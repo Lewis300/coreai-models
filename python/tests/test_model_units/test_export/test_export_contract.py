@@ -194,7 +194,7 @@ class TestSmallContext:
     def test_cache_seq_len_above_the_context_is_rejected(self) -> None:
         # A cache longer than the context it serves is meaningless, so the spec
         # rejects it rather than quietly shrinking it.
-        with pytest.raises(AssertionError, match="must not be greater than"):
+        with pytest.raises(ValueError, match="must not be greater than"):
             TraceSpec(max_context_length=512, cache_seq_len=513)
 
     def test_larger_context_leaves_trace_length_alone(self) -> None:
