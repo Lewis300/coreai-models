@@ -166,13 +166,16 @@ def quantize_pytorch_model(
 
         reset_positions = set(state_indices)
         for pos in reset_positions:
-            assert pos >= 2, (
-                "States cannot occupy the first two input positions. "
-                "Those must be reserved for input_ids and position_ids"
-            )
-            assert pos < len(inputs), (
-                f"State index out of bounds, got {pos}, while the number of inputs is {len(inputs)}"
-            )
+            if pos < 2:
+                raise ValueError(
+                    "States cannot occupy the first two input positions. "
+                    "Those must be reserved for input_ids and position_ids"
+                )
+            if pos >= len(inputs):
+                raise IndexError(
+                    f"State index out of bounds, got {pos}, while the number of inputs is "
+                    f"{len(inputs)}"
+                )
 
         # Match the caller's declared bound: position_ids.shape[1] <= cache_seq_len - 1
         # (the `seq_pos` Dim in `BaseForCausalLM.build_dynamic_shapes`).

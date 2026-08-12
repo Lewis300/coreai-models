@@ -69,11 +69,12 @@ class TraceSpec:
                 f"max_context_length={self.max_context_length} is too small to trace: "
                 f"it must be at least query_len + 2 = {self.query_len + 2}."
             )
-        assert self.cache_seq_len <= self.max_context_length, (
-            "cache_seq_len must not be greater than max_context_length. Received "
-            f"cache_seq_len = {self.cache_seq_len}, "
-            f"max_context_length = {self.max_context_length}"
-        )
+        if self.cache_seq_len > self.max_context_length:
+            raise ValueError(
+                "cache_seq_len must not be greater than max_context_length. Received "
+                f"cache_seq_len = {self.cache_seq_len}, "
+                f"max_context_length = {self.max_context_length}"
+            )
 
     @property
     def caches_are_static(self) -> bool:
