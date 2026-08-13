@@ -261,6 +261,12 @@ def quantize_for_export(
     # Same check the export path runs, so a bad contract fails identically on both.
     model.validate_export_contract(reference_inputs, dynamic_shapes)
 
+    if MAIN_GRAPH_NAME not in reference_inputs:
+        raise ValueError(
+            f"{type(model).__name__} exports graphs {sorted(reference_inputs)}, not a "
+            f"single {MAIN_GRAPH_NAME!r} graph. Torch quantization is only implemented "
+            "for single-graph (macOS) models; iOS uses palettization."
+        )
     graph_inputs = reference_inputs[MAIN_GRAPH_NAME]
     keys = list(graph_inputs)
     if quantization_config.get("calibrate_activations") and keys[:2] != [

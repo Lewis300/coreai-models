@@ -15,9 +15,10 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, NoReturn, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import torch
+from coreai.authoring.types import AllocationType, HardwareConstraints
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -26,12 +27,28 @@ from transformers.modeling_utils import PreTrainedModel
 from typing_extensions import Self, override
 
 from coreai_models._constants import (
+    CAUSAL_MASK_INPUT_NAME,
+    EMBEDDING_TABLE_INPUT_NAME,
+    EXTEND_FUNCTION_NAME,
+    GATHER_EMBEDDINGS_FUNCTION_NAME,
+    GATHERED_EMBEDDINGS_OUTPUT_NAME,
+    IN_STEP_INPUT_NAME,
+    KEY_CACHE_INPUT_NAME,
     KEY_CACHE_NAME,
+    KEY_CACHE_OUTPUT_NAME,
+    LOAD_EMBEDDINGS_FUNCTION_NAME,
+    LOAD_EMBEDDINGS_OUTPUT_NAME,
     MAIN_GRAPH_NAME,
+    OUTPUT_LOGITS_NAME,
+    POSITION_IDS_INPUT_NAME,
     QUANT_TRACE_OFFSET,
     QUANT_TRACE_QUERY_LEN,
+    TOKEN_IDS_INPUT_NAME,
     TRACE_KV_CACHE_SEQ_LEN,
+    TRANSFORMER_INPUT_NAME,
+    VALUE_CACHE_INPUT_NAME,
     VALUE_CACHE_NAME,
+    VALUE_CACHE_OUTPUT_NAME,
 )
 from coreai_models.primitives.ios.embedding import GatherEmbeddings, LoadEmbeddings
 from coreai_models.primitives.macos.cache import KVCache
@@ -822,36 +839,92 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
         self.extend.prefill_mode = prefill_mode
 
     # ------------------------------------------------------------------
-    # Export contract -- not implemented for iOS
+    # Export contract
     #
-    # The iOS graph matches the macOS defaults in no respect (different inputs, cache
-    # rank and output name -- see export/ios.py), and export_ios_model builds its own.
-    # Inheriting the defaults would report a plausible but wrong contract, and they are
-    # reachable: `--variant iOS --compression 4bit` resolves a macOS quantization preset
-    # and the quantize branch is not variant-gated.
+    # iOS exports four entrypoints over three callables: the embedding-table loader,
+    # the token gather, and the transformer, the last traced twice with prefill off and
+    # on. The two transformer entrypoints have identical inputs, states and outputs, so
+    # the contract carries three entries and `export/ios.py` uses the transformer entry
+    # for both. Which callable each graph traces, and the prefill toggle between them,
+    # is the exporter's business.
+    #
+    # `model.forward` composes the three for eager use and is never exported, so the
+    # inherited single-graph defaults would describe the wrong graph entirely.
+    #
+    # iOS also needs two things macOS does not: the static shape ladder each graph is
+    # specialized over, and the layout constraints on the buffers it shares with the
+    # runner. Both are per-graph and shaped by this model's graphs, so they live here
+    # alongside the names.
     # ------------------------------------------------------------------
 
+    #: Query length the iOS graphs are traced at.
+    IOS_QUERY_LEN = 8
+
+    #: Query lengths the graphs are specialized for.
+    IOS_STATIC_QUERY_LENS = (8, 16, 64)
+
+    #: Smallest cache length in the static ladder; it doubles up to the context.
+    IOS_STATIC_MIN_CACHE_LEN = 256
+
+    #: Interleave factor for the KV cache's embedding dim.
+    KV_CACHE_INTERLEAVE_FACTOR = 8
+
     @classmethod
-    def _export_contract_not_implemented(cls, hook: str) -> NoReturn:
-        raise NotImplementedError(
-            f"{cls.__name__}.{hook} is not yet implemented for iOS models: the iOS graph "
-            "has a different signature from the macOS one it would otherwise inherit."
-        )
+    def _head_dim(cls, config) -> int:
+        """``config.head_dim`` when it is set, else derived from hidden size and heads."""
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
+        return head_dim
 
     @classmethod
     @override
     def export_input_names(cls) -> dict[str, tuple[str, ...]]:
-        cls._export_contract_not_implemented("export_input_names")
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (
+                TOKEN_IDS_INPUT_NAME,
+                EMBEDDING_TABLE_INPUT_NAME,
+            ),
+            EXTEND_FUNCTION_NAME: (
+                TRANSFORMER_INPUT_NAME,
+                POSITION_IDS_INPUT_NAME,
+                IN_STEP_INPUT_NAME,
+                CAUSAL_MASK_INPUT_NAME,
+                EMBEDDING_TABLE_INPUT_NAME,
+            ),
+        }
 
     @classmethod
     @override
     def export_state_names(cls) -> dict[str, tuple[str, ...]]:
-        cls._export_contract_not_implemented("export_state_names")
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (),
+            EXTEND_FUNCTION_NAME: (KEY_CACHE_INPUT_NAME, VALUE_CACHE_INPUT_NAME),
+        }
+
+    @classmethod
+    def export_state_output_names(cls) -> dict[str, tuple[str, ...]]:
+        """State output names per graph.
+
+        iOS names them because the hardware constraints attach to the mutated output as
+        well as the input; the macOS converter surfaces state in/out implicitly.
+        """
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (),
+            EXTEND_FUNCTION_NAME: (KEY_CACHE_OUTPUT_NAME, VALUE_CACHE_OUTPUT_NAME),
+        }
 
     @classmethod
     @override
     def export_output_names(cls) -> dict[str, tuple[str, ...]]:
-        cls._export_contract_not_implemented("export_output_names")
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: (LOAD_EMBEDDINGS_OUTPUT_NAME,),
+            GATHER_EMBEDDINGS_FUNCTION_NAME: (GATHERED_EMBEDDINGS_OUTPUT_NAME,),
+            EXTEND_FUNCTION_NAME: (OUTPUT_LOGITS_NAME,),
+        }
 
     @override
     def build_reference_inputs(
@@ -860,8 +933,138 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
         target_dtype: torch.dtype,
         spec: TraceSpec,
     ) -> dict[str, dict[str, Any]]:
-        self._export_contract_not_implemented("build_reference_inputs")
+        max_ctx = spec.max_context_length
+        query_len = self.IOS_QUERY_LEN
+        head_dim = self._head_dim(config)
+
+        embedding_table = self.load_embeddings.embedding_table
+        input_ids = torch.randint(1, config.vocab_size, (1, query_len), dtype=torch.int32)
+        # One graph's reference input is produced by running another.
+        transformer_input = self.gather_embeddings(input_ids, embedding_table)
+
+        key_cache = torch.zeros(
+            config.num_hidden_layers,
+            1,
+            config.num_key_value_heads * head_dim,
+            1,
+            max_ctx,
+            dtype=torch.float16,
+        )
+
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {
+                "input_ids": input_ids,
+                "embedding_table": embedding_table,
+            },
+            # Exact signature order of Qwen3Extend.forward and friends.
+            EXTEND_FUNCTION_NAME: {
+                "transformer_input": transformer_input,
+                "position_ids": torch.arange(query_len).to(torch.uint16).unsqueeze(0),
+                "in_step": torch.zeros((1,), dtype=torch.int32),
+                "causal_mask": torch.zeros(1, max_ctx, 1, query_len, dtype=torch.float16),
+                "key_cache": key_cache,
+                "value_cache": key_cache.clone(),
+                "embedding_table": embedding_table,
+            },
+        }
 
     @override
     def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
-        self._export_contract_not_implemented("build_dynamic_shapes")
+        max_ctx = spec.max_context_length
+        seq_len_dim = torch.export.Dim("seq_len", max=max_ctx)
+        cache_len_dim = torch.export.Dim("cache_len", max=max_ctx)
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {
+                "input_ids": {1: seq_len_dim},
+                "embedding_table": None,
+            },
+            EXTEND_FUNCTION_NAME: {
+                "transformer_input": {1: seq_len_dim},
+                "position_ids": {1: seq_len_dim},
+                "in_step": None,
+                "causal_mask": {1: cache_len_dim, 3: seq_len_dim},
+                "key_cache": {4: cache_len_dim},
+                "value_cache": {4: cache_len_dim},
+                "embedding_table": None,
+            },
+        }
+
+    @classmethod
+    def export_static_shape_configs(
+        cls, config, max_context_length: int
+    ) -> dict[str, dict[str, dict[str, tuple[int, ...]]]]:
+        """Static shape specializations per graph, keyed like the name hooks.
+
+        iOS compiles for fixed shapes, so each graph is built once per shape it must
+        serve: the transformer over (cache length, query length), the gather over query
+        length alone. The inner keys are the specialization labels, quoted because that
+        is the form the compiler expects. An empty dict means no specialization.
+        """
+        kv_embed_size = config.num_key_value_heads * cls._head_dim(config)
+
+        transformer: dict[str, dict[str, tuple[int, ...]]] = {}
+        cache_len = cls.IOS_STATIC_MIN_CACHE_LEN
+        while cache_len <= max_context_length:
+            for q_len in cls.IOS_STATIC_QUERY_LENS:
+                transformer[f'"{cache_len}_{q_len}"'] = {
+                    TRANSFORMER_INPUT_NAME: (1, q_len, 1, config.hidden_size),
+                    POSITION_IDS_INPUT_NAME: (1, q_len),
+                    CAUSAL_MASK_INPUT_NAME: (1, cache_len, 1, q_len),
+                    KEY_CACHE_INPUT_NAME: (
+                        config.num_hidden_layers,
+                        1,
+                        kv_embed_size,
+                        1,
+                        cache_len,
+                    ),
+                    VALUE_CACHE_INPUT_NAME: (
+                        config.num_hidden_layers,
+                        1,
+                        kv_embed_size,
+                        1,
+                        cache_len,
+                    ),
+                }
+            cache_len *= 2
+
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {
+                f'"{q}"': {TOKEN_IDS_INPUT_NAME: (1, q)} for q in cls.IOS_STATIC_QUERY_LENS
+            },
+            EXTEND_FUNCTION_NAME: transformer,
+        }
+
+    @classmethod
+    def export_hardware_constraints(
+        cls, max_context_length: int
+    ) -> dict[str, dict[str, HardwareConstraints]]:
+        """Per-input hardware constraints per graph, keyed like the name hooks.
+
+        These pin the layout of the buffers the runner shares with the compiled graphs,
+        so both sides agree. The caches are constrained on the mutated output as well as
+        the input, which is why :meth:`export_state_output_names` exists.
+        """
+        embedding_table = HardwareConstraints(
+            AllocationType.IOSurface, interleave=[8, 1, 1], alignments=[1, 1, 1, 1]
+        )
+        cache = HardwareConstraints(
+            AllocationType.IOSurface,
+            interleave=[1, 1, cls.KV_CACHE_INTERLEAVE_FACTOR, 1, 1],
+            alignments=[1, 1, 1, 1, cls.KV_CACHE_INTERLEAVE_FACTOR * max_context_length, 1],
+        )
+
+        transformer = {EMBEDDING_TABLE_INPUT_NAME: embedding_table}
+        for name in (
+            *cls.export_state_names()[EXTEND_FUNCTION_NAME],
+            *cls.export_state_output_names()[EXTEND_FUNCTION_NAME],
+        ):
+            transformer[name] = cache
+
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {EMBEDDING_TABLE_INPUT_NAME: embedding_table},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {EMBEDDING_TABLE_INPUT_NAME: embedding_table},
+            EXTEND_FUNCTION_NAME: transformer,
+        }
