@@ -528,6 +528,7 @@ class TestMistralEndtoEnd:
         if hf_model_id == "mistralai/Mistral-7B-Instruct-v0.3":
             ref_model = TestMistralEndtoEnd.get_7b_like_model()
             config = ref_model.config
+            config.max_position_embeddings = max_seq_len
         else:
             ref_model = HFMistralForCausalLM.from_pretrained(hf_model_id).eval()
             config = ref_model.config
