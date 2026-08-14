@@ -41,6 +41,7 @@ from coreai_models._constants import (
     MAIN_GRAPH_NAME,
     OUTPUT_LOGITS_NAME,
     POSITION_IDS_INPUT_NAME,
+    PROMPT_GRAPH_OUTPUT_NAME,
     QUANT_TRACE_OFFSET,
     QUANT_TRACE_QUERY_LEN,
     TOKEN_IDS_INPUT_NAME,
@@ -304,6 +305,34 @@ class BaseForCausalLM(torch.nn.Module):
     # Subclasses must override this with their specific HuggingFace model class
     _HF_MODEL_CLASS: type | None = None
 
+    #: Whether the macOS exporter emits a second, LM-head-less ``prompt`` graph
+    #: beside ``main``. Opt in per model: ``forward`` must honour
+    #: :attr:`prefill_mode`.
+    exports_prompt_graph: bool = False
+
+    #: Set while the exporter traces the prefill graph. See :meth:`set_prefill_mode`.
+    prefill_mode: bool = False
+
+    def set_prefill_mode(self, prefill_mode: bool) -> None:
+        """Toggle prefill mode for the next trace.
+
+        The exporters trace one module twice — decode, then prefill — to emit two
+        entrypoints from it. A model that opts into :attr:`exports_prompt_graph`
+        reads :attr:`prefill_mode` in ``forward`` and skips the LM head when it is
+        set, since the prompt graph exists only to fill the KV cache.
+        """
+        self.prefill_mode = prefill_mode
+
+    @classmethod
+    def export_prompt_output_names(cls) -> tuple[str, ...]:
+        """Output names for the ``prompt`` graph, in return order.
+
+        Only consulted when :attr:`exports_prompt_graph` is set. That graph shares
+        ``main``'s inputs, states and reference inputs, so only its outputs differ
+        and the graph-keyed hooks above stay single-graph.
+        """
+        return (PROMPT_GRAPH_OUTPUT_NAME,)
+
     @staticmethod
     def cast_logits_bfloat16_to_float16(forward_fn: Callable) -> Callable:
         """Decorator to cast torch.bfloat16 logits outputs to float16.
@@ -378,8 +407,10 @@ class BaseForCausalLM(torch.nn.Module):
     # Export contract
     #
     # Everything the exporters need to trace this model, keyed by graph name. A macOS
-    # model has one graph; iOS has several. These hooks supply only names and tensors;
-    # which callable each graph traces stays the exporter's business.
+    # model has one traced signature; iOS has several. These hooks supply only names and
+    # tensors; which callable each graph traces stays the exporter's business. A macOS
+    # model that opts into `exports_prompt_graph` emits a second entrypoint from that one
+    # signature, so it varies only in `export_prompt_output_names` above.
     #
     # Reference inputs bind to the traced signature, so they must be in its EXACT
     # order. Names are looked up by name, so each list carries only the RELATIVE order
@@ -835,7 +866,10 @@ class BaseForCausalLMForiOS(BaseForCausalLM):
         self.gather_embeddings = GatherEmbeddings()
         self.disable_embedding_quantization = disable_embedding_quantization
 
+    @override
     def set_prefill_mode(self, prefill_mode: bool):
+        # iOS composes the transformer as a submodule, so the flag lives there rather
+        # than on the top-level module.
         self.extend.prefill_mode = prefill_mode
 
     # ------------------------------------------------------------------

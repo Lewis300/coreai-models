@@ -9,8 +9,19 @@ A leaf module: imported by both ``models/`` and ``export/``, imports nothing fro
 either.
 """
 
-# Graph name for a single-graph (macOS) export. iOS uses its own entrypoint names.
+# Graph name for the decode (and, absent a prompt graph, prefill) macOS export.
+# iOS uses its own entrypoint names.
 MAIN_GRAPH_NAME = "main"
+
+# Optional second macOS entrypoint: the prefill graph. Same inputs and states as
+# `main`, but traced in prefill mode, so it stops before the LM head — the KV cache
+# writes are its only product. Only emitted for models that opt in via
+# `BaseForCausalLM.exports_prompt_graph`; the Swift runner picks it up when present.
+PROMPT_GRAPH_NAME = "prompt"
+
+# The prompt graph's single output. It is the transformer's final hidden states, kept
+# only so the graph has an output at all; the runner never reads it.
+PROMPT_GRAPH_OUTPUT_NAME = "hidden_states"
 
 # KV cache names used by the Swift runner
 KEY_CACHE_NAME = "keyCache"

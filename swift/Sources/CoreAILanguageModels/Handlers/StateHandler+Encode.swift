@@ -7,7 +7,11 @@ import CoreAI
 import Metal
 
 /// Encode an inference step with KV cache states, optional additional MTLBuffer
-/// states, and logits output.
+/// states, and a single output.
+///
+/// The output is the graph's logits for `main`, or the unread by-product of a
+/// prefill-only `prompt` graph — hence the neutral `output*` naming and the explicit
+/// scalar type.
 func encodeWithStates(
     function: InferenceFunction,
     inputs: [String: InferenceFunction.AsyncValue],
@@ -16,10 +20,11 @@ func encodeWithStates(
     valState: inout InferenceFunction.AsyncMutableValue,
     valueCacheName: String,
     additionalStates: FixedMTLBufferState?,
-    logitsBuffer: MTLBuffer,
-    logitsName: String,
-    logitsShape: [Int],
-    logitsStrides: [Int],
+    outputBuffer: MTLBuffer,
+    outputName: String,
+    outputShape: [Int],
+    outputStrides: [Int],
+    outputScalarType: NDArray.ScalarType = .float16,
     computeStream: ComputeStream
 ) throws {
     var asyncStates = InferenceFunction.AsyncMutableViews()
@@ -27,11 +32,11 @@ func encodeWithStates(
     asyncStates.insert(&valState, for: valueCacheName)
     additionalStates?.bind(into: &asyncStates)
 
-    var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
-        unsafeBuffer: logitsBuffer, byteOffset: 0,
-        scalarType: .float16, shape: logitsShape, strides: logitsStrides)
+    var output = unsafe InferenceFunction.AsyncMutableValue(
+        unsafeBuffer: outputBuffer, byteOffset: 0,
+        scalarType: outputScalarType, shape: outputShape, strides: outputStrides)
     var asyncOutputs = InferenceFunction.AsyncMutableViews()
-    asyncOutputs.insert(&logitsOutput, for: logitsName)
+    asyncOutputs.insert(&output, for: outputName)
     let _ = try function.encode(
         inputs: inputs, states: consume asyncStates,
         outputViews: consume asyncOutputs, to: computeStream)

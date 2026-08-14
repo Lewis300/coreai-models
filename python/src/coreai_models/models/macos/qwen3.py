@@ -155,6 +155,9 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFQwen3ForCausalLM
 
+    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``.
+    exports_prompt_graph = True
+
     @override
     def _init_model(self, config: Qwen3Config) -> None:
         self.model = Qwen3Model(config)
@@ -172,6 +175,10 @@ class Qwen3ForCausalLM(BaseForCausalLM):
     ) -> torch.Tensor:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            # Prompt graph: the KV cache writes are the product, and the runner reads
+            # logits from a separate single-token pass, so skip the LM head entirely.
+            return out
         return self.lm_head(out)
 
     @override
