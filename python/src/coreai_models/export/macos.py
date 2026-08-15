@@ -203,7 +203,11 @@ def export_to_coreai(
             entrypoint_name=MAIN_GRAPH_NAME,
         )
         if prompt_output_names is not None:
-            logger.info(f"Exporting prefill entrypoint {PROMPT_GRAPH_NAME!r}...")
+            logger.info(
+                f"Exporting prefill entrypoint {PROMPT_GRAPH_NAME!r} (its trace ends at the "
+                "last cache write, so 'skipping unused submodule' warnings for the tail of "
+                "the model are expected)..."
+            )
             converter.add_pytorch_module(
                 model,
                 export_fn=make_export_fn(prefill=True),

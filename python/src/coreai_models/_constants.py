@@ -19,9 +19,10 @@ MAIN_GRAPH_NAME = "main"
 # `BaseForCausalLM.exports_prompt_graph`; the Swift runner picks it up when present.
 PROMPT_GRAPH_NAME = "prompt"
 
-# The prompt graph's single output. It is the transformer's final hidden states, kept
-# only so the graph has an output at all; the runner never reads it.
-PROMPT_GRAPH_OUTPUT_NAME = "hidden_states"
+# The prompt graph's single output: a trivial read of the KV cache, kept only so the
+# graph has an output at all. Everything the cache writes don't feed — LM head, final
+# norm, last block's MLP — is then dead code. The runner binds it and never reads it.
+PROMPT_GRAPH_OUTPUT_NAME = "cache_probe"
 
 # KV cache names used by the Swift runner
 KEY_CACHE_NAME = "keyCache"

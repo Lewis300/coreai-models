@@ -176,9 +176,11 @@ class Qwen3ForCausalLM(BaseForCausalLM):
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
         if self.prefill_mode:
-            # Prompt graph: the KV cache writes are the product, and the runner reads
-            # logits from a separate single-token pass, so skip the LM head entirely.
-            return out
+            # Prompt graph: the KV cache writes are the product, and the runner samples
+            # from a separate single-token pass. Returning a cache probe instead of
+            # `out` leaves the LM head, the final norm and the last block's MLP dead,
+            # for the compiler to drop.
+            return cache.probe()
         return self.lm_head(out)
 
     @override
