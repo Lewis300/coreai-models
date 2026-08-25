@@ -32,11 +32,6 @@ private let temperatureTolerance: Double = 0.001
 /// MPSNDArray enforces 64-byte row-stride alignment on backing buffers.
 private let minimumMPSNDArrayBufferSize = 64
 
-/// Name of the optional prefill entrypoint. Exported beside `main` (see
-/// `export/macos.py`) with the same inputs and states, but no LM head and no outputs:
-/// it only fills the KV cache.
-private let promptFunctionName = "prompt"
-
 // MARK: - Core AI Pipelined Engine (Public Wrapper)
 
 /// GPU-pipelined inference engine using Core AI's encode API.
@@ -593,40 +588,6 @@ private struct EngineImpl: ~Copyable {
 
     // MARK: - Init
 
-    /// Load the prompt graph, or nil if the asset has none.
-    ///
-    /// It must take the same inputs and states as `main` and declare no outputs, because
-    /// that is how the caller binds it. A graph that disagrees is a stale asset, so this
-    /// throws instead of falling back.
-    private static func loadPromptGraph(
-        from model: AIModel,
-        matching main: InferenceFunctionDescriptor,
-        mainName: String
-    ) throws -> InferenceFunction? {
-        guard let prompt = model.functionDescriptor(for: promptFunctionName) else { return nil }
-
-        guard prompt.inputNames == main.inputNames else {
-            throw InferenceRuntimeError.invalidInputType(
-                "'\(promptFunctionName)' graph inputs \(prompt.inputNames) do not match "
-                    + "'\(mainName)' inputs \(main.inputNames)")
-        }
-        guard Set(prompt.stateNames) == Set(main.stateNames) else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "'\(promptFunctionName)' graph states \(prompt.stateNames) do not match "
-                    + "'\(mainName)' states \(main.stateNames)")
-        }
-        guard prompt.outputNames.isEmpty else {
-            throw InferenceRuntimeError.invalidOutputType(
-                "'\(promptFunctionName)' graph declares outputs \(prompt.outputNames); "
-                    + "expected none. Re-export the model.")
-        }
-        guard let loaded = try model.loadFunction(named: promptFunctionName) else {
-            throw InferenceRuntimeError.genericError(
-                "Cannot load function '\(promptFunctionName)'")
-        }
-        return loaded
-    }
-
     init(
         config: ModelConfig,
         preparedModel: PreparedModel,
@@ -792,10 +753,10 @@ private struct EngineImpl: ~Copyable {
 
         // Without a prompt graph, prefill runs through `function` exactly as before.
         let promptMaxQueryLen = max(1, min(config.prefillChunkSize, config.maxContextLength))
-        let promptFn = try Self.loadPromptGraph(
+        let promptFn = try loadPromptGraph(
             from: model, matching: descriptor, mainName: config.function)
         if promptFn != nil {
-            CLILogger.log("Found '\(promptFunctionName)' graph — prefill skips the LM head")
+            CLILogger.log("Found '\(promptGraphFunctionName)' graph — prefill skips the LM head")
         }
 
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift).
@@ -1656,7 +1617,7 @@ private struct EngineImpl: ~Copyable {
     private mutating func _encodeChunk(tokens: [Int32]) async throws {
         let queryLength = tokens.count
         let currentStep = processedTokenCount
-        let graphName = promptFunction != nil ? promptFunctionName : config.function
+        let graphName = promptFunction != nil ? promptGraphFunctionName : config.function
 
         let chunkID = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIPipelinedChunk",
