@@ -316,10 +316,10 @@ class BaseForCausalLM(torch.nn.Module):
         """Toggle prefill mode for the next trace.
 
         The exporters trace one module twice -- decode, then prefill -- to emit two
-        entrypoints from it. A model that opts into :attr:`exports_prompt_graph`
-        reads :attr:`prefill_mode` in ``forward`` and returns nothing when it is set,
-        since the prompt graph exists only to fill the KV cache: the LM head, the final
-        norm and the last block's tail all become dead code for the converter to drop.
+        entrypoints from it. A model that opts into :attr:`exports_prompt_graph` checks
+        :attr:`prefill_mode` in ``forward`` and returns nothing when it is set: the
+        prompt graph only has to fill the KV cache, so the LM head and the tail of the
+        model become dead code.
         """
         self.prefill_mode = prefill_mode
 

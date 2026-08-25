@@ -37,11 +37,10 @@ func encodeWithStates(
         outputViews: consume asyncOutputs, to: computeStream)
 }
 
-/// Encode an inference step that produces no outputs at all.
+/// Encode an inference step with no outputs.
 ///
-/// A prefill (`prompt`) graph's only product is the KV cache it writes, so it declares no
-/// outputs and there is nothing to bind. Same states as `encodeWithStates`, empty output
-/// views.
+/// The prompt graph only fills the KV cache, so it declares no outputs and there is
+/// nothing to bind. Same states as `encodeWithStates`.
 func encodeWithStatesNoOutputs(
     function: InferenceFunction,
     inputs: [String: InferenceFunction.AsyncValue],

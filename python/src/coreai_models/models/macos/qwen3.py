@@ -176,9 +176,9 @@ class Qwen3ForCausalLM(BaseForCausalLM):
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
         if self.prefill_mode:
-            # Prompt graph: the KV cache writes are the product, and the runner samples
-            # from a separate single-token pass. Returning nothing leaves the LM head,
-            # the final norm and the last block's tail dead, for the converter to drop.
+            # Prompt graph: only the KV cache writes matter, and the runner samples from
+            # a separate single-token pass. Returning nothing drops the LM head and the
+            # tail of the model.
             return ()
         return self.lm_head(out)
 

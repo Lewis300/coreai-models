@@ -10,9 +10,9 @@ Exports a PyTorch LLM model to a Core AI AIProgram via:
 torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 
 The result carries one entrypoint, ``main``, or two when the model opts into
-``exports_prompt_graph``: ``main`` for decode and ``prompt`` for prefill. The two are
-the same module traced twice, the second time with prefill mode on so the trace stops
-before the LM head.
+``exports_prompt_graph``: ``main`` for decode and ``prompt`` for prefill. Both come from
+the same module, traced twice -- the second time with prefill mode on, so it returns
+nothing and the LM head drops out.
 """
 
 import logging
@@ -71,13 +71,10 @@ def _set_prefill_mode(module: torch.nn.Module, prefill: bool) -> None:
     ``export_to_coreai`` also serves plain ``nn.Module`` components that know nothing
     about prefill, so this is a no-op for anything without the hook.
 
-    The flag lives on the module, shared by both traces, which makes this correct only
-    while the converter exports entrypoints *serially*. That holds today: each
-    ``add_pytorch_module`` runs its ``export_fn`` to completion before the next is
-    staged, and ``export_fn`` sets the mode as its first act. If the converter ever
-    reorders or parallelizes those traces, two exports would race on one flag and the
-    prefill graph could silently come out identical to ``main`` -- so this needs
-    revisiting alongside any such change, not just re-testing.
+    Both traces share this one flag, so it is only correct while the converter exports
+    entrypoints serially -- which it does today, and ``export_fn`` sets the mode as its
+    first act. If that ever changes, the two traces would race and the prefill graph
+    could silently come out identical to ``main``.
     """
     setter = getattr(module, "set_prefill_mode", None)
     if callable(setter):
@@ -127,11 +124,10 @@ def export_to_coreai(
         include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
             information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
             which embeds minimum debug information and makes the exported asset smaller.
-        export_prompt_graph: When True, the model is traced a second time with prefill
-            mode on and staged as the ``prompt`` entrypoint. That trace shares
-            ``input_names``, ``state_names``, ``reference_inputs`` and ``dynamic_shapes``
-            with ``main`` and declares *no* outputs -- the KV cache writes are its only
-            product, so everything they don't feed is dead code the converter drops.
+        export_prompt_graph: When True, trace the model a second time with prefill mode
+            on and stage it as the ``prompt`` entrypoint. It shares ``input_names``,
+            ``state_names``, ``reference_inputs`` and ``dynamic_shapes`` with ``main`` and
+            declares no outputs, so everything the KV cache writes don't feed is dropped.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -235,10 +231,8 @@ def export_to_coreai(
     try:
         return converter.to_coreai()
     finally:
-        # Don't leave a shared model in prefill mode for whatever runs next. This also
-        # covers the failure path: if the second `add_pytorch_module` or `to_coreai`
-        # raises, the flag is still set, and the caller may well go on to use the same
-        # module (the standalone recipes hold one model across quantize + export).
+        # Don't leave a shared model in prefill mode for whatever runs next, including
+        # when a trace raises -- callers reuse one model across quantize and export.
         _set_prefill_mode(model, False)
 
 

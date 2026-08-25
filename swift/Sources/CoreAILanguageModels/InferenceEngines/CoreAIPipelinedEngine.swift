@@ -32,9 +32,9 @@ private let temperatureTolerance: Double = 0.001
 /// MPSNDArray enforces 64-byte row-stride alignment on backing buffers.
 private let minimumMPSNDArrayBufferSize = 64
 
-/// Entrypoint name of the optional prefill graph. Exported (see `export/macos.py`) as a
-/// second entrypoint beside `main`: same inputs and states, but traced in prefill mode
-/// so it stops before the LM head. Its only product is the KV cache it fills.
+/// Name of the optional prefill entrypoint. Exported beside `main` (see
+/// `export/macos.py`) with the same inputs and states, but no LM head and no outputs:
+/// it only fills the KV cache.
 private let promptFunctionName = "prompt"
 
 // MARK: - Core AI Pipelined Engine (Public Wrapper)
@@ -72,6 +72,7 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
     var isBusy: Bool { _activeToken.withLock { $0 != nil } }
 
     var processedTokenCount: Int { engine.processedTokenCount }
+
 
     init(
         config: ModelConfig,
@@ -526,6 +527,7 @@ final class PipelineGate: Sendable {
 // MARK: - Engine Implementation
 
 private struct EngineImpl: ~Copyable {
+
     var vocabSize: Int { config.vocabSize }
 
     static let maxJumpForwardTokens = 64
@@ -537,21 +539,12 @@ private struct EngineImpl: ~Copyable {
     let computeStream: ComputeStream
     let device: MTLDevice
 
-    // Optional prefill graph. When the asset carries one, every prefill step but the
-    // last runs here instead of `function`: it has no LM head, so it is cheaper, but it
-    // also produces no logits — the final prompt token must still go through `function`
-    // to seed sampling. The graph declares no outputs at all, so there is nothing to
-    // bind and no scratch buffer to own.
+    // Prefill chunks run here when the asset has this graph. It produces no logits, so
+    // the last prompt token still goes through `function` to seed sampling.
     let promptFunction: InferenceFunction?
-    /// Longest query the prompt graph's output buffer is sized for, and the chunk size the
-    /// prefill loop uses whenever that graph is present.
-    ///
-    /// Derived as `min(config.prefillChunkSize, config.maxContextLength)`, so it equals
-    /// `prefillChunkSize` except where a model's context is smaller than one chunk. The two
-    /// never compete: with a prompt graph this value alone sizes the chunks, and
-    /// `chunkThreshold` / `prefillChunkSize` govern only the fallback path through
-    /// `function`. Nothing may encode a wider query than this — the scratch output buffer
-    /// is sized for exactly it (see the clamp in `performWarmup`).
+    /// Chunk width used when a prompt graph is present, and the widest query warmup runs
+    /// on it: `config.prefillChunkSize` capped at the context. `chunkThreshold` and
+    /// `prefillChunkSize` apply only to the fallback path through `function`.
     let promptMaxQueryLength: Int
 
     // Descriptor metadata
@@ -599,6 +592,40 @@ private struct EngineImpl: ~Copyable {
     let inFlightGate = PipelineGate(capacity: pipelineDepth)
 
     // MARK: - Init
+
+    /// Load the prompt graph, or nil if the asset has none.
+    ///
+    /// It must take the same inputs and states as `main` and declare no outputs, because
+    /// that is how the caller binds it. A graph that disagrees is a stale asset, so this
+    /// throws instead of falling back.
+    private static func loadPromptGraph(
+        from model: AIModel,
+        matching main: InferenceFunctionDescriptor,
+        mainName: String
+    ) throws -> InferenceFunction? {
+        guard let prompt = model.functionDescriptor(for: promptFunctionName) else { return nil }
+
+        guard prompt.inputNames == main.inputNames else {
+            throw InferenceRuntimeError.invalidInputType(
+                "'\(promptFunctionName)' graph inputs \(prompt.inputNames) do not match "
+                    + "'\(mainName)' inputs \(main.inputNames)")
+        }
+        guard Set(prompt.stateNames) == Set(main.stateNames) else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "'\(promptFunctionName)' graph states \(prompt.stateNames) do not match "
+                    + "'\(mainName)' states \(main.stateNames)")
+        }
+        guard prompt.outputNames.isEmpty else {
+            throw InferenceRuntimeError.invalidOutputType(
+                "'\(promptFunctionName)' graph declares outputs \(prompt.outputNames); "
+                    + "expected none. Re-export the model.")
+        }
+        guard let loaded = try model.loadFunction(named: promptFunctionName) else {
+            throw InferenceRuntimeError.genericError(
+                "Cannot load function '\(promptFunctionName)'")
+        }
+        return loaded
+    }
 
     init(
         config: ModelConfig,
@@ -763,43 +790,17 @@ private struct EngineImpl: ~Copyable {
                 "Pipelined additional states: \(allFixedNames.joined(separator: ", "))")
         }
 
-        // Load the optional prefill graph. Absent one, prefill runs through `function`
-        // exactly as before.
+        // Without a prompt graph, prefill runs through `function` exactly as before.
         let promptMaxQueryLen = max(1, min(config.prefillChunkSize, config.maxContextLength))
-        var promptFn: InferenceFunction? = nil
-        if let promptDescriptor = model.functionDescriptor(for: promptFunctionName) {
-            // The runner binds both graphs' inputs and states by the same names, so a
-            // prompt graph that disagrees is a mismatched asset, not a fallback case.
-            guard promptDescriptor.inputNames == descriptor.inputNames else {
-                throw InferenceRuntimeError.invalidInputType(
-                    "'\(promptFunctionName)' graph inputs \(promptDescriptor.inputNames) do not match "
-                        + "'\(config.function)' inputs \(descriptor.inputNames)")
-            }
-            guard Set(promptDescriptor.stateNames) == Set(descriptor.stateNames) else {
-                throw InferenceRuntimeError.invalidOutputType(
-                    "'\(promptFunctionName)' graph states \(promptDescriptor.stateNames) do not match "
-                        + "'\(config.function)' states \(descriptor.stateNames)")
-            }
-            // The prefill graph's product is the KV cache it writes, so it declares no
-            // outputs. One that does is a stale asset built before that change, not
-            // something to accommodate: binding its output would need a descriptor and a
-            // scratch buffer this engine no longer carries.
-            guard promptDescriptor.outputNames.isEmpty else {
-                throw InferenceRuntimeError.invalidOutputType(
-                    "'\(promptFunctionName)' graph declares outputs "
-                        + "\(promptDescriptor.outputNames); expected none. Re-export the model.")
-            }
-            guard let loaded = try model.loadFunction(named: promptFunctionName) else {
-                throw InferenceRuntimeError.genericError(
-                    "Cannot load function '\(promptFunctionName)'")
-            }
-            promptFn = loaded
+        let promptFn = try Self.loadPromptGraph(
+            from: model, matching: descriptor, mainName: config.function)
+        if promptFn != nil {
             CLILogger.log("Found '\(promptFunctionName)' graph — prefill skips the LM head")
         }
 
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift).
-        // With a prompt graph, `function` only ever sees one token at a time, so a
-        // prompt-sized logits buffer (hundreds of MB at large vocabularies) is dead weight.
+        // With a prompt graph, `function` only ever sees one token, so a prompt-sized
+        // logits buffer — hundreds of MB at large vocabularies — would go unused.
         let logitsRef = try GrowingLogitsBuffer(
             device: device,
             descriptor: descriptor,
@@ -1650,9 +1651,8 @@ private struct EngineImpl: ~Copyable {
 
     /// Encode one prefill chunk: KV cache writes only, no sampling.
     ///
-    /// Runs on the `prompt` graph when the asset has one — a chunk needs no logits, and
-    /// that graph stops before the LM head. Its output is a by-product nothing reads, so
-    /// every chunk writes it into the same scratch buffer.
+    /// A chunk needs no logits, so it runs on the prompt graph when the asset has one and
+    /// binds no output. Otherwise `function` runs it and its logits go unread.
     private mutating func _encodeChunk(tokens: [Int32]) async throws {
         let queryLength = tokens.count
         let currentStep = processedTokenCount
@@ -1705,10 +1705,6 @@ private struct EngineImpl: ~Copyable {
         var valState = unsafe InferenceFunction.AsyncMutableValue(
             unsafeBuffer: valBuffer, byteOffset: 0,
             scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
-        // The prompt graph has no outputs, so a chunk on it binds nothing at all.
-        // Without one, `function` serves the chunk and its logits go to the shared
-        // growing buffer, where nobody reads them either — that is the cost the prompt
-        // graph exists to avoid.
         if let promptFn = promptFunction {
             try encodeWithStatesNoOutputs(
                 function: promptFn, inputs: asyncInputs,
@@ -1764,8 +1760,8 @@ private struct EngineImpl: ~Copyable {
             shapesToWarm = [1, defaultWarmupLength]
         }
         if promptFunction != nil {
-            // Multi-token shapes warm the prompt graph, so `function` — which then only
-            // ever runs one token at a time — needs its own single-token pass.
+            // Multi-token shapes warm the prompt graph, so `function` needs its own
+            // single-token pass.
             shapesToWarm = shapesToWarm.map { $0 > 1 ? min($0, promptMaxQueryLength) : $0 }
             if !shapesToWarm.contains(1) { shapesToWarm.append(1) }
         }
@@ -1824,11 +1820,9 @@ private struct EngineImpl: ~Copyable {
             var valState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: valBuffer, byteOffset: 0,
                 scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
-            // Warm the graph this shape will actually run on. Multi-token shapes must go
-            // to the prompt graph when there is one -- not merely to avoid compiling
-            // kernels nothing uses, but because the logits buffer is clamped to a single
-            // row whenever a prompt graph exists, so a multi-token warmup on `function`
-            // would write shape x vocab into a 1 x vocab allocation.
+            // Multi-token shapes must run on the prompt graph when there is one. Not just
+            // to avoid compiling unused kernels: the logits buffer holds a single row in
+            // that case, so a wide warmup on `function` would overrun it.
             if shape > 1, let promptFn = promptFunction {
                 try encodeWithStatesNoOutputs(
                     function: promptFn, inputs: asyncInputs,
