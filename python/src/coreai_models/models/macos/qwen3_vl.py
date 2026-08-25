@@ -182,7 +182,10 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
         if self.prefill_mode:
-            return ()  # prompt graph: fills the KV cache, no logits
+            # A bare `return` causes torch export to trace a leaf node with value
+            # `None` rather than having no leaf nodes whatsoever. Remedied with
+            # empty tuple.
+            return ()
         return self.lm_head(out)
 
     @override
