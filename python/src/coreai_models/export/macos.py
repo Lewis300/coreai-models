@@ -70,6 +70,14 @@ def _set_prefill_mode(module: torch.nn.Module, prefill: bool) -> None:
 
     ``export_to_coreai`` also serves plain ``nn.Module`` components that know nothing
     about prefill, so this is a no-op for anything without the hook.
+
+    The flag lives on the module, shared by both traces, which makes this correct only
+    while the converter exports entrypoints *serially*. That holds today: each
+    ``add_pytorch_module`` runs its ``export_fn`` to completion before the next is
+    staged, and ``export_fn`` sets the mode as its first act. If the converter ever
+    reorders or parallelizes those traces, two exports would race on one flag and the
+    prefill graph could silently come out identical to ``main`` -- so this needs
+    revisiting alongside any such change, not just re-testing.
     """
     setter = getattr(module, "set_prefill_mode", None)
     if callable(setter):
@@ -85,7 +93,7 @@ def export_to_coreai(
     state_names: tuple[str, ...] | None = None,
     externalized_model: torch.nn.Module | None = None,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-    prompt_output_names: tuple[str, ...] | None = None,
+    export_prompt_graph: bool = False,
 ) -> AIProgram:
     """Export a stateful macOS model to a AIProgram.
 
@@ -119,11 +127,11 @@ def export_to_coreai(
         include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
             information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
             which embeds minimum debug information and makes the exported asset smaller.
-        prompt_output_names: When set, the model is traced a second time with prefill
-            mode on and staged as the ``prompt`` entrypoint, using these output names.
-            The prefill trace shares ``input_names``, ``state_names``,
-            ``reference_inputs`` and ``dynamic_shapes`` with ``main``; only its outputs
-            differ, since a prefill graph stops before the LM head.
+        export_prompt_graph: When True, the model is traced a second time with prefill
+            mode on and staged as the ``prompt`` entrypoint. That trace shares
+            ``input_names``, ``state_names``, ``reference_inputs`` and ``dynamic_shapes``
+            with ``main`` and declares *no* outputs -- the KV cache writes are its only
+            product, so everything they don't feed is dead code the converter drops.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -202,7 +210,7 @@ def export_to_coreai(
             state_names=state_names,
             entrypoint_name=MAIN_GRAPH_NAME,
         )
-        if prompt_output_names is not None:
+        if export_prompt_graph:
             logger.info(
                 f"Exporting prefill entrypoint {PROMPT_GRAPH_NAME!r} (its trace ends at the "
                 "last cache write, so 'skipping unused submodule' warnings for the tail of "
@@ -213,7 +221,7 @@ def export_to_coreai(
                 export_fn=make_export_fn(prefill=True),
                 externalize_modules=EXTERNALIZE_SPECS,
                 input_names=input_names,
-                output_names=prompt_output_names,
+                output_names=(),
                 state_names=state_names,
                 entrypoint_name=PROMPT_GRAPH_NAME,
             )
@@ -227,7 +235,10 @@ def export_to_coreai(
     try:
         return converter.to_coreai()
     finally:
-        # Don't leave a shared model in prefill mode for whatever runs next.
+        # Don't leave a shared model in prefill mode for whatever runs next. This also
+        # covers the failure path: if the second `add_pytorch_module` or `to_coreai`
+        # raises, the flag is still set, and the caller may well go on to use the same
+        # module (the standalone recipes hold one model across quantize + export).
         _set_prefill_mode(model, False)
 
 
@@ -282,8 +293,6 @@ def export_macos_model(
         contract_model, config, target_dtype, max_context_length
     )
 
-    prompt_output_names = model.export_prompt_output_names() if model.exports_prompt_graph else None
-
     logger.info("Exporting model to Core AI dialect...")
     coreai_program = export_to_coreai(
         model,
@@ -294,7 +303,7 @@ def export_macos_model(
         state_names=contract_model.export_state_names()[MAIN_GRAPH_NAME],
         include_debug_info=getattr(export_config, "include_debug_info", DEFAULT_INCLUDE_DEBUG_INFO),
         externalized_model=externalized_model,
-        prompt_output_names=prompt_output_names,
+        export_prompt_graph=contract_model.exports_prompt_graph,
     )
 
     logger.info("Optimizing AIProgram...")

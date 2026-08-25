@@ -14,15 +14,11 @@ either.
 MAIN_GRAPH_NAME = "main"
 
 # Optional second macOS entrypoint: the prefill graph. Same inputs and states as
-# `main`, but traced in prefill mode, so it stops before the LM head — the KV cache
-# writes are its only product. Only emitted for models that opt in via
-# `BaseForCausalLM.exports_prompt_graph`; the Swift runner picks it up when present.
+# `main`, but traced in prefill mode, so it stops before the LM head -- the KV cache
+# writes are its only product, and it declares no outputs at all. Only emitted for
+# models that opt in via `BaseForCausalLM.exports_prompt_graph`; the Swift runner picks
+# it up when present.
 PROMPT_GRAPH_NAME = "prompt"
-
-# The prompt graph's single output: a trivial read of the KV cache, kept only so the
-# graph has an output at all. Everything the cache writes don't feed — LM head, final
-# norm, last block's MLP — is then dead code. The runner binds it and never reads it.
-PROMPT_GRAPH_OUTPUT_NAME = "cache_probe"
 
 # KV cache names used by the Swift runner
 KEY_CACHE_NAME = "keyCache"

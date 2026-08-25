@@ -77,19 +77,6 @@ class KVCache:
         v_cache = torch.zeros(n_layers, 1, n_kv_heads, max_seq_len, head_dim)
         return cls(k_cache, v_cache)
 
-    def probe(self: Self) -> torch.Tensor:
-        """A trivial read of both caches, for a graph whose only product is the cache.
-
-        A prefill graph stops after the last cache write, so it has no logits to
-        return, but a graph still needs an output. Reading one element of each cache
-        keeps that output as cheap as it can be: everything the cache writes don't
-        depend on — the final norm, the last block's MLP — is dead code the compiler
-        drops. The value itself is meaningless; nothing reads it.
-
-        Shaped ``(1, 1, 1)`` so the runner binds it at the same rank as logits.
-        """
-        return (self._k_cache[0, 0, 0, 0, 0] + self._v_cache[0, 0, 0, 0, 0]).reshape(1, 1, 1)
-
     def update_and_fetch(
         self: Self,
         layer_idx: int,

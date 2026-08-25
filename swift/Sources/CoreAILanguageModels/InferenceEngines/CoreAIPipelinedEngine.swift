@@ -37,14 +37,6 @@ private let minimumMPSNDArrayBufferSize = 64
 /// so it stops before the LM head. Its only product is the KV cache it fills.
 private let promptFunctionName = "prompt"
 
-/// Concrete shape for the prompt graph's output at a given query length.
-///
-/// Only the sequence dim is dynamic in that output, so resolving every dynamic dim to
-/// `queryLength` yields this step's shape. The values themselves are never read.
-private func promptOutputShape(descriptor: NDArrayDescriptor, queryLength: Int) -> [Int] {
-    descriptor.shape.map { $0 < 0 ? queryLength : $0 }
-}
-
 // MARK: - Core AI Pipelined Engine (Public Wrapper)
 
 /// GPU-pipelined inference engine using Core AI's encode API.
@@ -548,12 +540,18 @@ private struct EngineImpl: ~Copyable {
     // Optional prefill graph. When the asset carries one, every prefill step but the
     // last runs here instead of `function`: it has no LM head, so it is cheaper, but it
     // also produces no logits — the final prompt token must still go through `function`
-    // to seed sampling. All four fields are set together or all nil.
+    // to seed sampling. The graph declares no outputs at all, so there is nothing to
+    // bind and no scratch buffer to own.
     let promptFunction: InferenceFunction?
-    let promptOutputName: String?
-    let promptOutputBaseDesc: NDArrayDescriptor?
-    let promptOutputBuffer: MTLBuffer?
-    /// Longest query the prompt graph's output buffer is sized for.
+    /// Longest query the prompt graph's output buffer is sized for, and the chunk size the
+    /// prefill loop uses whenever that graph is present.
+    ///
+    /// Derived as `min(config.prefillChunkSize, config.maxContextLength)`, so it equals
+    /// `prefillChunkSize` except where a model's context is smaller than one chunk. The two
+    /// never compete: with a prompt graph this value alone sizes the chunks, and
+    /// `chunkThreshold` / `prefillChunkSize` govern only the fallback path through
+    /// `function`. Nothing may encode a wider query than this — the scratch output buffer
+    /// is sized for exactly it (see the clamp in `performWarmup`).
     let promptMaxQueryLength: Int
 
     // Descriptor metadata
@@ -769,9 +767,6 @@ private struct EngineImpl: ~Copyable {
         // exactly as before.
         let promptMaxQueryLen = max(1, min(config.prefillChunkSize, config.maxContextLength))
         var promptFn: InferenceFunction? = nil
-        var promptOutName: String? = nil
-        var promptOutDesc: NDArrayDescriptor? = nil
-        var promptOutBuffer: MTLBuffer? = nil
         if let promptDescriptor = model.functionDescriptor(for: promptFunctionName) {
             // The runner binds both graphs' inputs and states by the same names, so a
             // prompt graph that disagrees is a mismatched asset, not a fallback case.
@@ -785,35 +780,21 @@ private struct EngineImpl: ~Copyable {
                     "'\(promptFunctionName)' graph states \(promptDescriptor.stateNames) do not match "
                         + "'\(config.function)' states \(descriptor.stateNames)")
             }
-            guard let outName = promptDescriptor.outputNames.first else {
+            // The prefill graph's product is the KV cache it writes, so it declares no
+            // outputs. One that does is a stale asset built before that change, not
+            // something to accommodate: binding its output would need a descriptor and a
+            // scratch buffer this engine no longer carries.
+            guard promptDescriptor.outputNames.isEmpty else {
                 throw InferenceRuntimeError.invalidOutputType(
-                    "'\(promptFunctionName)' graph has no outputs")
-            }
-            guard case .ndArray(let outDesc) = promptDescriptor.outputDescriptor(of: outName) else {
-                throw InferenceRuntimeError.invalidOutputType(
-                    "Cannot get descriptor for '\(promptFunctionName)' output '\(outName)'")
+                    "'\(promptFunctionName)' graph declares outputs "
+                        + "\(promptDescriptor.outputNames); expected none. Re-export the model.")
             }
             guard let loaded = try model.loadFunction(named: promptFunctionName) else {
                 throw InferenceRuntimeError.genericError(
                     "Cannot load function '\(promptFunctionName)'")
             }
-            // One buffer, sized for the widest chunk the prefill path ever encodes.
-            // Nothing reads it, so successive chunks can share it.
-            let shape = promptOutputShape(descriptor: outDesc, queryLength: promptMaxQueryLen)
-            let byteCount = max(
-                minimumMPSNDArrayBufferSize,
-                outDesc.resolvingDynamicDimensions(shape).minimumByteCount)
-            guard let buf = device.makeBuffer(length: byteCount, options: .storageModeShared) else {
-                throw InferenceRuntimeError.bufferAllocationFailed(
-                    "promptOutputBuffer (\(byteCount) bytes)")
-            }
             promptFn = loaded
-            promptOutName = outName
-            promptOutDesc = outDesc
-            promptOutBuffer = buf
-            CLILogger.log(
-                "Found '\(promptFunctionName)' graph — prefill skips the LM head "
-                    + "(output '\(outName)' \(shape), \(byteCount) bytes)")
+            CLILogger.log("Found '\(promptFunctionName)' graph — prefill skips the LM head")
         }
 
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift).
@@ -846,9 +827,6 @@ private struct EngineImpl: ~Copyable {
         self.options = options
         self.function = fn
         self.promptFunction = promptFn
-        self.promptOutputName = promptOutName
-        self.promptOutputBaseDesc = promptOutDesc
-        self.promptOutputBuffer = promptOutBuffer
         self.promptMaxQueryLength = promptMaxQueryLen
         self.pipelineQueue = pipelineQueue
         self.computeStream = computeStream
@@ -1060,8 +1038,8 @@ private struct EngineImpl: ~Copyable {
             keyState: &keyState, keyCacheName: keyCacheName,
             valState: &valState, valueCacheName: valueCacheName,
             additionalStates: additionalStates,
-            outputBuffer: logitsOutputBuffer, outputName: logitsOutputName,
-            outputShape: logitsShape, outputStrides: logitsStrides,
+            logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
+            logitsShape: logitsShape, logitsStrides: logitsStrides,
             computeStream: computeStream)
         logitsSpan.end()
 
@@ -1727,43 +1705,30 @@ private struct EngineImpl: ~Copyable {
         var valState = unsafe InferenceFunction.AsyncMutableValue(
             unsafeBuffer: valBuffer, byteOffset: 0,
             scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
-        // Bind whichever graph's output this chunk produces: the prompt graph's
-        // by-product, or `function`'s logits into the shared growing buffer.
-        let chunkFunction: InferenceFunction
-        let outputName: String
-        let outputBuffer: MTLBuffer
-        let outputShape: [Int]
-        let outputStrides: [Int]
-        let outputScalarType: NDArray.ScalarType
-        if let promptFn = promptFunction,
-            let promptName = promptOutputName,
-            let promptDesc = promptOutputBaseDesc,
-            let promptBuffer = promptOutputBuffer
-        {
-            chunkFunction = promptFn
-            outputName = promptName
-            outputBuffer = promptBuffer
-            outputShape = promptOutputShape(descriptor: promptDesc, queryLength: queryLength)
-            outputStrides = try resolvedStrides(descriptor: promptDesc, shape: outputShape)
-            outputScalarType = promptDesc.scalarType
+        // The prompt graph has no outputs, so a chunk on it binds nothing at all.
+        // Without one, `function` serves the chunk and its logits go to the shared
+        // growing buffer, where nobody reads them either — that is the cost the prompt
+        // graph exists to avoid.
+        if let promptFn = promptFunction {
+            try encodeWithStatesNoOutputs(
+                function: promptFn, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                computeStream: computeStream)
         } else {
-            chunkFunction = function
-            outputName = logitsOutputName
-            outputBuffer = logits.metalBuffer
-            outputShape = [1, queryLength, vocabSize]
-            outputStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: outputShape)
-            outputScalarType = logitsBaseDesc.scalarType
+            let logitsShape = [1, queryLength, vocabSize]
+            try encodeWithStates(
+                function: function, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
+                logitsShape: logitsShape,
+                logitsStrides: try resolvedStrides(
+                    descriptor: logitsBaseDesc, shape: logitsShape),
+                computeStream: computeStream)
         }
-
-        try encodeWithStates(
-            function: chunkFunction, inputs: asyncInputs,
-            keyState: &keyState, keyCacheName: keyCacheName,
-            valState: &valState, valueCacheName: valueCacheName,
-            additionalStates: additionalStates,
-            outputBuffer: outputBuffer, outputName: outputName,
-            outputShape: outputShape, outputStrides: outputStrides,
-            outputScalarType: outputScalarType,
-            computeStream: computeStream)
 
         processedTokenCount += queryLength
         step += 1
@@ -1859,42 +1824,31 @@ private struct EngineImpl: ~Copyable {
             var valState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: valBuffer, byteOffset: 0,
                 scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
-            // Warm the graph this shape will actually run on: multi-token shapes go
-            // through the prompt graph when there is one, single tokens through `function`.
-            let warmFunction: InferenceFunction
-            let outName: String
-            let outBuffer: MTLBuffer
-            let outShape: [Int]
-            let outStrides: [Int]
-            let outScalarType: NDArray.ScalarType
-            if shape > 1, let promptFn = promptFunction,
-                let promptName = promptOutputName,
-                let promptDesc = promptOutputBaseDesc,
-                let promptBuffer = promptOutputBuffer
-            {
-                warmFunction = promptFn
-                outName = promptName
-                outBuffer = promptBuffer
-                outShape = promptOutputShape(descriptor: promptDesc, queryLength: shape)
-                outStrides = try resolvedStrides(descriptor: promptDesc, shape: outShape)
-                outScalarType = promptDesc.scalarType
-            } else {
-                warmFunction = function
-                outName = logitsOutputName
-                outBuffer = logits.metalBuffer
-                outShape = [1, shape, vocabSize]
-                outStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: outShape)
-                outScalarType = logitsBaseDesc.scalarType
+            // Warm the graph this shape will actually run on. Multi-token shapes must go
+            // to the prompt graph when there is one -- not merely to avoid compiling
+            // kernels nothing uses, but because the logits buffer is clamped to a single
+            // row whenever a prompt graph exists, so a multi-token warmup on `function`
+            // would write shape x vocab into a 1 x vocab allocation.
+            if shape > 1, let promptFn = promptFunction {
+                try encodeWithStatesNoOutputs(
+                    function: promptFn, inputs: asyncInputs,
+                    keyState: &keyState, keyCacheName: keyCacheName,
+                    valState: &valState, valueCacheName: valueCacheName,
+                    additionalStates: additionalStates,
+                    computeStream: computeStream)
+                step += 1
+                continue
             }
 
+            let lShape = [1, shape, vocabSize]
             try encodeWithStates(
-                function: warmFunction, inputs: asyncInputs,
+                function: function, inputs: asyncInputs,
                 keyState: &keyState, keyCacheName: keyCacheName,
                 valState: &valState, valueCacheName: valueCacheName,
                 additionalStates: additionalStates,
-                outputBuffer: outBuffer, outputName: outName,
-                outputShape: outShape, outputStrides: outStrides,
-                outputScalarType: outScalarType,
+                logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
+                logitsShape: lShape,
+                logitsStrides: try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape),
                 computeStream: computeStream)
 
             // Warm up argmax kernel using pipeline-matched decode buffers

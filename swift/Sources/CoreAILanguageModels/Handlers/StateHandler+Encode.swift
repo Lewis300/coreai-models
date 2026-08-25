@@ -7,11 +7,7 @@ import CoreAI
 import Metal
 
 /// Encode an inference step with KV cache states, optional additional MTLBuffer
-/// states, and a single output.
-///
-/// The output is the graph's logits for `main`, or the unread by-product of a
-/// prefill-only `prompt` graph — hence the neutral `output*` naming and the explicit
-/// scalar type.
+/// states, and logits output.
 func encodeWithStates(
     function: InferenceFunction,
     inputs: [String: InferenceFunction.AsyncValue],
@@ -20,11 +16,10 @@ func encodeWithStates(
     valState: inout InferenceFunction.AsyncMutableValue,
     valueCacheName: String,
     additionalStates: FixedMTLBufferState?,
-    outputBuffer: MTLBuffer,
-    outputName: String,
-    outputShape: [Int],
-    outputStrides: [Int],
-    outputScalarType: NDArray.ScalarType = .float16,
+    logitsBuffer: MTLBuffer,
+    logitsName: String,
+    logitsShape: [Int],
+    logitsStrides: [Int],
     computeStream: ComputeStream
 ) throws {
     var asyncStates = InferenceFunction.AsyncMutableViews()
@@ -32,12 +27,37 @@ func encodeWithStates(
     asyncStates.insert(&valState, for: valueCacheName)
     additionalStates?.bind(into: &asyncStates)
 
-    var output = unsafe InferenceFunction.AsyncMutableValue(
-        unsafeBuffer: outputBuffer, byteOffset: 0,
-        scalarType: outputScalarType, shape: outputShape, strides: outputStrides)
+    var logitsOutput = unsafe InferenceFunction.AsyncMutableValue(
+        unsafeBuffer: logitsBuffer, byteOffset: 0,
+        scalarType: .float16, shape: logitsShape, strides: logitsStrides)
     var asyncOutputs = InferenceFunction.AsyncMutableViews()
-    asyncOutputs.insert(&output, for: outputName)
+    asyncOutputs.insert(&logitsOutput, for: logitsName)
     let _ = try function.encode(
         inputs: inputs, states: consume asyncStates,
         outputViews: consume asyncOutputs, to: computeStream)
+}
+
+/// Encode an inference step that produces no outputs at all.
+///
+/// A prefill (`prompt`) graph's only product is the KV cache it writes, so it declares no
+/// outputs and there is nothing to bind. Same states as `encodeWithStates`, empty output
+/// views.
+func encodeWithStatesNoOutputs(
+    function: InferenceFunction,
+    inputs: [String: InferenceFunction.AsyncValue],
+    keyState: inout InferenceFunction.AsyncMutableValue,
+    keyCacheName: String,
+    valState: inout InferenceFunction.AsyncMutableValue,
+    valueCacheName: String,
+    additionalStates: FixedMTLBufferState?,
+    computeStream: ComputeStream
+) throws {
+    var asyncStates = InferenceFunction.AsyncMutableViews()
+    asyncStates.insert(&keyState, for: keyCacheName)
+    asyncStates.insert(&valState, for: valueCacheName)
+    additionalStates?.bind(into: &asyncStates)
+
+    let _ = try function.encode(
+        inputs: inputs, states: consume asyncStates,
+        outputViews: InferenceFunction.AsyncMutableViews(), to: computeStream)
 }
