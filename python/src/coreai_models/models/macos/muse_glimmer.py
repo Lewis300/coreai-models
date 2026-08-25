@@ -191,6 +191,9 @@ class MuseGlimmerModel(nn.Module):
 class MuseGlimmerForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = None  # Not in our transformers version
 
+    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``.
+    exports_prompt_graph = True
+
     @classmethod
     def _get_reauthored_config(cls, hf_config, max_context_length=None, num_layers=None):
         text_config = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
@@ -332,9 +335,14 @@ class MuseGlimmerForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            # A bare `return` causes torch export to trace a leaf node with value
+            # `None` rather than having no leaf nodes whatsoever. Remedied with
+            # empty tuple.
+            return ()
         logits = self.lm_head(out)
         if self._softcap:
             logits = torch.tanh(logits / self._softcap) * self._softcap
