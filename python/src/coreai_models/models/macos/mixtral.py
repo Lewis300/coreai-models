@@ -173,6 +173,9 @@ class MixtralModel(nn.Module):
 class MixtralForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFMixtralForCausalLM
 
+    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``.
+    exports_prompt_graph = True
+
     @override
     def _init_model(self, config: MixtralConfig) -> None:
         self.model = MixtralModel(config)
@@ -185,9 +188,11 @@ class MixtralForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            return ()  # prompt graph: fills the KV cache, no logits
         return self.lm_head(out)
 
     @override

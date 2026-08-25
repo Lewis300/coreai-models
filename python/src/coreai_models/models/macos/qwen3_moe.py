@@ -203,6 +203,9 @@ class Qwen3MoeModel(nn.Module):
 class Qwen3MoeForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFQwen3MoeForCausalLM
 
+    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``.
+    exports_prompt_graph = True
+
     @override
     def _init_model(self, config: Qwen3MoeConfig) -> None:
         self.model = Qwen3MoeModel(config)
@@ -215,9 +218,11 @@ class Qwen3MoeForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            return ()  # prompt graph: fills the KV cache, no logits
         return self.lm_head(out)
 
     @override

@@ -227,6 +227,9 @@ class GptOssModel(torch.nn.Module):
 class GptOssForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFGptOssForCausalLM
 
+    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``.
+    exports_prompt_graph = True
+
     @override
     def _init_model(self: Self, config: GptOssConfig) -> None:
         self.config = config
@@ -415,7 +418,9 @@ class GptOssForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            return ()  # prompt graph: fills the KV cache, no logits
         return self.lm_head(out)

@@ -140,6 +140,11 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
 
     _HF_MODEL_CLASS = HFQwen3VLForConditionalGeneration
 
+    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``. Only this
+    # class; the Embeddings variant below is exported by `vlm/export.py`, which does
+    # not request a prompt graph.
+    exports_prompt_graph = True
+
     @classmethod
     def _get_reauthored_config(
         cls,
@@ -173,9 +178,11 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
+        if self.prefill_mode:
+            return ()  # prompt graph: fills the KV cache, no logits
         return self.lm_head(out)
 
     @override

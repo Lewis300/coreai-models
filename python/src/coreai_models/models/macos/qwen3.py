@@ -172,14 +172,11 @@ class Qwen3ForCausalLM(BaseForCausalLM):
         position_ids: torch.IntTensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple:
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, position_ids, cache)
         if self.prefill_mode:
-            # Prompt graph: only the KV cache writes matter, and the runner samples from
-            # a separate single-token pass. Returning nothing drops the LM head and the
-            # tail of the model.
-            return ()
+            return ()  # prompt graph: fills the KV cache, no logits
         return self.lm_head(out)
 
     @override
