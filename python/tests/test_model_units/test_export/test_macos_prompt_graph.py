@@ -8,9 +8,10 @@
 A model that sets ``exports_prompt_graph`` gets a second entrypoint traced from the
 same signature with prefill mode on. It must declare no outputs and bind exactly the
 inputs and states ``main`` does, because that is the contract the Swift runner
-validates in ``loadPromptGraph``. Beyond that shape contract, the KV cache it writes
-is its only product, so the last test here executes the graph and checks that cache
-numerically against eager torch.
+validates in ``loadPromptGraph``. Beyond that shape contract, the KV cache it writes is
+its only product, so one test here executes the graph and checks that cache numerically
+against eager torch. A model that reaches the exporter already flattened can't produce
+one at all, which is also covered.
 
 Exports a tiny randomly-initialised model, so no HuggingFace weights are needed, but
 it does run a real conversion and therefore needs ``coreai-torch``.
@@ -18,6 +19,7 @@ it does run a real conversion and therefore needs ``coreai-torch``.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -39,6 +41,7 @@ try:
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
     from coreai_models.export.macos import export_macos_model
+    from coreai_models.models.base import TraceSpec
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
     from coreai_models.primitives.macos.cache import KVCache
 
@@ -211,6 +214,32 @@ async def test_prompt_graph_is_absent_when_opted_out() -> None:
     assert PROMPT_GRAPH_NAME not in descs
     assert list(descs[MAIN_GRAPH_NAME].output_names) == ["logits"]
     assert model.prefill_mode is False
+
+
+@pytest.mark.asyncio
+async def test_flattened_model_gets_no_prompt_graph(caplog: pytest.LogCaptureFixture) -> None:
+    """Graph-mode quantization hands the exporter a flattened module, which resolved
+    ``prefill_mode`` when it was captured. Asking for a prefill entrypoint from one can't
+    work, so the export says so and emits ``main`` alone rather than a second copy of it.
+    """
+    config = _tiny_config()
+    torch.manual_seed(0)
+    model = Qwen3ForCausalLM(config).to(torch.float16).eval()
+    spec = TraceSpec(max_context_length=MAX_CTX, cache_seq_len=MAX_CTX)
+    reference_inputs = model.build_reference_inputs(config, torch.float16, spec)[MAIN_GRAPH_NAME]
+    dynamic_shapes = model.build_dynamic_shapes(config, spec)[MAIN_GRAPH_NAME]
+    with torch.no_grad():
+        flattened = torch.export.export(
+            model, args=tuple(reference_inputs.values()), dynamic_shapes=dynamic_shapes
+        ).module()
+
+    assert model.exports_prompt_graph
+    export_config = SimpleNamespace(max_context_length=MAX_CTX, compute_precision="float16")
+    with caplog.at_level(logging.WARNING, logger="coreai_models.export.macos"):
+        program = export_macos_model(flattened, config, export_config, externalized_model=model)
+
+    assert set(await _function_descriptors(program)) == {MAIN_GRAPH_NAME}
+    assert PROMPT_GRAPH_NAME in caplog.text
 
 
 @pytest.mark.asyncio

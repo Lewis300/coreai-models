@@ -128,6 +128,8 @@ def export_to_coreai(
             on and stage it as the ``prompt`` entrypoint. It shares ``input_names``,
             ``state_names``, ``reference_inputs`` and ``dynamic_shapes`` with ``main`` and
             declares no outputs, so everything the KV cache writes don't feed is dropped.
+            Warned about and skipped when ``model`` is flattened, which has no prefill
+            mode left to set.
 
     Returns:
         A AIProgram ready for optimization and compilation.
@@ -183,8 +185,18 @@ def export_to_coreai(
                 "A flattened torch.fx.GraphModule needs an externalized_model handle. "
                 "Call patch_model_for_externalization on the model before quantization."
             )
-        # No prefill entrypoint here: the flattened graph was captured in decode mode,
-        # so there is no `prefill_mode` left to toggle.
+        if export_prompt_graph:
+            # The flattened graph resolved `prefill_mode` when it was captured, so the
+            # flag no longer does anything here and a second trace would come out a copy
+            # of `main` -- LM head, `logits` output and all, which the runner rejects.
+            # Emitting nothing is safe: it falls back to `main` for prefill.
+            logger.warning(
+                f"Not exporting the {PROMPT_GRAPH_NAME!r} entrypoint: this model arrives "
+                "flattened from graph-mode quantization, already captured in decode mode, so "
+                "prefill mode can no longer be switched on. Prefill will run on "
+                f"{MAIN_GRAPH_NAME!r} instead, LM head and all. Quantize in eager mode "
+                "(execution_mode: eager, or --quantization-mode eager) to get a prompt graph."
+            )
         exported_program = make_export_fn(prefill=False)(model, pass_inputs_as_kwargs=False)
         externalized_programs = subexport_and_restore(externalized_model, exported_program)
 
