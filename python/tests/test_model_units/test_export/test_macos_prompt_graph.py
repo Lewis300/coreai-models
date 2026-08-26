@@ -8,7 +8,9 @@
 A model that sets ``exports_prompt_graph`` gets a second entrypoint traced from the
 same signature with prefill mode on. It must declare no outputs and bind exactly the
 inputs and states ``main`` does, because that is the contract the Swift runner
-validates in ``loadPromptGraph``.
+validates in ``loadPromptGraph``. Beyond that shape contract, the KV cache it writes
+is its only product, so the last test here executes the graph and checks that cache
+numerically against eager torch.
 
 Exports a tiny randomly-initialised model, so no HuggingFace weights are needed, but
 it does run a real conversion and therefore needs ``coreai-torch``.
@@ -16,10 +18,12 @@ it does run a real conversion and therefore needs ``coreai-torch``.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -36,12 +40,24 @@ try:
 
     from coreai_models.export.macos import export_macos_model
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
+    from coreai_models.primitives.macos.cache import KVCache
+
+    # Imported here rather than at module scope: `testing_utils` imports
+    # `coreai_torch` unguarded, so a top-level import would break collection in
+    # environments without the toolchain, which the skip below exists to tolerate.
+    from tests._runner_infra.testing_utils import assert_close
 
     HAS_COREAI = True
 except ImportError:  # pragma: no cover - depends on the installed toolchain
     HAS_COREAI = False
 
 MAX_CTX = 256
+
+# Prompt length for the parity test. Longer than one token so prefill is doing real
+# multi-token work, and >= the traced `position_ids` minimum of QUANT_TRACE_QUERY_LEN.
+PREFILL_LEN = 32
+
+_LOCAL_RUNTIME = os.environ.get("USE_LOCAL_COREAI", "0") == "1"
 
 pytestmark = pytest.mark.skipif(not HAS_COREAI, reason="coreai-torch not available")
 
@@ -73,6 +89,8 @@ def _export(*, opts_in: bool) -> tuple[torch.nn.Module, object]:
         exports_prompt_graph = opts_in
 
     config = _tiny_config()
+    # Seeded so the parity test's error margin is reproducible run to run.
+    torch.manual_seed(0)
     model = _Model(config).to(torch.float16).eval()
     # `compute_precision` has to agree with the dtype above: the exporter resolves the
     # trace dtype from it, not from the model's parameters.
@@ -88,6 +106,77 @@ async def _function_descriptors(program) -> dict[str, object]:  # type: ignore[n
         program.save_asset(path, rt.AIModelAssetMetadata())
         model = await rt.AIModel.load(path)
         return {name: model.load_function(name).desc for name in model.function_names}
+
+
+def _prefill_inputs(config: Qwen3Config) -> tuple[torch.Tensor, torch.Tensor]:
+    """One whole prompt: ``position_ids`` is as long as ``input_ids``, so offset 0."""
+    generator = torch.Generator().manual_seed(0)
+    input_ids = torch.randint(
+        1, config.vocab_size, (1, PREFILL_LEN), dtype=torch.int32, generator=generator
+    )
+    position_ids = torch.arange(PREFILL_LEN, dtype=torch.int32).unsqueeze(0)
+    return input_ids, position_ids
+
+
+def _zeroed_caches() -> tuple[torch.Tensor, torch.Tensor]:
+    """A fresh, empty cache at the exported context length."""
+    return KVCache.create_cache_tensors(_tiny_config(), dtype=torch.float16, seq_len=MAX_CTX)
+
+
+async def _run_entrypoint(
+    program,  # type: ignore[no-untyped-def]
+    name: str,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run one entrypoint over an empty cache and return the state it wrote.
+
+    The KV cache is the prompt graph's only product -- it declares no outputs -- so
+    the state arrays are what there is to compare. They're copied out before the asset
+    is torn down, since they may alias memory it owns.
+    """
+    k_cache, v_cache = _zeroed_caches()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "model.aimodel"
+        program.save_asset(path, rt.AIModelAssetMetadata())
+        model = await rt.AIModel.load(path)
+        function = model.load_function(name)
+        state = {
+            KEY_CACHE_NAME: rt.NDArray(data=k_cache),
+            VALUE_CACHE_NAME: rt.NDArray(data=v_cache),
+        }
+        await function(
+            {
+                "input_ids": rt.NDArray(data=input_ids.contiguous()),
+                "position_ids": rt.NDArray(data=position_ids.contiguous()),
+            },
+            state=state,
+        )
+        return (
+            state[KEY_CACHE_NAME].numpy().copy(),
+            state[VALUE_CACHE_NAME].numpy().copy(),
+        )
+
+
+def _torch_prefill(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager reference: run ``forward`` in prefill mode and return the caches it filled.
+
+    This is the same authoring the prompt graph is traced from, in prefill mode, which
+    is the only reference available: HuggingFace has no prefill-only forward to compare
+    against. So this pins the conversion, not the authoring.
+    """
+    k_cache, v_cache = _zeroed_caches()
+    model.set_prefill_mode(True)
+    try:
+        with torch.no_grad():
+            assert model(input_ids, position_ids, k_cache, v_cache) == ()
+    finally:
+        model.set_prefill_mode(False)
+    return k_cache, v_cache
 
 
 @pytest.mark.asyncio
@@ -122,3 +211,44 @@ async def test_prompt_graph_is_absent_when_opted_out() -> None:
     assert PROMPT_GRAPH_NAME not in descs
     assert list(descs[MAIN_GRAPH_NAME].output_names) == ["logits"]
     assert model.prefill_mode is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _LOCAL_RUNTIME,
+    reason="running the prompt graph needs the local Core AI runtime; run with USE_LOCAL_COREAI=1",
+)
+async def test_prompt_graph_kv_writes_match_torch() -> None:
+    """The converted prompt graph fills the cache the way eager prefill does.
+
+    The shape assertions above would pass just as well for a prompt graph that dropped
+    its cache writes along with the LM head, or wrote them at the wrong offsets, since
+    the graph has no outputs to be wrong. This is what catches that.
+
+    The reference is our own authoring in prefill mode, not HuggingFace: HF has no
+    prefill-only forward to compare against. So this pins the conversion, not the
+    authoring, which is what the rest of ``test_models/`` covers.
+    """
+    model, program = _export(opts_in=True)
+    input_ids, position_ids = _prefill_inputs(_tiny_config())
+
+    k_coreai, v_coreai = await _run_entrypoint(program, PROMPT_GRAPH_NAME, input_ids, position_ids)
+    k_torch, v_torch = _torch_prefill(model, input_ids, position_ids)
+
+    # Not vacuous: the prompt's positions really were written, so an all-zeros cache on
+    # both sides can't pass. Positions past the prompt stay zero, and comparing the full
+    # tensor keeps a graph that scribbles beyond its range from passing either.
+    written = (slice(None), slice(None), slice(None), slice(0, PREFILL_LEN))
+    assert torch.any(k_torch[written] != 0)
+    assert torch.any(v_torch[written] != 0)
+
+    # fp32 so the comparison isn't done in the caches' own fp16. Tolerances are set for
+    # fp16 rounding differences between the runtime and eager: the observed max abs
+    # error is ~5e-3 on values of order 1, and rtol alone won't do because entries near
+    # zero carry a large relative error.
+    for name, torch_cache, coreai_cache in (
+        (KEY_CACHE_NAME, k_torch, k_coreai),
+        (VALUE_CACHE_NAME, v_torch, v_coreai),
+    ):
+        print(f"comparing {name}")
+        assert_close(coreai_cache.astype(np.float32), torch_cache.float(), atol=1e-2, rtol=1e-2)
