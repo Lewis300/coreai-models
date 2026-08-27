@@ -20,7 +20,6 @@ it does run a real conversion and therefore needs ``coreai-torch``.
 from __future__ import annotations
 
 import logging
-import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,8 +58,6 @@ MAX_CTX = 256
 # Prompt length for the parity test. Longer than one token so prefill is doing real
 # multi-token work, and >= the traced `position_ids` minimum of QUANT_TRACE_QUERY_LEN.
 PREFILL_LEN = 32
-
-_LOCAL_RUNTIME = os.environ.get("USE_LOCAL_COREAI", "0") == "1"
 
 pytestmark = pytest.mark.skipif(not HAS_COREAI, reason="coreai-torch not available")
 
@@ -243,10 +240,6 @@ async def test_flattened_model_gets_no_prompt_graph(caplog: pytest.LogCaptureFix
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not _LOCAL_RUNTIME,
-    reason="running the prompt graph needs the local Core AI runtime; run with USE_LOCAL_COREAI=1",
-)
 async def test_prompt_graph_kv_writes_match_torch() -> None:
     """The converted prompt graph fills the cache the way eager prefill does.
 
