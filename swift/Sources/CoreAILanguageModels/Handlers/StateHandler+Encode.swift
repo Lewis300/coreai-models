@@ -39,7 +39,7 @@ func encodeWithStates(
 
 /// Encode an inference step with no outputs.
 ///
-/// The prompt graph only fills the KV cache, so it declares no outputs and there is
+/// The prefill graph only fills the KV cache, so it declares no outputs and there is
 /// nothing to bind. Same states as `encodeWithStates`.
 func encodeWithStatesNoOutputs(
     function: InferenceFunction,

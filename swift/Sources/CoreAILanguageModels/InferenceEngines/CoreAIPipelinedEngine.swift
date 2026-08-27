@@ -534,11 +534,11 @@ private struct EngineImpl: ~Copyable {
 
     // Prefill chunks run here when the asset has this graph. It produces no logits, so
     // the last prompt token still goes through `function` to seed sampling.
-    let promptFunction: InferenceFunction?
-    /// Chunk width used when a prompt graph is present, and the widest query warmup runs
+    let prefillFunction: InferenceFunction?
+    /// Chunk width used when a prefill graph is present, and the widest query warmup runs
     /// on it: `config.prefillChunkSize` capped at the context. `chunkThreshold` and
     /// `prefillChunkSize` apply only to the fallback path through `function`.
-    let promptMaxQueryLength: Int
+    let prefillMaxQueryLength: Int
 
     // Descriptor metadata
     let inputIdsName: String
@@ -749,16 +749,16 @@ private struct EngineImpl: ~Copyable {
                 "Pipelined additional states: \(allFixedNames.joined(separator: ", "))")
         }
 
-        // Without a prompt graph, prefill runs through `function` exactly as before.
-        let promptMaxQueryLen = max(1, min(config.prefillChunkSize, config.maxContextLength))
-        let promptFn = try loadPromptGraph(
+        // Without a prefill graph, prefill runs through `function` exactly as before.
+        let prefillMaxQueryLen = max(1, min(config.prefillChunkSize, config.maxContextLength))
+        let prefillFn = try loadPrefillGraph(
             from: model, matching: descriptor, mainName: config.function)
-        if promptFn != nil {
-            CLILogger.log("Found '\(promptGraphFunctionName)' graph — prefill skips the LM head")
+        if prefillFn != nil {
+            CLILogger.log("Found '\(prefillGraphFunctionName)' graph — prefill skips the LM head")
         }
 
         // Create growing logits buffer (reuses TensorStorage+CoreAI.swift).
-        // With a prompt graph, `function` only ever sees one token, so a prompt-sized
+        // With a prefill graph, `function` only ever sees one token, so a prompt-sized
         // logits buffer — hundreds of MB at large vocabularies — would go unused.
         let logitsRef = try GrowingLogitsBuffer(
             device: device,
@@ -766,7 +766,7 @@ private struct EngineImpl: ~Copyable {
             name: logitsOutputName,
             vocabSize: config.vocabSize,
             maxCapacity: config.maxContextLength,
-            initialCapacity: promptFn != nil ? 1 : averageExpectedPromptSize
+            initialCapacity: prefillFn != nil ? 1 : averageExpectedPromptSize
         )
 
         // Load inference function
@@ -786,8 +786,8 @@ private struct EngineImpl: ~Copyable {
         self.config = config
         self.options = options
         self.function = fn
-        self.promptFunction = promptFn
-        self.promptMaxQueryLength = promptMaxQueryLen
+        self.prefillFunction = prefillFn
+        self.prefillMaxQueryLength = prefillMaxQueryLen
         self.pipelineQueue = pipelineQueue
         self.computeStream = computeStream
         self.device = device
@@ -1563,14 +1563,14 @@ private struct EngineImpl: ~Copyable {
     /// The caller must run the returned slice through `function` to produce
     /// logits and seed the decode loop.
     ///
-    /// With a `prompt` graph, everything but the final token goes through it in chunks:
+    /// With a `prefill` graph, everything but the final token goes through it in chunks:
     /// it has no LM head, so it can't seed sampling, and one token has to be held back.
     /// Without one, `function` serves prefill too, chunked only above `chunkThreshold`,
     /// and the trailing partial chunk carries the logits.
     private mutating func prefill(prompt: [Int32]) async throws -> ArraySlice<Int32> {
-        if promptFunction != nil {
+        if prefillFunction != nil {
             var head = prompt.dropLast()
-            let chunkSize = promptMaxQueryLength
+            let chunkSize = prefillMaxQueryLength
             while !head.isEmpty {
                 let chunk = head.prefix(chunkSize)
                 try await _encodeChunk(tokens: Array(chunk))
@@ -1610,12 +1610,12 @@ private struct EngineImpl: ~Copyable {
 
     /// Encode one prefill chunk: KV cache writes only, no sampling.
     ///
-    /// A chunk needs no logits, so it runs on the prompt graph when the asset has one and
+    /// A chunk needs no logits, so it runs on the prefill graph when the asset has one and
     /// binds no output. Otherwise `function` runs it and its logits go unread.
     private mutating func _encodeChunk(tokens: [Int32]) async throws {
         let queryLength = tokens.count
         let currentStep = processedTokenCount
-        let graphName = promptFunction != nil ? promptGraphFunctionName : config.function
+        let graphName = prefillFunction != nil ? prefillGraphFunctionName : config.function
 
         let chunkID = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIPipelinedChunk",
@@ -1664,9 +1664,9 @@ private struct EngineImpl: ~Copyable {
         var valState = unsafe InferenceFunction.AsyncMutableValue(
             unsafeBuffer: valBuffer, byteOffset: 0,
             scalarType: valueCacheScalarType, shape: valShape, strides: valStrides)
-        if let promptFn = promptFunction {
+        if let prefillFn = prefillFunction {
             try encodeWithStatesNoOutputs(
-                function: promptFn, inputs: asyncInputs,
+                function: prefillFn, inputs: asyncInputs,
                 keyState: &keyState, keyCacheName: keyCacheName,
                 valState: &valState, valueCacheName: valueCacheName,
                 additionalStates: additionalStates,
@@ -1718,18 +1718,18 @@ private struct EngineImpl: ~Copyable {
         } else {
             shapesToWarm = [1, defaultWarmupLength]
         }
-        if promptFunction != nil {
-            // Multi-token shapes warm the prompt graph, so `function` needs its own
+        if prefillFunction != nil {
+            // Multi-token shapes warm the prefill graph, so `function` needs its own
             // single-token pass.
-            shapesToWarm = shapesToWarm.map { $0 > 1 ? min($0, promptMaxQueryLength) : $0 }
+            shapesToWarm = shapesToWarm.map { $0 > 1 ? min($0, prefillMaxQueryLength) : $0 }
             if !shapesToWarm.contains(1) { shapesToWarm.append(1) }
         }
 
         CLILogger.log("Running warmup for \(shapesToWarm.count) shape(s)")
 
         let maxShape = shapesToWarm.max() ?? 1
-        // `function` only produces prompt-wide logits when there's no prompt graph.
-        try logits.ensureCapacity(forContextLength: promptFunction != nil ? 1 : maxShape)
+        // `function` only produces prompt-wide logits when there's no prefill graph.
+        try logits.ensureCapacity(forContextLength: prefillFunction != nil ? 1 : maxShape)
 
         do {
             let queue = pipelineQueue
@@ -1779,12 +1779,12 @@ private struct EngineImpl: ~Copyable {
             var valState = unsafe InferenceFunction.AsyncMutableValue(
                 unsafeBuffer: valBuffer, byteOffset: 0,
                 scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
-            // Multi-token shapes must run on the prompt graph when there is one. Not just
+            // Multi-token shapes must run on the prefill graph when there is one. Not just
             // to avoid compiling unused kernels: the logits buffer holds a single row in
             // that case, so a wide warmup on `function` would overrun it.
-            if shape > 1, let promptFn = promptFunction {
+            if shape > 1, let prefillFn = prefillFunction {
                 try encodeWithStatesNoOutputs(
-                    function: promptFn, inputs: asyncInputs,
+                    function: prefillFn, inputs: asyncInputs,
                     keyState: &keyState, keyCacheName: keyCacheName,
                     valState: &valState, valueCacheName: valueCacheName,
                     additionalStates: additionalStates,

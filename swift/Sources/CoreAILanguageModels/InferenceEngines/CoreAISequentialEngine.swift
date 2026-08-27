@@ -43,7 +43,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
 
     // Optional prefill graph. Prefill chunks run here when the asset has it. It produces
     // no logits, so the last prompt token still goes through `function`.
-    private let promptFunction: InferenceFunction?
+    private let prefillFunction: InferenceFunction?
 
     // I/O names from descriptor
     private let inputIdsName: String
@@ -183,10 +183,10 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         self.cachedInputBatchSize = 1
 
         // Load inference function
-        self.promptFunction = try loadPromptGraph(
+        self.prefillFunction = try loadPrefillGraph(
             from: model, matching: descriptor, mainName: config.function)
-        if self.promptFunction != nil {
-            CLILogger.log("Found '\(promptGraphFunctionName)' graph — prefill skips the LM head")
+        if self.prefillFunction != nil {
+            CLILogger.log("Found '\(prefillGraphFunctionName)' graph — prefill skips the LM head")
         }
 
         guard let fn = try model.loadFunction(named: config.function) else {
@@ -219,9 +219,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     // MARK: - Prefill Strategy
 
     private func selectPrefillStrategy(newTokenCount: Int) -> PrefillStrategy {
-        // With a prompt graph, chunking is cheaper at any size: every chunk but the last
+        // With a prefill graph, chunking is cheaper at any size: every chunk but the last
         // token skips the LM head, so there is no threshold to clear.
-        if promptFunction != nil || newTokenCount > config.chunkThreshold {
+        if prefillFunction != nil || newTokenCount > config.chunkThreshold {
             return .chunked(chunkSize: config.prefillChunkSize)
         }
         return .wholeBatch
@@ -292,9 +292,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         return logitBuffer
     }
 
-    /// Run one prefill chunk on the prompt graph: KV cache writes only, no logits.
-    private func encodePromptChunk(
-        _ tokens: ArraySlice<Int32>, using promptFn: InferenceFunction
+    /// Run one prefill chunk on the prefill graph: KV cache writes only, no logits.
+    private func encodePrefillChunk(
+        _ tokens: ArraySlice<Int32>, using prefillFn: InferenceFunction
     ) async throws {
         let batchSize = tokens.count
         _ = try kvCache.ensureCapacity(forContextLength: processedTokenCount + batchSize)
@@ -312,7 +312,7 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         fillNDArray(&positionIds, as: Int32.self, count: totalPositions) { Int32($0) }
 
         try await runWithStatesNoOutputs(
-            function: promptFn,
+            function: prefillFn,
             inputs: [inputIdsName: inputIdsArray, positionIdsName: positionIds],
             primary: kvCache,
             secondary: additionalStates)
@@ -337,9 +337,9 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         var remainingTokens = tokens
         var chunkIndex = 0
 
-        // The prompt graph produces no logits, so hold the final token back for
+        // The prefill graph produces no logits, so hold the final token back for
         // `function`: it is the one whose logits seed sampling.
-        let floor = promptFunction != nil ? 1 : 0
+        let floor = prefillFunction != nil ? 1 : 0
 
         while remainingTokens.count > floor {
             let currentChunkSize = min(chunkSize, remainingTokens.count - floor)
@@ -350,8 +350,8 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                 "Chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.count) tokens at position \(processedTokenCount)"
             )
 
-            if let promptFn = promptFunction {
-                try await encodePromptChunk(chunk, using: promptFn)
+            if let prefillFn = prefillFunction {
+                try await encodePrefillChunk(chunk, using: prefillFn)
             } else {
                 lastLogits = try await processTokenBatch(chunk)
             }

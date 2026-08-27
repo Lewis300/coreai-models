@@ -140,10 +140,10 @@ class Qwen3VLForCausalLM(BaseForCausalLM):
 
     _HF_MODEL_CLASS = HFQwen3VLForConditionalGeneration
 
-    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``. Only this
+    # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``. Only this
     # class; the Embeddings variant below is exported by `vlm/export.py`, which does
-    # not request a prompt graph.
-    exports_prompt_graph = True
+    # not request a prefill graph.
+    exports_prefill_graph = True
 
     @classmethod
     def _get_reauthored_config(

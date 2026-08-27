@@ -203,8 +203,8 @@ class Qwen3MoeModel(nn.Module):
 class Qwen3MoeForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = HFQwen3MoeForCausalLM
 
-    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``.
-    exports_prompt_graph = True
+    # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
+    exports_prefill_graph = True
 
     @override
     def _init_model(self, config: Qwen3MoeConfig) -> None:

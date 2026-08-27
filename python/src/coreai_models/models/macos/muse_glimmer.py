@@ -191,8 +191,8 @@ class MuseGlimmerModel(nn.Module):
 class MuseGlimmerForCausalLM(BaseForCausalLM):
     _HF_MODEL_CLASS = None  # Not in our transformers version
 
-    # Emit a second, prefill-only ``prompt`` entrypoint beside ``main``.
-    exports_prompt_graph = True
+    # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``.
+    exports_prefill_graph = True
 
     @classmethod
     def _get_reauthored_config(cls, hf_config, max_context_length=None, num_layers=None):

@@ -3,12 +3,12 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""Tests for the optional ``prompt`` (prefill) entrypoint on macOS exports.
+"""Tests for the optional ``prefill`` entrypoint on macOS exports.
 
-A model that sets ``exports_prompt_graph`` gets a second entrypoint traced from the
+A model that sets ``exports_prefill_graph`` gets a second entrypoint traced from the
 same signature with prefill mode on. It must declare no outputs and bind exactly the
 inputs and states ``main`` does, because that is the contract the Swift runner
-validates in ``loadPromptGraph``. Beyond that shape contract, the KV cache it writes is
+validates in ``loadPrefillGraph``. Beyond that shape contract, the KV cache it writes is
 its only product, so one test here executes the graph and checks that cache numerically
 against eager torch. A model that reaches the exporter already flattened can't produce
 one at all, which is also covered.
@@ -31,7 +31,7 @@ import torch
 from coreai_models._constants import (
     KEY_CACHE_NAME,
     MAIN_GRAPH_NAME,
-    PROMPT_GRAPH_NAME,
+    PREFILL_GRAPH_NAME,
     VALUE_CACHE_NAME,
 )
 
@@ -78,7 +78,7 @@ def _tiny_config() -> Qwen3Config:
 
 
 def _export(*, opts_in: bool) -> tuple[torch.nn.Module, object]:
-    """Export a tiny random model, opting the prompt graph in or out.
+    """Export a tiny random model, opting the prefill graph in or out.
 
     Subclassing to flip the flag keeps the real ``forward`` -- including its
     ``prefill_mode`` guard -- so the opt-out case proves the flag alone decides,
@@ -86,7 +86,7 @@ def _export(*, opts_in: bool) -> tuple[torch.nn.Module, object]:
     """
 
     class _Model(Qwen3ForCausalLM):
-        exports_prompt_graph = opts_in
+        exports_prefill_graph = opts_in
 
     config = _tiny_config()
     # Seeded so the parity test's error margin is reproducible run to run.
@@ -131,7 +131,7 @@ async def _run_entrypoint(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run one entrypoint over an empty cache and return the state it wrote.
 
-    The KV cache is the prompt graph's only product -- it declares no outputs -- so
+    The KV cache is the prefill graph's only product -- it declares no outputs -- so
     the state arrays are what there is to compare. They're copied out before the asset
     is torn down, since they may alias memory it owns.
     """
@@ -165,7 +165,7 @@ def _torch_prefill(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Eager reference: run ``forward`` in prefill mode and return the caches it filled.
 
-    This is the same authoring the prompt graph is traced from, in prefill mode, which
+    This is the same authoring the prefill graph is traced from, in prefill mode, which
     is the only reference available: HuggingFace has no prefill-only forward to compare
     against. So this pins the conversion, not the authoring.
     """
@@ -180,41 +180,41 @@ def _torch_prefill(
 
 
 @pytest.mark.asyncio
-async def test_prompt_graph_is_emitted_when_opted_in() -> None:
+async def test_prefill_graph_is_emitted_when_opted_in() -> None:
     model, program = _export(opts_in=True)
     descs = await _function_descriptors(program)
 
-    assert set(descs) == {MAIN_GRAPH_NAME, PROMPT_GRAPH_NAME}
+    assert set(descs) == {MAIN_GRAPH_NAME, PREFILL_GRAPH_NAME}
 
-    prompt, main = descs[PROMPT_GRAPH_NAME], descs[MAIN_GRAPH_NAME]
+    prefill, main = descs[PREFILL_GRAPH_NAME], descs[MAIN_GRAPH_NAME]
 
     # No outputs at all: the KV cache writes are the graph's only product. The runner
-    # rejects a prompt graph that declares any, so this is the load-bearing assertion.
-    assert list(prompt.output_names) == []
+    # rejects a prefill graph that declares any, so this is the load-bearing assertion.
+    assert list(prefill.output_names) == []
     assert list(main.output_names) == ["logits"]
 
     # Same bindings as `main`, by name -- the runner feeds both from one code path.
-    assert list(prompt.input_names) == list(main.input_names)
-    assert set(prompt.state_names) == set(main.state_names)
-    assert set(prompt.state_names) == {KEY_CACHE_NAME, VALUE_CACHE_NAME}
+    assert list(prefill.input_names) == list(main.input_names)
+    assert set(prefill.state_names) == set(main.state_names)
+    assert set(prefill.state_names) == {KEY_CACHE_NAME, VALUE_CACHE_NAME}
 
     # The exporter must not leave a shared model in prefill mode.
     assert model.prefill_mode is False
 
 
 @pytest.mark.asyncio
-async def test_prompt_graph_is_absent_when_opted_out() -> None:
+async def test_prefill_graph_is_absent_when_opted_out() -> None:
     model, program = _export(opts_in=False)
     descs = await _function_descriptors(program)
 
     assert set(descs) == {MAIN_GRAPH_NAME}
-    assert PROMPT_GRAPH_NAME not in descs
+    assert PREFILL_GRAPH_NAME not in descs
     assert list(descs[MAIN_GRAPH_NAME].output_names) == ["logits"]
     assert model.prefill_mode is False
 
 
 @pytest.mark.asyncio
-async def test_flattened_model_gets_no_prompt_graph(caplog: pytest.LogCaptureFixture) -> None:
+async def test_flattened_model_gets_no_prefill_graph(caplog: pytest.LogCaptureFixture) -> None:
     """Graph-mode quantization hands the exporter a flattened module, which resolved
     ``prefill_mode`` when it was captured. Asking for a prefill entrypoint from one can't
     work, so the export says so and emits ``main`` alone rather than a second copy of it.
@@ -230,20 +230,20 @@ async def test_flattened_model_gets_no_prompt_graph(caplog: pytest.LogCaptureFix
             model, args=tuple(reference_inputs.values()), dynamic_shapes=dynamic_shapes
         ).module()
 
-    assert model.exports_prompt_graph
+    assert model.exports_prefill_graph
     export_config = SimpleNamespace(max_context_length=MAX_CTX, compute_precision="float16")
     with caplog.at_level(logging.WARNING, logger="coreai_models.export.macos"):
         program = export_macos_model(flattened, config, export_config, externalized_model=model)
 
     assert set(await _function_descriptors(program)) == {MAIN_GRAPH_NAME}
-    assert PROMPT_GRAPH_NAME in caplog.text
+    assert PREFILL_GRAPH_NAME in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_prompt_graph_kv_writes_match_torch() -> None:
-    """The converted prompt graph fills the cache the way eager prefill does.
+async def test_prefill_graph_kv_writes_match_torch() -> None:
+    """The converted prefill graph fills the cache the way eager prefill does.
 
-    The shape assertions above would pass just as well for a prompt graph that dropped
+    The shape assertions above would pass just as well for a prefill graph that dropped
     its cache writes along with the LM head, or wrote them at the wrong offsets, since
     the graph has no outputs to be wrong. This is what catches that.
 
@@ -254,7 +254,7 @@ async def test_prompt_graph_kv_writes_match_torch() -> None:
     model, program = _export(opts_in=True)
     input_ids, position_ids = _prefill_inputs(_tiny_config())
 
-    k_coreai, v_coreai = await _run_entrypoint(program, PROMPT_GRAPH_NAME, input_ids, position_ids)
+    k_coreai, v_coreai = await _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
     k_torch, v_torch = _torch_prefill(model, input_ids, position_ids)
 
     # Not vacuous: the prompt's positions really were written, so an all-zeros cache on

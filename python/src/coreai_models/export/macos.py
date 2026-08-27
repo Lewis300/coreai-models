@@ -10,7 +10,7 @@ Exports a PyTorch LLM model to a Core AI AIProgram via:
 torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 
 The result carries one entrypoint, ``main``, or two when the model opts into
-``exports_prompt_graph``: ``main`` for decode and ``prompt`` for prefill. Both come from
+``exports_prefill_graph``: ``main`` for decode, ``prefill`` for the prompt. Both come from
 the same module, traced twice -- the second time with prefill mode on, so it returns
 nothing and the LM head drops out.
 """
@@ -25,7 +25,7 @@ from coreai.authoring import AIProgram
 from coreai_models._constants import (
     DEFAULT_INCLUDE_DEBUG_INFO,
     MAIN_GRAPH_NAME,
-    PROMPT_GRAPH_NAME,
+    PREFILL_GRAPH_NAME,
     TRACE_KV_CACHE_SEQ_LEN,
 )
 from coreai_models.export.externalize import (
@@ -60,7 +60,7 @@ def _build_reference_inputs(
     reference_inputs = model.build_reference_inputs(config, target_dtype, spec)
     dynamic_shapes = model.build_dynamic_shapes(config, spec)
     model.validate_export_contract(reference_inputs, dynamic_shapes)
-    # A macOS model has exactly one traced signature; a `prompt` entrypoint, when the
+    # A macOS model has exactly one traced signature; a `prefill` entrypoint, when the
     # model asks for one, is that same signature traced again in prefill mode.
     return reference_inputs[MAIN_GRAPH_NAME], dynamic_shapes[MAIN_GRAPH_NAME]
 
@@ -90,7 +90,7 @@ def export_to_coreai(
     state_names: tuple[str, ...] | None = None,
     externalized_model: torch.nn.Module | None = None,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-    export_prompt_graph: bool = False,
+    export_prefill_graph: bool = False,
 ) -> AIProgram:
     """Export a stateful macOS model to a AIProgram.
 
@@ -124,8 +124,8 @@ def export_to_coreai(
         include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
             information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
             which embeds minimum debug information and makes the exported asset smaller.
-        export_prompt_graph: When True, trace the model a second time with prefill mode
-            on and stage it as the ``prompt`` entrypoint. It shares ``input_names``,
+        export_prefill_graph: When True, trace the model a second time with prefill mode
+            on and stage it as the ``prefill`` entrypoint. It shares ``input_names``,
             ``state_names``, ``reference_inputs`` and ``dynamic_shapes`` with ``main`` and
             declares no outputs, so everything the KV cache writes don't feed is dropped.
             Warned about and skipped when ``model`` is flattened, which has no prefill
@@ -185,17 +185,17 @@ def export_to_coreai(
                 "A flattened torch.fx.GraphModule needs an externalized_model handle. "
                 "Call patch_model_for_externalization on the model before quantization."
             )
-        if export_prompt_graph:
+        if export_prefill_graph:
             # The flattened graph resolved `prefill_mode` when it was captured, so the
             # flag no longer does anything here and a second trace would come out a copy
             # of `main` -- LM head, `logits` output and all, which the runner rejects.
             # Emitting nothing is safe: it falls back to `main` for prefill.
             logger.warning(
-                f"Not exporting the {PROMPT_GRAPH_NAME!r} entrypoint: this model arrives "
+                f"Not exporting the {PREFILL_GRAPH_NAME!r} entrypoint: this model arrives "
                 "flattened from graph-mode quantization, already captured in decode mode, so "
                 "prefill mode can no longer be switched on. Prefill will run on "
                 f"{MAIN_GRAPH_NAME!r} instead, LM head and all. Quantize in eager mode "
-                "(execution_mode: eager, or --quantization-mode eager) to get a prompt graph."
+                "(execution_mode: eager, or --quantization-mode eager) to get a prefill graph."
             )
         exported_program = make_export_fn(prefill=False)(model, pass_inputs_as_kwargs=False)
         externalized_programs = subexport_and_restore(externalized_model, exported_program)
@@ -218,9 +218,9 @@ def export_to_coreai(
             state_names=state_names,
             entrypoint_name=MAIN_GRAPH_NAME,
         )
-        if export_prompt_graph:
+        if export_prefill_graph:
             logger.info(
-                f"Exporting prefill entrypoint {PROMPT_GRAPH_NAME!r} (its trace ends at the "
+                f"Exporting prefill entrypoint {PREFILL_GRAPH_NAME!r} (its trace ends at the "
                 "last cache write, so 'skipping unused submodule' warnings for the tail of "
                 "the model are expected)..."
             )
@@ -231,7 +231,7 @@ def export_to_coreai(
                 input_names=input_names,
                 output_names=(),
                 state_names=state_names,
-                entrypoint_name=PROMPT_GRAPH_NAME,
+                entrypoint_name=PREFILL_GRAPH_NAME,
             )
     else:
         raise TypeError(
@@ -261,7 +261,7 @@ def export_macos_model(
     2. Exports the model through torch.export -> TorchConverter
     3. Optimizes the resulting AIProgram
 
-    Models that set ``exports_prompt_graph`` get a second ``prompt`` entrypoint,
+    Models that set ``exports_prefill_graph`` get a second ``prefill`` entrypoint,
     traced from the same module in prefill mode (no LM head). The Swift runner uses
     it for prefill when it is present and falls back to ``main`` when it is not.
 
@@ -309,7 +309,7 @@ def export_macos_model(
         state_names=contract_model.export_state_names()[MAIN_GRAPH_NAME],
         include_debug_info=getattr(export_config, "include_debug_info", DEFAULT_INCLUDE_DEBUG_INFO),
         externalized_model=externalized_model,
-        export_prompt_graph=contract_model.exports_prompt_graph,
+        export_prefill_graph=contract_model.exports_prefill_graph,
     )
 
     logger.info("Optimizing AIProgram...")

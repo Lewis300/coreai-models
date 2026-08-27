@@ -8,38 +8,38 @@ import CoreAI
 /// Name of the optional prefill entrypoint. Exported beside `main` (see
 /// `export/macos.py`) with the same inputs and states, but no LM head and no outputs:
 /// it only fills the KV cache.
-let promptGraphFunctionName = "prompt"
+let prefillGraphFunctionName = "prefill"
 
-/// Load the prompt graph, or nil if the asset has none.
+/// Load the prefill graph, or nil if the asset has none.
 ///
 /// It must take the same inputs and states as `main` and declare no outputs, because that
 /// is how callers bind it. A graph that disagrees is a stale asset, so this throws instead
 /// of falling back.
-func loadPromptGraph(
+func loadPrefillGraph(
     from model: AIModel,
     matching main: InferenceFunctionDescriptor,
     mainName: String
 ) throws -> InferenceFunction? {
-    guard let prompt = model.functionDescriptor(for: promptGraphFunctionName) else { return nil }
+    guard let prefill = model.functionDescriptor(for: prefillGraphFunctionName) else { return nil }
 
-    guard prompt.inputNames == main.inputNames else {
+    guard prefill.inputNames == main.inputNames else {
         throw InferenceRuntimeError.invalidInputType(
-            "'\(promptGraphFunctionName)' graph inputs \(prompt.inputNames) do not match "
+            "'\(prefillGraphFunctionName)' graph inputs \(prefill.inputNames) do not match "
                 + "'\(mainName)' inputs \(main.inputNames)")
     }
-    guard Set(prompt.stateNames) == Set(main.stateNames) else {
+    guard Set(prefill.stateNames) == Set(main.stateNames) else {
         throw InferenceRuntimeError.invalidOutputType(
-            "'\(promptGraphFunctionName)' graph states \(prompt.stateNames) do not match "
+            "'\(prefillGraphFunctionName)' graph states \(prefill.stateNames) do not match "
                 + "'\(mainName)' states \(main.stateNames)")
     }
-    guard prompt.outputNames.isEmpty else {
+    guard prefill.outputNames.isEmpty else {
         throw InferenceRuntimeError.invalidOutputType(
-            "'\(promptGraphFunctionName)' graph declares outputs \(prompt.outputNames); "
+            "'\(prefillGraphFunctionName)' graph declares outputs \(prefill.outputNames); "
                 + "expected none. Re-export the model.")
     }
-    guard let loaded = try model.loadFunction(named: promptGraphFunctionName) else {
+    guard let loaded = try model.loadFunction(named: prefillGraphFunctionName) else {
         throw InferenceRuntimeError.genericError(
-            "Cannot load function '\(promptGraphFunctionName)'")
+            "Cannot load function '\(prefillGraphFunctionName)'")
     }
     return loaded
 }
