@@ -68,7 +68,6 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
 
     var processedTokenCount: Int { engine.processedTokenCount }
 
-
     init(
         config: ModelConfig,
         preparedModel: PreparedModel,
@@ -522,7 +521,6 @@ final class PipelineGate: Sendable {
 // MARK: - Engine Implementation
 
 private struct EngineImpl: ~Copyable {
-
     var vocabSize: Int { config.vocabSize }
 
     static let maxJumpForwardTokens = 64
