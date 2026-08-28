@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAILMCommon
 import CoreAILanguageModels
 import CoreAIShared
 import Foundation
@@ -92,9 +93,9 @@ final class ServerStats: @unchecked Sendable {
     func buildResponse(
         prefixHitRate: Double, prefixHits: Int, prefixMisses: Int,
         totalToolCalls: Int, topTools: [ToolCallStat]
-    ) -> StatsResponse {
+    ) -> ServerStatsResponse {
         let s = lock.withLock { $0 }
-        return StatsResponse(
+        return ServerStatsResponse(
             totalRequests: s.totalRequests,
             totalPromptTokens: s.totalPromptTokens,
             totalGenTokens: s.totalGenTokens,
@@ -205,7 +206,7 @@ final class ServerState: @unchecked Sendable {
     }
 
     /// Stats snapshot for /v1/stats endpoint.
-    func statsSnapshot() -> StatsResponse {
+    func statsSnapshot() -> ServerStatsResponse {
         let s = _state.withLock { s in
             (
                 prefixHits: s.prefixHits, prefixMisses: s.prefixMisses,
@@ -224,6 +225,26 @@ final class ServerState: @unchecked Sendable {
     private enum PrepareAction {
         case reset
         case reuse(prefixLength: Int)
+    }
+
+    /// Readiness snapshot for /ready endpoint.
+    func readySnapshot() -> ReadyResponse {
+        let busy = _state.withLock { $0.generating }
+        let usedTokens = engine.processedTokenCount
+        let maxTokens = config.maxContextLength
+        let utilization = maxTokens > 0 ? Double(usedTokens) / Double(maxTokens) : 0
+        return ReadyResponse(
+            status: "ready",
+            model: config.modelName,
+            maxContextLength: maxTokens,
+            busy: busy,
+            cache: .init(
+                usedTokens: usedTokens,
+                maxTokens: maxTokens,
+                utilization: utilization
+            ),
+            toolCalling: supportsToolCalling
+        )
     }
 
     func makeSamplingConfig(
@@ -274,37 +295,4 @@ enum ServerError: Error, LocalizedError {
         case .badRequest(let msg): return msg
         }
     }
-}
-
-// MARK: - Stats Response
-
-struct StatsResponse: Codable, Sendable {
-    let totalRequests: Int
-    let totalPromptTokens: Int
-    let totalGenTokens: Int
-    let avgPrefillTokPerSec: Double
-    let avgDecodeTokPerSec: Double
-    let prefixHitRate: Double
-    let prefixHits: Int
-    let prefixMisses: Int
-    let totalToolCalls: Int
-    let topTools: [ToolCallStat]?
-
-    enum CodingKeys: String, CodingKey {
-        case totalRequests = "total_requests"
-        case totalPromptTokens = "total_prompt_tokens"
-        case totalGenTokens = "total_gen_tokens"
-        case avgPrefillTokPerSec = "avg_prefill_tok_per_sec"
-        case avgDecodeTokPerSec = "avg_decode_tok_per_sec"
-        case prefixHitRate = "prefix_hit_rate"
-        case prefixHits = "prefix_hits"
-        case prefixMisses = "prefix_misses"
-        case totalToolCalls = "total_tool_calls"
-        case topTools = "top_tools"
-    }
-}
-
-struct ToolCallStat: Codable, Sendable {
-    let name: String
-    let count: Int
 }
