@@ -750,7 +750,8 @@ private struct EngineImpl: ~Copyable {
         }
 
         // Without a prefill graph, prefill runs through `function` exactly as before.
-        let prefillMaxQueryLen = max(1, min(config.prefillChunkSize, config.maxContextLength))
+        let prefillMaxQueryLen = prefillQueryLength(
+            prefillChunkSize: config.prefillChunkSize, maxContextLength: config.maxContextLength)
         let prefillFn = try loadPrefillGraph(
             from: model, matching: descriptor, mainName: config.function)
         if prefillFn != nil {
@@ -1570,11 +1571,11 @@ private struct EngineImpl: ~Copyable {
     private mutating func prefill(prompt: [Int32]) async throws -> ArraySlice<Int32> {
         if prefillFunction != nil {
             var head = prompt.dropLast()
-            let chunkSize = prefillMaxQueryLength
-            while !head.isEmpty {
-                let chunk = head.prefix(chunkSize)
-                try await _encodeChunk(tokens: Array(chunk))
-                head = head.dropFirst(chunk.count)
+            for chunk in prefillChunkSizes(
+                tokenCount: prompt.count, chunkSize: prefillMaxQueryLength, heldBack: 1)
+            {
+                try await _encodeChunk(tokens: Array(head.prefix(chunk)))
+                head = head.dropFirst(chunk)
             }
             return prompt.suffix(1)
         }

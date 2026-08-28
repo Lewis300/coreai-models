@@ -221,7 +221,11 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     private func selectPrefillStrategy(newTokenCount: Int) -> PrefillStrategy {
         // With a prefill graph, chunking is cheaper at any size: every chunk but the last
         // token skips the LM head, so there is no threshold to clear.
-        if prefillFunction != nil || newTokenCount > config.chunkThreshold {
+        if shouldChunkPrefill(
+            tokenCount: newTokenCount,
+            hasPrefillGraph: prefillFunction != nil,
+            chunkThreshold: config.chunkThreshold)
+        {
             return .chunked(chunkSize: config.prefillChunkSize)
         }
         return .wholeBatch
