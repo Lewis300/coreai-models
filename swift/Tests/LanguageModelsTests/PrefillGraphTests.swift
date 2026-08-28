@@ -131,6 +131,84 @@ struct PrefillGraphTests {
         }
     }
 
+    // MARK: - Falling back to `main` when there is no prefill graph
+
+    @Test("Without a prefill graph, nothing is held back")
+    func nothingHeldBackWithoutPrefillGraph() {
+        // `main` serves prefill itself, so its trailing chunk carries the logits and no
+        // token needs reserving.
+        #expect(prefillHeldBackTokens(hasPrefillGraph: false) == 0)
+    }
+
+    @Test("With a prefill graph, exactly one token is held back")
+    func oneHeldBackWithPrefillGraph() {
+        #expect(prefillHeldBackTokens(hasPrefillGraph: true) == 1)
+    }
+
+    @Test("Without a prefill graph, every token is prefilled on `main`")
+    func fallbackPrefillsEverythingOnMain() {
+        // The whole point of the fallback: no token is reserved, so the chunks account for
+        // the entire prompt and `main` has done all the work when the walk ends.
+        let heldBack = prefillHeldBackTokens(hasPrefillGraph: false)
+        for count in [1, 2, 63, 64, 65, 400] {
+            let sizes = prefillChunkSizes(tokenCount: count, chunkSize: 64, heldBack: heldBack)
+            #expect(sizes.reduce(0, +) == count, "at \(count) tokens")
+        }
+    }
+
+    @Test("Without a prefill graph, a short prompt is one whole-batch chunk")
+    func fallbackShortPromptIsOneChunk() {
+        // Below the chunk width there is nothing to split, and nothing held back, so the
+        // prompt goes through `main` in a single pass.
+        let heldBack = prefillHeldBackTokens(hasPrefillGraph: false)
+        #expect(prefillChunkSizes(tokenCount: 40, chunkSize: 64, heldBack: heldBack) == [40])
+    }
+
+    @Test("Without a prefill graph, the logits buffer starts prompt-sized")
+    func fallbackLogitsBufferIsPromptSized() {
+        // `main` sees whole chunks in the fallback, so the buffer cannot start at one row.
+        #expect(
+            prefillLogitsInitialCapacity(hasPrefillGraph: false, averagePromptSize: 256) == 256)
+    }
+
+    @Test("With a prefill graph, the logits buffer starts at one token")
+    func logitsBufferIsOneTokenWithPrefillGraph() {
+        // `main` only ever sees the held-back token, so a prompt-sized buffer would waste
+        // hundreds of MB at large vocabularies.
+        #expect(prefillLogitsInitialCapacity(hasPrefillGraph: true, averagePromptSize: 256) == 1)
+    }
+
+    /// The walk `prefillChunkSizes` replaced in `processChunkedPrompt`, kept as a reference
+    /// so the extraction can be held to it.
+    private func legacyChunkWalk(tokenCount: Int, chunkSize: Int, floor: Int) -> [Int] {
+        var sizes: [Int] = []
+        var remaining = tokenCount
+        while remaining > floor {
+            let chunk = min(chunkSize, remaining - floor)
+            sizes.append(chunk)
+            remaining -= chunk
+        }
+        return sizes
+    }
+
+    @Test("The plan matches the loop it replaced, with and without a prefill graph")
+    func planMatchesLegacyWalk() {
+        // Guards the "no behaviour change" claim for both engines across the seams.
+        for hasPrefillGraph in [true, false] {
+            let heldBack = prefillHeldBackTokens(hasPrefillGraph: hasPrefillGraph)
+            for chunkSize in [1, 8, 64, 512] {
+                for count in [0, 1, 2, 7, 8, 9, 63, 64, 65, 127, 128, 129, 400, 1000] {
+                    #expect(
+                        prefillChunkSizes(
+                            tokenCount: count, chunkSize: chunkSize, heldBack: heldBack)
+                            == legacyChunkWalk(
+                                tokenCount: count, chunkSize: chunkSize, floor: heldBack),
+                        "prefillGraph=\(hasPrefillGraph) chunkSize=\(chunkSize) count=\(count)")
+                }
+            }
+        }
+    }
+
     // MARK: - Descriptor validation
 
     private let mainInputs = ["input_ids", "position_ids"]

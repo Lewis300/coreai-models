@@ -767,7 +767,8 @@ private struct EngineImpl: ~Copyable {
             name: logitsOutputName,
             vocabSize: config.vocabSize,
             maxCapacity: config.maxContextLength,
-            initialCapacity: prefillFn != nil ? 1 : averageExpectedPromptSize
+            initialCapacity: prefillLogitsInitialCapacity(
+                hasPrefillGraph: prefillFn != nil, averagePromptSize: averageExpectedPromptSize)
         )
 
         // Load inference function
@@ -1572,7 +1573,8 @@ private struct EngineImpl: ~Copyable {
         if prefillFunction != nil {
             var head = prompt.dropLast()
             for chunk in prefillChunkSizes(
-                tokenCount: prompt.count, chunkSize: prefillMaxQueryLength, heldBack: 1)
+                tokenCount: prompt.count, chunkSize: prefillMaxQueryLength,
+                heldBack: prefillHeldBackTokens(hasPrefillGraph: true))
             {
                 try await _encodeChunk(tokens: Array(head.prefix(chunk)))
                 head = head.dropFirst(chunk)

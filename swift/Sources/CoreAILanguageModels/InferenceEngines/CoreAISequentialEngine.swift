@@ -330,28 +330,27 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         tokens: ArraySlice<Int32>,
         chunkSize: Int
     ) async throws -> [LogitsScalarType] {
-        let totalChunks = (tokens.count + chunkSize - 1) / chunkSize
+        // The prefill graph produces no logits, so hold the final token back for
+        // `function`: it is the one whose logits seed sampling. Without one, nothing is
+        // held back and the trailing chunk carries the logits.
+        let floor = prefillHeldBackTokens(hasPrefillGraph: prefillFunction != nil)
+        let plan = prefillChunkSizes(
+            tokenCount: tokens.count, chunkSize: chunkSize, heldBack: floor)
 
         let chunkSignpost = InstrumentsProfiler.beginCustomInterval(
             name: "CoreAIClean Chunked Prefill",
-            details: "\(tokens.count) tokens in \(totalChunks) chunks of \(chunkSize)"
+            details: "\(tokens.count) tokens in \(plan.count) chunks of \(chunkSize)"
         )
 
         var lastLogits: [LogitsScalarType] = []
         var remainingTokens = tokens
-        var chunkIndex = 0
 
-        // The prefill graph produces no logits, so hold the final token back for
-        // `function`: it is the one whose logits seed sampling.
-        let floor = prefillFunction != nil ? 1 : 0
-
-        while remainingTokens.count > floor {
-            let currentChunkSize = min(chunkSize, remainingTokens.count - floor)
+        for (chunkIndex, currentChunkSize) in plan.enumerated() {
             let chunkEnd = remainingTokens.startIndex + currentChunkSize
             let chunk = remainingTokens[remainingTokens.startIndex..<chunkEnd]
 
             CLILogger.log(
-                "Chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.count) tokens at position \(processedTokenCount)"
+                "Chunk \(chunkIndex + 1)/\(plan.count): \(chunk.count) tokens at position \(processedTokenCount)"
             )
 
             if let prefillFn = prefillFunction {
@@ -360,7 +359,6 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
                 lastLogits = try await processTokenBatch(chunk)
             }
             remainingTokens = remainingTokens[chunkEnd...]
-            chunkIndex += 1
         }
 
         if !remainingTokens.isEmpty {

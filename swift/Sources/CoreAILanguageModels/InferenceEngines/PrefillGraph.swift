@@ -28,14 +28,28 @@ func shouldChunkPrefill(tokenCount: Int, hasPrefillGraph: Bool, chunkThreshold: 
     hasPrefillGraph || tokenCount > chunkThreshold
 }
 
+/// Tokens the prefill plan must leave for `main`.
+///
+/// One with a prefill graph, which has no LM head and so cannot produce the logits that
+/// seed sampling; none without one, where prefill runs on `main` and the trailing chunk
+/// carries the logits itself.
+func prefillHeldBackTokens(hasPrefillGraph: Bool) -> Int {
+    hasPrefillGraph ? 1 : 0
+}
+
+/// Initial size of the logits buffer, in token rows.
+///
+/// With a prefill graph `main` only ever sees the one held-back token, so a prompt-sized
+/// buffer -- hundreds of MB at large vocabularies -- would go unused. Without one `main`
+/// serves prefill too and sees whole chunks, so it starts at the usual guess and grows.
+func prefillLogitsInitialCapacity(hasPrefillGraph: Bool, averagePromptSize: Int) -> Int {
+    hasPrefillGraph ? 1 : averagePromptSize
+}
+
 /// Sizes of the chunks prefill runs, in order, covering all but the held-back tokens.
 ///
-/// `heldBack` is 1 when a prefill graph is present and 0 otherwise: the prefill graph has no
-/// LM head, so one token has to reach `main` to produce the logits that seed sampling.
-/// Without a prefill graph nothing is held back and the trailing chunk carries the logits.
-///
-/// Returns an empty array when there is nothing to prefill -- a prompt at or below
-/// `heldBack` is entirely the caller's to run.
+/// `heldBack` comes from `prefillHeldBackTokens`. Returns an empty array when there is
+/// nothing to prefill -- a prompt at or below `heldBack` is entirely the caller's to run.
 func prefillChunkSizes(tokenCount: Int, chunkSize: Int, heldBack: Int) -> [Int] {
     let width = max(1, chunkSize)
     var remaining = max(0, tokenCount - max(0, heldBack))
