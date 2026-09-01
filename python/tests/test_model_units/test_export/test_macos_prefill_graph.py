@@ -25,11 +25,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.utils._pytree as pytree
 
 from coreai_models._constants import (
     KEY_CACHE_NAME,
     MAIN_GRAPH_NAME,
     PREFILL_GRAPH_NAME,
+    QUANT_TRACE_OFFSET,
     VALUE_CACHE_NAME,
 )
 
@@ -38,7 +40,7 @@ try:
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
     from coreai_models.export.externalize import patch_model_for_externalization
-    from coreai_models.export.macos import export_macos_model
+    from coreai_models.export.macos import _drop_user_outputs, export_macos_model
     from coreai_models.models.base import TraceSpec
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
     from coreai_models.primitives.macos.cache import KVCache
@@ -55,7 +57,8 @@ except ImportError:  # pragma: no cover - depends on the installed toolchain
 MAX_CTX = 256
 
 # Prompt length for the parity test. Longer than one token so prefill is doing real
-# multi-token work, and >= the traced `position_ids` minimum of QUANT_TRACE_QUERY_LEN.
+# multi-token work, and short enough that `QUANT_TRACE_OFFSET + PREFILL_LEN` stays inside
+# the traced `position_ids` bound of MAX_CTX - 1.
 PREFILL_LEN = 32
 
 pytestmark = pytest.mark.skipif(not HAS_COREAI, reason="coreai-torch not available")
@@ -108,12 +111,21 @@ async def _function_descriptors(program) -> dict[str, object]:  # type: ignore[n
 
 
 def _prefill_inputs(config: Qwen3Config) -> tuple[torch.Tensor, torch.Tensor]:
-    """One whole prompt: ``position_ids`` is as long as ``input_ids``, so offset 0."""
+    """One prefill chunk of ``PREFILL_LEN`` tokens landing at ``QUANT_TRACE_OFFSET``.
+
+    ``position_ids`` has to come out strictly longer than ``input_ids``. The authoring
+    derives ``offset = len(position_ids) - len(input_ids)`` and marks it size-like, so a
+    program exported from it guards on a nonzero offset and refuses a whole prompt at
+    offset 0 when it is run in eager -- even though the eager model itself is happy to.
+    Prefilling at the offset the exporter traced with stays inside that envelope, the same
+    way ``_prep_calib_inputs`` builds ``position_ids`` for calibration. Both sides of the
+    comparison see identical inputs, so the offset costs this test nothing.
+    """
     generator = torch.Generator().manual_seed(0)
     input_ids = torch.randint(
         1, config.vocab_size, (1, PREFILL_LEN), dtype=torch.int32, generator=generator
     )
-    position_ids = torch.arange(PREFILL_LEN, dtype=torch.int32).unsqueeze(0)
+    position_ids = torch.arange(QUANT_TRACE_OFFSET + PREFILL_LEN, dtype=torch.int32).unsqueeze(0)
     return input_ids, position_ids
 
 
@@ -132,14 +144,21 @@ def _torch_prefill(
     This is the same authoring the prefill graph is traced from, in prefill mode, which
     is the only reference available: HuggingFace has no prefill-only forward to compare
     against. So this pins the conversion, not the authoring.
+
+    Also serves the trimmed flattened graph, which resolved ``prefill_mode`` back when it
+    was captured and so has no flag left to toggle -- the same reason the exporter reaches
+    for the setter through ``getattr``.
     """
     k_cache, v_cache = _zeroed_caches()
-    model.set_prefill_mode(True)
+    set_prefill_mode = getattr(model, "set_prefill_mode", None)
+    if set_prefill_mode is not None:
+        set_prefill_mode(True)
     try:
         with torch.no_grad():
             assert model(input_ids, position_ids, k_cache, v_cache) == ()
     finally:
-        model.set_prefill_mode(False)
+        if set_prefill_mode is not None:
+            set_prefill_mode(False)
     return k_cache, v_cache
 
 
@@ -177,11 +196,11 @@ async def test_prefill_graph_is_absent_when_opted_out() -> None:
     assert model.prefill_mode is False
 
 
-def _export_flattened() -> tuple[torch.nn.Module, object]:
+def _export_flattened() -> tuple[torch.export.ExportedProgram, object]:
     """Export the way graph-mode quantization does: mark, capture, hand over the graph.
 
-    Returns the eager model -- still the export contract's source of truth, and the
-    reference for what prefill should write -- alongside the program.
+    Returns the captured program -- the thing the exporter trims for its prefill
+    entrypoint, and so the thing the numerics test needs -- alongside the export.
     """
     config = _tiny_config()
     torch.manual_seed(0)
@@ -195,11 +214,32 @@ def _export_flattened() -> tuple[torch.nn.Module, object]:
     with torch.no_grad():
         flattened = torch.export.export(
             model, args=tuple(reference_inputs.values()), dynamic_shapes=dynamic_shapes
-        ).module()
+        )
 
     assert model.exports_prefill_graph
     export_config = SimpleNamespace(max_context_length=MAX_CTX, compute_precision="float16")
-    return model, export_macos_model(flattened, config, export_config, externalized_model=model)
+    return flattened, export_macos_model(
+        flattened.module(), config, export_config, externalized_model=model
+    )
+
+
+def _get_trimmed_flattened() -> torch.nn.Module:
+    """The exporter's trimmed prefill program, made runnable in eager.
+
+    ``_drop_user_outputs`` rewrites ``graph_signature``, which is the only view the
+    converter reads, but ``module_call_graph`` still carries the pytree spec captured
+    before the trim -- it describes the ``logits`` the trim just deleted.
+    ``ExportedProgram.module()`` builds its flatten/unflatten calls from that spec, so
+    without this repair the wrapper unflattens the graph's zero outputs into a one-leaf
+    spec and raises. The export path never trips over it because it never makes the
+    trimmed program eagerly callable, so the repair belongs here rather than in the
+    exporter.
+    """
+    flattened, _ = _export_flattened()
+    trimmed = _drop_user_outputs(flattened)
+    root = next(entry for entry in trimmed.module_call_graph if entry.fqn == "")
+    root.signature.out_spec = pytree.tree_structure(())
+    return trimmed.module()
 
 
 @pytest.mark.asyncio
@@ -226,9 +266,7 @@ async def test_flattened_model_gets_a_trimmed_prefill_graph() -> None:
 async def test_flattened_vs_model_numerics() -> None:
     """Test base torch module with prefill_mode = True against trimmed flattened GraphModule"""
     model, _ = _export(opts_in=False)
-    flattened, _ = _export_flattened()
-
-    model.set_prefill_mode(True)
+    flattened = _get_trimmed_flattened()
     input_ids, position_ids = _prefill_inputs(_tiny_config())
     k_torch_base, v_torch_base = _torch_prefill(model, input_ids, position_ids)
     k_torch_flattened, v_torch_flattened = _torch_prefill(flattened, input_ids, position_ids)
