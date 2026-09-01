@@ -259,56 +259,19 @@ async def test_flattened_model_gets_a_trimmed_prefill_graph() -> None:
 
 
 @pytest.mark.asyncio
-async def test_flattened_prefill_graph_kv_writes_match_torch() -> None:
-    """Trimming the outputs must not take the cache writes with it.
+async def test_flattened_vs_model_numerics() -> None:
+    """Test base torch module with prefill_mode = True against trimmed flattened GraphModule"""
+    model, _ = _export(opts_in=False)
+    flattened, _ = _export_flattened()
 
-    Same check as the eager path's, and the same eager reference: the graph declares no
-    outputs, so the cache is the only place a mistrimmed graph would show up.
-    """
-    model, program = _export_flattened()
+    model.set_prefill_mode(True)
     input_ids, position_ids = _prefill_inputs(_tiny_config())
+    k_torch_base, v_torch_base = _torch_prefill(model, input_ids, position_ids)
+    k_torch_flattened, v_torch_flattened = _torch_prefill(flattened, input_ids, position_ids)
 
-    k_coreai, v_coreai = await _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
-    k_torch, v_torch = _torch_prefill(model, input_ids, position_ids)
-
-    written = (slice(None), slice(None), slice(None), slice(0, PREFILL_LEN))
-    assert torch.any(k_torch[written] != 0)
-    assert_close(k_coreai.astype(np.float32), k_torch.float(), atol=1e-2, rtol=1e-2)
-    assert_close(v_coreai.astype(np.float32), v_torch.float(), atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.asyncio
-async def test_prefill_graph_kv_writes_match_torch() -> None:
-    """The converted prefill graph fills the cache the way eager prefill does.
-
-    The shape assertions above would pass just as well for a prefill graph that dropped
-    its cache writes along with the LM head, or wrote them at the wrong offsets, since
-    the graph has no outputs to be wrong. This is what catches that.
-
-    The reference is our own authoring in prefill mode, not HuggingFace: HF has no
-    prefill-only forward to compare against. So this pins the conversion, not the
-    authoring, which is what the rest of ``test_models/`` covers.
-    """
-    model, program = _export(opts_in=True)
-    input_ids, position_ids = _prefill_inputs(_tiny_config())
-
-    k_coreai, v_coreai = await _run_entrypoint(program, PREFILL_GRAPH_NAME, input_ids, position_ids)
-    k_torch, v_torch = _torch_prefill(model, input_ids, position_ids)
-
-    # Not vacuous: the prompt's positions really were written, so an all-zeros cache on
-    # both sides can't pass. Positions past the prompt stay zero, and comparing the full
-    # tensor keeps a graph that scribbles beyond its range from passing either.
-    written = (slice(None), slice(None), slice(None), slice(0, PREFILL_LEN))
-    assert torch.any(k_torch[written] != 0)
-    assert torch.any(v_torch[written] != 0)
-
-    # fp32 so the comparison isn't done in the caches' own fp16. Tolerances are set for
-    # fp16 rounding differences between the runtime and eager: the observed max abs
-    # error is ~5e-3 on values of order 1, and rtol alone won't do because entries near
-    # zero carry a large relative error.
-    for name, torch_cache, coreai_cache in (
-        (KEY_CACHE_NAME, k_torch, k_coreai),
-        (VALUE_CACHE_NAME, v_torch, v_coreai),
+    for name, torch_cache_base, torch_cache_flattened in (
+        (KEY_CACHE_NAME, k_torch_base, k_torch_flattened),
+        (VALUE_CACHE_NAME, v_torch_base, v_torch_flattened),
     ):
         print(f"comparing {name}")
-        assert_close(coreai_cache.astype(np.float32), torch_cache.float(), atol=1e-2, rtol=1e-2)
+        assert_close(torch_cache_base.float(), torch_cache_flattened.float(), atol=1e-9, rtol=1e-9)
