@@ -23,7 +23,6 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
@@ -121,41 +120,6 @@ def _prefill_inputs(config: Qwen3Config) -> tuple[torch.Tensor, torch.Tensor]:
 def _zeroed_caches() -> tuple[torch.Tensor, torch.Tensor]:
     """A fresh, empty cache at the exported context length."""
     return KVCache.create_cache_tensors(_tiny_config(), dtype=torch.float16, seq_len=MAX_CTX)
-
-
-async def _run_entrypoint(
-    program,  # type: ignore[no-untyped-def]
-    name: str,
-    input_ids: torch.Tensor,
-    position_ids: torch.Tensor,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run one entrypoint over an empty cache and return the state it wrote.
-
-    The KV cache is the prefill graph's only product -- it declares no outputs -- so
-    the state arrays are what there is to compare. They're copied out before the asset
-    is torn down, since they may alias memory it owns.
-    """
-    k_cache, v_cache = _zeroed_caches()
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "model.aimodel"
-        program.save_asset(path, rt.AIModelAssetMetadata())
-        model = await rt.AIModel.load(path)
-        function = model.load_function(name)
-        state = {
-            KEY_CACHE_NAME: rt.NDArray(data=k_cache),
-            VALUE_CACHE_NAME: rt.NDArray(data=v_cache),
-        }
-        await function(
-            {
-                "input_ids": rt.NDArray(data=input_ids.contiguous()),
-                "position_ids": rt.NDArray(data=position_ids.contiguous()),
-            },
-            state=state,
-        )
-        return (
-            state[KEY_CACHE_NAME].numpy().copy(),
-            state[VALUE_CACHE_NAME].numpy().copy(),
-        )
 
 
 def _torch_prefill(
