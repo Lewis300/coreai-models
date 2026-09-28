@@ -59,6 +59,8 @@ def _hf_hub_reachable(model_id: str = "yujiepan/qwen3-tiny-random") -> bool:
         import huggingface_hub
 
         huggingface_hub.HfApi().model_info(model_id, timeout=2)
+        # hf_hub_download omits the timeout kwarg: huggingface_hub 1.x — required by
+        # Gemma 4's transformers.models.gemma4 — accepts it only on model_info above.
         huggingface_hub.hf_hub_download(model_id, "config.json")
         return True
     except Exception:
