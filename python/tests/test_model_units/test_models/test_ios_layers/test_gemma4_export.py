@@ -29,7 +29,6 @@ from coreai_models.models.ios.gemma4_text import Gemma4ForCausalLMForiOS  # noqa
 from tests._runner_infra._deps import _HAS_COREAI, _MSG_COREAI_NOT_FOUND  # noqa: E402
 from tests.test_model_units.test_models.test_ios_layers.test_gemma4 import (  # noqa: E402
     Gemma4ForCausalLM,
-    _build_ios_model,
     _make_config,
 )
 
@@ -51,7 +50,14 @@ def test_ladder_converts_and_loads():
     torch.manual_seed(0)
     cfg = _make_config()
     cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW
-    model = _build_ios_model(cfg, dict(Gemma4ForCausalLM(cfg).state_dict())).half()
+    # Quantized embeddings, as shipped: the gather then lowers to the fused
+    # dequant-gather, which only converts when traced dynamic in the query length.
+    sd = dict(Gemma4ForCausalLM(cfg).state_dict())
+    model = Gemma4ForCausalLMForiOS(cfg, model_device="cpu", disable_embedding_quantization=False)
+    model.to(torch.float32).eval()
+    model._mutate_state_dict(sd)
+    model.load_state_dict(sd, assign=True, strict=True)
+    model = model.half()
     ctx = 1024
 
     program = asyncio.run(export_g4._export_blocked_ladder(model, model.config, ctx))
@@ -77,4 +83,7 @@ def test_ladder_converts_and_loads():
                     loaded[name] = (tuple(desc.input_names), tuple(desc.state_names))
                 return loaded
 
-    assert asyncio.run(load()) == expected
+    loaded = asyncio.run(load())
+    assert {name: loaded.get(name) for name in expected} == expected
+    # Anything else is a composite the lowering emits (the fused dequant-gather).
+    assert all(name.startswith("fused_") for name in set(loaded) - set(expected)), sorted(loaded)

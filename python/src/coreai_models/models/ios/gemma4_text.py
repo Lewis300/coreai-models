@@ -746,20 +746,25 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
 
     @override
     def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
-        # Every shape is static; see build_reference_inputs.
+        # The transformer rungs are fully static (see build_reference_inputs); the gather
+        # is dynamic in the query length and specialized, as for every iOS model.
         return {
             LOAD_EMBEDDINGS_FUNCTION_NAME: None,
-            GATHER_EMBEDDINGS_FUNCTION_NAME: None,
+            GATHER_EMBEDDINGS_FUNCTION_NAME: super().build_dynamic_shapes(config, spec)[
+                GATHER_EMBEDDINGS_FUNCTION_NAME
+            ],
             EXTEND_FUNCTION_NAME: None,
         }
 
     @classmethod
     @override
     def export_static_shape_configs(cls, config, max_context_length: int) -> dict:
-        # Programs are traced at fully static shapes, so nothing to specialize.
+        # Only the gather is specialized (over IOS_STATIC_QUERY_LENS, as for every iOS
+        # model); the transformer rungs are traced at fully static shapes.
+        base = super().export_static_shape_configs(config, max_context_length)
         return {
             LOAD_EMBEDDINGS_FUNCTION_NAME: {},
-            GATHER_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: base[GATHER_EMBEDDINGS_FUNCTION_NAME],
             EXTEND_FUNCTION_NAME: {},
         }
 

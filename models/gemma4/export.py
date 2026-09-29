@@ -59,7 +59,6 @@ from coreai_models.export.pipeline import ExportConfig, _generate_output_name
 from coreai_models.llm.export import _load_compression_config_object
 from coreai_models.models.base import TraceSpec
 from coreai_models.models.ios.gemma4_text import (
-    MAX_QUERY_LEN,
     Gemma4ForCausalLMForiOS,
 )
 
@@ -370,20 +369,24 @@ def _export_programs(
     buckets: list[int],
     dev: DevOverrides = DevOverrides(),
 ) -> list[tuple[str, str, int, torch.export.ExportedProgram]]:
-    """Trace one fully static program per emitted function.
+    """Trace one program per emitted entrypoint.
 
     Mirrors ``coreai_models.export.ios._export_programs``, except that every
-    (context bucket, query length) pair is its own program, named
-    ``{entrypoint}_{ctx}_{q}`` (``gather_embeddings_{q}`` for the gather). Returns
-    ``(function name, contract graph, context bucket, program)`` tuples.
+    transformer (context bucket, query length) pair is its own fully static
+    program, named ``{entrypoint}_{ctx}_{q}``. Returns
+    ``(entrypoint name, contract graph, context bucket, program)`` tuples.
     """
     extend_qlens = _extend_query_lengths(dev)
     prompt_qlens = _prompt_query_lengths(dev)
     decomp_table = _ios_decomp_table()
     block_size = model.extend.model.kv_block_size
 
-    def trace(module, kwargs: dict) -> torch.export.ExportedProgram:
-        return torch.export.export(module, args=(), kwargs=kwargs)
+    def trace(
+        module, kwargs: dict, dynamic_shapes=None
+    ) -> torch.export.ExportedProgram:
+        return torch.export.export(
+            module, args=(), kwargs=kwargs, dynamic_shapes=dynamic_shapes
+        )
 
     programs: list[tuple[str, str, int, torch.export.ExportedProgram]] = []
     with torch.no_grad():
@@ -396,19 +399,29 @@ def _export_programs(
                 trace(model.load_embeddings, {}),
             )
         )
-        for q in sorted(set(extend_qlens) | set(prompt_qlens)):
-            name = f"{GATHER_EMBEDDINGS_FUNCTION_NAME}_{q}"
-            logger.info(f"Exporting {name}...")
-            ref = _reference_inputs(model, config, max_context_length, buckets[0], q)
-            gather = ref[GATHER_EMBEDDINGS_FUNCTION_NAME]
-            programs.append(
-                (
-                    name,
-                    GATHER_EMBEDDINGS_FUNCTION_NAME,
-                    buckets[0],
-                    trace(model.gather_embeddings, gather),
-                )
+        logger.info(f"Exporting {GATHER_EMBEDDINGS_FUNCTION_NAME}...")
+        spec = TraceSpec(
+            max_context_length=max_context_length,
+            cache_seq_len=buckets[0],
+            query_len=model.IOS_QUERY_LEN,
+        )
+        ref = _reference_inputs(
+            model, config, max_context_length, buckets[0], model.IOS_QUERY_LEN
+        )
+        programs.append(
+            (
+                GATHER_EMBEDDINGS_FUNCTION_NAME,
+                GATHER_EMBEDDINGS_FUNCTION_NAME,
+                buckets[0],
+                trace(
+                    model.gather_embeddings,
+                    ref[GATHER_EMBEDDINGS_FUNCTION_NAME],
+                    model.build_dynamic_shapes(config, spec)[
+                        GATHER_EMBEDDINGS_FUNCTION_NAME
+                    ],
+                ),
             )
+        )
 
         # The transformer entry is used for both emitted entrypoints.
         for ctx in buckets:
@@ -435,13 +448,16 @@ def _export_programs(
 async def _convert_to_coreai(
     model: Gemma4ForCausalLMForiOS,
     programs: list[tuple[str, str, int, torch.export.ExportedProgram]],
+    config,
+    gather_qlens: set[int],
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Convert the traced programs to one AIProgram with iOS constraints.
 
-    Mirrors ``coreai_models.export.ios._convert_to_coreai``. The programs are traced
-    at fully static shapes, so there are no static shape configs to apply; the
-    hardware constraints come from the model's contract for each program's bucket.
+    Mirrors ``coreai_models.export.ios._convert_to_coreai``. Static shapes and
+    hardware constraints come from the model's contract for each program's bucket;
+    the gather's specializations are narrowed to ``gather_qlens``, the query lengths
+    the ladder emits.
     """
     inputs = model.export_input_names()
     states = model.export_state_names()
@@ -464,6 +480,15 @@ async def _convert_to_coreai(
     coreai_program: AIProgram = converter.to_coreai()
 
     for name, graph, ctx, _ in programs:
+        static_shapes = model.export_static_shape_configs(config, ctx)[graph]
+        if graph == GATHER_EMBEDDINGS_FUNCTION_NAME:
+            static_shapes = {
+                label: shapes
+                for label, shapes in static_shapes.items()
+                if int(label.strip('"')) in gather_qlens
+            }
+        if static_shapes:
+            coreai_program.set_static_shape_config(name, static_shapes)
         constraints = model.export_hardware_constraints(ctx)[graph]
         if constraints:
             coreai_program.set_hardware_constraints(name, constraints)
@@ -485,7 +510,10 @@ async def _export_blocked_ladder(
     buckets = context_ladder(max_context_length, dev)
     logger.info(f"iOS context ladder: {buckets}")
     programs = _export_programs(model, config, max_context_length, buckets, dev)
-    return await _convert_to_coreai(model, programs, include_debug_info)
+    gather_qlens = set(_extend_query_lengths(dev)) | set(_prompt_query_lengths(dev))
+    return await _convert_to_coreai(
+        model, programs, config, gather_qlens, include_debug_info
+    )
 
 
 def _palettization_inputs(
@@ -720,16 +748,17 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
             "at that bucket."
         )
 
-    # The sliding ring and every context bucket are multiples of MAX_QUERY_LEN, so a
-    # query length that divides it never wraps or straddles a cache write.
+    # Query lengths must be ones the gather is specialized for; all of them divide
+    # MAX_QUERY_LEN, so a cache write never wraps or straddles the ring or a bucket.
     for flag, qlens in (
         ("--dev-extend-qlens", args.dev_extend_qlens),
         ("--dev-prompt-qlens", args.dev_prompt_qlens),
     ):
-        invalid = [q for q in qlens or () if MAX_QUERY_LEN % q]
+        allowed = Gemma4ForCausalLMForiOS.IOS_STATIC_QUERY_LENS
+        invalid = [q for q in qlens or () if q not in allowed]
         if invalid:
             raise SystemExit(
-                f"{flag}: query lengths must divide {MAX_QUERY_LEN}, got {invalid}"
+                f"{flag}: query lengths must be among {list(allowed)}, got {invalid}"
             )
 
     if args.compression is None and args.compression_config is None:
