@@ -50,7 +50,7 @@ uv run export.py --model google/gemma-4-E2B-it
 
 > **Note:** The export defaults to a mixed-precision 4-bit palettization recipe
 > shipped alongside the script,
-> [`gemma4_4bit_palettized.yaml`](gemma4_4bit_palettized.yaml). iOS requires
+> [`4bit_palettized.yaml`](4bit_palettized.yaml). iOS requires
 > `float16` and defaults to a 131072 context, which is also its maximum. Bigger
 > contexts cost export time and program size, so pass `--max-context-length` if
 > you need less.
@@ -75,12 +75,12 @@ uv run export.py --model google/gemma-4-E2B-it --output-dir ./my-models/
 ```
 
 The export follows the standard iOS flow (`coreai_models.export.ios`), except
-that each (context bucket, query length) pair is traced as its own fully static
-program, `extend_{ctx}_{q}` / `prompt_opt_{ctx}_{q}`: the blocked attention
-unrolls its block loop, so the graph depends on the context length. A flat global KV cache is paired with a fixed-depth
-sliding-window ring, RoPE arrives precomputed as `rope_cos`/`rope_sin` inputs,
-and the INT8 Per-Layer Embeddings table is written as a sidecar next to the
-asset.
+that each transformer (context bucket, query length) pair is traced as its own
+fully static program, `extend_{ctx}_{q}` / `prompt_opt_{ctx}_{q}`: the blocked
+attention unrolls its block loop, so the graph depends on the context length. A
+flat global KV cache is paired with a fixed-depth sliding-window ring, RoPE
+arrives precomputed as `rope_cos`/`rope_sin` inputs, and the INT8 Per-Layer
+Embeddings table is written as a sidecar next to the asset.
 
 Developer overrides (comma-separated flags): `--dev-extend-qlens` /
 `--dev-prompt-qlens` (per-function query-length ladder), `--dev-ladder-only`

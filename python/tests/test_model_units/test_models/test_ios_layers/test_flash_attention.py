@@ -100,8 +100,8 @@ def _max_op_rank(module, args, dynamic_shapes=None) -> int:
 
     ``BlockedSDPA`` takes only flat rank-4 inputs, so even the placeholders are
     <=4D. Exporting with a dynamic ``seq_len`` additionally guards against a
-    reshape / split that would emit a query-length guard and force the graph to
-    specialize ``q_len`` (the flat-cache export keeps ``seq_len`` dynamic).
+    reshape / split that would emit a query-length guard and tie the graph to one
+    ``q_len``.
     """
     from torch.export import export
 
@@ -128,8 +128,8 @@ _HEAD_CFGS = [(8, 1), (4, 2), (4, 4)]
 #   ctx==2*block_size            -> 2 blocks
 #   ctx==16*block_size           -> 16 blocks
 #   ctx not a multiple of block  -> ragged final block
-# start chosen to exercise both a mid-prompt chunk (future blocks all -inf, the
-# NaN-guard path) and an end chunk (diagonal in the last block).
+# start chosen to exercise both a mid-prompt chunk (future blocks fully masked, held
+# at the fp16-safe -inf floor) and an end chunk (diagonal in the last block).
 _SHAPE_CASES = [
     (16, 16, 8, "n_blocks=1 end"),
     (16, 16, 0, "n_blocks=1 start"),
@@ -183,10 +183,9 @@ class TestBlockedSDPA:
     def test_export_ranks_le_4_dynamic_seq_len(self, head_dim, ctx, block_size):
         """Every compute op stays rank <= 4 (iOS 4D limit) with a dynamic ``seq_len``.
 
-        ctx is static per bucket; only ``seq_len`` is a ``Dim`` -- mirrors
-        ``export/ios.py``. This guards the 4D compute-tensor limit and, via the
-        dynamic query dim, against a q_len-dependent reshape/split that would force
-        export to specialize the query length.
+        ctx is static; only ``seq_len`` is a ``Dim``. The export traces each query
+        length statically, but keeping it dynamic here checks the primitive has no
+        q_len-dependent reshape/split, alongside the 4D compute-tensor limit.
         """
         from torch.export import Dim
 

@@ -13,12 +13,13 @@ pipeline, so they ship as a standalone recipe (see ``models/gemma4/README.md``):
     cd models/gemma4
     uv run export.py --model google/gemma-4-E2B-it --max-context-length 32768
 
-The export follows ``coreai_models.export.ios``, except that each (context bucket,
-query length) pair is traced as its own fully static program,
+The export follows ``coreai_models.export.ios``, except that each transformer
+(context bucket, query length) pair is traced as its own fully static program,
 ``extend_{ctx}_{q}`` / ``prompt_opt_{ctx}_{q}``: ``BlockedSDPA`` unrolls its block
-loop, so the graph depends on the context length. A flat global KV cache pairs with a fixed-depth sliding-window ring, RoPE
-arrives precomputed as ``rope_cos``/``rope_sin``, and the INT8 Per-Layer
-Embeddings table is written as a sidecar next to the asset.
+loop, so the graph depends on the context length. The gather is traced and
+specialized as ``ios.py`` does it. A flat global KV cache pairs with a fixed-depth
+sliding-window ring, RoPE arrives precomputed as ``rope_cos``/``rope_sin``, and the
+INT8 Per-Layer Embeddings table is written as a sidecar next to the asset.
 """
 
 import argparse
@@ -28,8 +29,8 @@ import logging
 import os
 import shutil
 import tempfile
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -66,7 +67,7 @@ logger = logging.getLogger("gemma4.export")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_IOS_COMPRESSION_CONFIG = (
-    Path(__file__).resolve().parent / "gemma4_4bit_palettized.yaml"
+    Path(__file__).resolve().parent / "4bit_palettized.yaml"
 )
 
 # Checkpoints whose exports have been accuracy- and performance-verified. These
@@ -109,7 +110,7 @@ def _resolve_eos_token_ids(hf_model_id: str, text_config: Any) -> list[int]:
 
     try:
         _add(GenerationConfig.from_pretrained(hf_model_id).eos_token_id)
-    except Exception as exc:  # noqa: BLE001
+    except OSError as exc:  # no generation_config.json in the checkpoint
         logger.warning(f"Could not load generation config for eos tokens: {exc}")
 
     _add(getattr(text_config, "eos_token_id", None))
@@ -122,40 +123,37 @@ def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
     * ``sliding_window`` -- the runner builds the windowed mask for the sliding
       KV cache from it.
     * ``rope`` -- the iOS graph takes precomputed ``rope_cos``/``rope_sin``
-      instead of ``position_ids`` (a 131k position overflows a 16-bit input and a
-      32-bit input fails to compile), so the runner needs
+      instead of ``position_ids`` (a 131k position overflows a 16-bit position input,
+      and a 32-bit one feeding the RoPE gather fails to
+      compile), so the runner needs
       the two head dims, the two RoPE bases, and the global partial-rotary factor
       to build the combined table rows.
     * ``final_logit_softcapping`` -- ``tanh`` is best run on the CPU rather than in the
       graph, so the iOS graph omits the ``c * tanh(logits / c)`` cap and the runner
       applies it on the CPU between reading the logits and sampling.
     """
-    extras: dict[str, Any] = {}
-
-    sliding_window = getattr(text_config, "sliding_window", None)
-    if isinstance(sliding_window, int) and sliding_window > 0:
-        extras["sliding_window"] = sliding_window
+    try:
+        rope = text_config.rope_parameters
+        extras: dict[str, Any] = {
+            "sliding_window": text_config.sliding_window,
+            "rope": {
+                "sliding_head_dim": text_config.head_dim,
+                "global_head_dim": text_config.global_head_dim,
+                "sliding_rope_theta": rope["sliding_attention"]["rope_theta"],
+                "global_rope_theta": rope["full_attention"]["rope_theta"],
+                "partial_rotary_factor": rope["full_attention"][
+                    "partial_rotary_factor"
+                ],
+            },
+        }
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            f"Gemma 4 config is missing a field the iOS runner needs: {exc!r}"
+        ) from exc
 
     softcap = getattr(text_config, "final_logit_softcapping", None)
-    if isinstance(softcap, (int, float)) and softcap > 0:
+    if softcap:
         extras["final_logit_softcapping"] = float(softcap)
-
-    rope_parameters = getattr(text_config, "rope_parameters", None)
-    global_head_dim = getattr(text_config, "global_head_dim", None)
-    if (
-        isinstance(rope_parameters, dict)
-        and "sliding_attention" in rope_parameters
-        and "full_attention" in rope_parameters
-        and isinstance(global_head_dim, int)
-    ):
-        full = rope_parameters["full_attention"]
-        extras["rope"] = {
-            "sliding_head_dim": text_config.head_dim,
-            "global_head_dim": global_head_dim,
-            "sliding_rope_theta": rope_parameters["sliding_attention"]["rope_theta"],
-            "global_rope_theta": full["rope_theta"],
-            "partial_rotary_factor": full.get("partial_rotary_factor", 0.25),
-        }
     return extras
 
 
@@ -203,22 +201,17 @@ def _text_config(hf_model_id: str) -> Any:
 def _resolve_bundle_paths(
     output_dir: str, output_name: str, overwrite: bool
 ) -> tuple[Path, Path]:
-    """Create the bundle directory and clear a stale asset. Returns (bundle, asset)."""
+    """Create the bundle directory, failing fast on an existing asset without
+    ``--overwrite``. Returns (bundle, asset). The existing asset is only removed just
+    before the new one is saved, so a failed export leaves it in place."""
     bundle_path = Path(output_dir) / output_name
     aimodel_path = bundle_path / f"{output_name}.aimodel"
-    if aimodel_path.exists():
-        if not overwrite:
-            raise SystemExit(
-                f"{aimodel_path} already exists. Use --overwrite to replace it."
-            )
-        shutil.rmtree(aimodel_path)
+    if aimodel_path.exists() and not overwrite:
+        raise SystemExit(
+            f"{aimodel_path} already exists. Use --overwrite to replace it."
+        )
     bundle_path.mkdir(parents=True, exist_ok=True)
     return bundle_path, aimodel_path
-
-
-# ===========================================================================
-# Compression
-# ===========================================================================
 
 
 # ===========================================================================
@@ -331,8 +324,13 @@ def context_ladder(
     buckets = sorted(set(buckets))
 
     if dev.ladder_only:
-        want = set(dev.ladder_only)
-        buckets = [b for b in buckets if b in want] or [ctx_max]
+        kept = [b for b in buckets if b in set(dev.ladder_only)]
+        if not kept:
+            raise SystemExit(
+                f"--dev-ladder-only {list(dev.ladder_only)}: none of these buckets are in "
+                f"the ladder for --max-context-length {max_context_length}: {buckets}"
+            )
+        buckets = kept
     return buckets
 
 
@@ -345,27 +343,19 @@ def _ios_decomp_table():
 
 
 def _reference_inputs(
-    model: Gemma4ForCausalLMForiOS,
-    config,
-    max_context_length: int,
-    ctx: int,
-    query_len: int,
-) -> dict[str, dict]:
-    """The model's reference inputs for one rung, checked against its contract."""
-    spec = TraceSpec(
-        max_context_length=max_context_length, cache_seq_len=ctx, query_len=query_len
-    )
+    model: Gemma4ForCausalLMForiOS, config, spec: TraceSpec
+) -> tuple[dict[str, dict], dict[str, Any]]:
+    """The model's reference inputs and dynamic shapes for one rung, checked against
+    its contract."""
     reference_inputs = model.build_reference_inputs(config, torch.float16, spec)
-    model.validate_export_contract(
-        reference_inputs, model.build_dynamic_shapes(config, spec)
-    )
-    return reference_inputs
+    dynamic_shapes = model.build_dynamic_shapes(config, spec)
+    model.validate_export_contract(reference_inputs, dynamic_shapes)
+    return reference_inputs, dynamic_shapes
 
 
 def _export_programs(
     model: Gemma4ForCausalLMForiOS,
     config,
-    max_context_length: int,
     buckets: list[int],
     dev: DevOverrides = DevOverrides(),
 ) -> list[tuple[str, str, int, torch.export.ExportedProgram]]:
@@ -375,7 +365,11 @@ def _export_programs(
     transformer (context bucket, query length) pair is its own fully static
     program, named ``{entrypoint}_{ctx}_{q}``. Returns
     ``(entrypoint name, contract graph, context bucket, program)`` tuples.
+
+    Every trace is bounded by the top bucket rather than ``--max-context-length``:
+    the ladder rounds that up to a power of two, so the top bucket can exceed it.
     """
+    ladder_max = buckets[-1]
     extend_qlens = _extend_query_lengths(dev)
     prompt_qlens = _prompt_query_lengths(dev)
     decomp_table = _ios_decomp_table()
@@ -400,13 +394,14 @@ def _export_programs(
             )
         )
         logger.info(f"Exporting {GATHER_EMBEDDINGS_FUNCTION_NAME}...")
-        spec = TraceSpec(
-            max_context_length=max_context_length,
-            cache_seq_len=buckets[0],
-            query_len=model.IOS_QUERY_LEN,
-        )
-        ref = _reference_inputs(
-            model, config, max_context_length, buckets[0], model.IOS_QUERY_LEN
+        ref, dynamic_shapes = _reference_inputs(
+            model,
+            config,
+            TraceSpec(
+                max_context_length=ladder_max,
+                cache_seq_len=buckets[0],
+                query_len=model.IOS_QUERY_LEN,
+            ),
         )
         programs.append(
             (
@@ -416,9 +411,7 @@ def _export_programs(
                 trace(
                     model.gather_embeddings,
                     ref[GATHER_EMBEDDINGS_FUNCTION_NAME],
-                    model.build_dynamic_shapes(config, spec)[
-                        GATHER_EMBEDDINGS_FUNCTION_NAME
-                    ],
+                    dynamic_shapes[GATHER_EMBEDDINGS_FUNCTION_NAME],
                 ),
             )
         )
@@ -436,7 +429,15 @@ def _export_programs(
                         f"Exporting {name} "
                         f"(flash chunks={(ctx + block_size - 1) // block_size})..."
                     )
-                    ref = _reference_inputs(model, config, max_context_length, ctx, q)
+                    ref, _ = _reference_inputs(
+                        model,
+                        config,
+                        TraceSpec(
+                            max_context_length=ladder_max,
+                            cache_seq_len=ctx,
+                            query_len=q,
+                        ),
+                    )
                     program = trace(model.extend, ref[EXTEND_FUNCTION_NAME])
                     program = program.run_decompositions(decomp_table)
                     remove_functionalization(program)
@@ -509,7 +510,7 @@ async def _export_blocked_ladder(
     """Export the Gemma4 model as a per-context blocked-flash ladder AIProgram."""
     buckets = context_ladder(max_context_length, dev)
     logger.info(f"iOS context ladder: {buckets}")
-    programs = _export_programs(model, config, max_context_length, buckets, dev)
+    programs = _export_programs(model, config, buckets, dev)
     gather_qlens = set(_extend_query_lengths(dev)) | set(_prompt_query_lengths(dev))
     return await _convert_to_coreai(
         model, programs, config, gather_qlens, include_debug_info
@@ -520,9 +521,21 @@ def _palettization_inputs(
     model: Gemma4ForCausalLMForiOS, config, max_context_length: int
 ) -> tuple:
     """The palettizer's calibration inputs: the smallest rung's reference inputs,
-    as ``model.forward``'s positional arguments."""
+    as ``model.forward``'s positional arguments.
+
+    K-means palettization works on the weights; these only drive the trace, which is
+    why zero RoPE rows and random ids and PLE rows are fine.
+    """
     ctx = min(SHIPPING_CONTEXT_LADDER[0], max_context_length)
-    ref = _reference_inputs(model, config, max_context_length, ctx, model.IOS_QUERY_LEN)
+    ref, _ = _reference_inputs(
+        model,
+        config,
+        TraceSpec(
+            max_context_length=max_context_length,
+            cache_seq_len=ctx,
+            query_len=model.IOS_QUERY_LEN,
+        ),
+    )
     forward_inputs = {
         "input_ids": ref[GATHER_EMBEDDINGS_FUNCTION_NAME]["input_ids"],
         **{
@@ -576,7 +589,13 @@ async def _export_ios(args: argparse.Namespace) -> str:
     with tempfile.TemporaryDirectory(prefix="gemma4_export_") as temp_dir:
         hf_config = _text_config(hf_model_id)
 
-        # The model's own window is only known once its config is loaded.
+        # The model's own limits are only known once its config is loaded; check them
+        # before any weights are.
+        if hf_config.sliding_window != Gemma4ForCausalLMForiOS.SLIDING_WINDOW:
+            raise SystemExit(
+                f"{hf_model_id} has sliding_window={hf_config.sliding_window}, but the "
+                f"iOS export is built for {Gemma4ForCausalLMForiOS.SLIDING_WINDOW}."
+            )
         native_max_ctx = getattr(hf_config, "max_position_embeddings", None)
         if native_max_ctx is not None and max_ctx > native_max_ctx:
             raise SystemExit(
@@ -593,6 +612,13 @@ async def _export_ios(args: argparse.Namespace) -> str:
         ).eval()
         hf_config.max_position_embeddings = max_ctx
 
+        # Write the PLE sidecar straight away and drop the table: it is multiple
+        # gigabytes and not a module weight, so mmap can't evict it.
+        logger.info("Dumping Per-Layer Embeddings (PLE) artifact...")
+        ple_path = model.dump_ple_embedding(str(bundle_path), output_name)
+        logger.info(f"Wrote PLE artifact to {ple_path}")
+        del model._ple_weight
+
         # ---- Palettization (skipped for --compression none) ----
         if palettization_config is not None:
             logger.info(f"Applying palettization ({compression})...")
@@ -608,13 +634,10 @@ async def _export_ios(args: argparse.Namespace) -> str:
             dev=dev,
         )
 
-        # ---- PLE sidecar (while the model is still in memory) ----
-        logger.info("Dumping Per-Layer Embeddings (PLE) artifact...")
-        ple_path = model.dump_ple_embedding(str(bundle_path), output_name)
-        logger.info(f"Wrote PLE artifact to {ple_path}")
-
         del model
 
+        if aimodel_path.exists():
+            shutil.rmtree(aimodel_path)
         logger.info(f"Saving model to {aimodel_path}...")
         await asyncio.to_thread(
             coreai_program.save_asset, aimodel_path, build_aimodel_metadata(hf_model_id)
@@ -724,8 +747,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_int_list,
         metavar="CTX[,CTX...]",
         help="Emit only these context buckets. Buckets outside the ladder for the "
-        "requested --max-context-length are ignored; if none remain, the cap alone "
-        "is emitted.",
+        "requested --max-context-length are ignored; it is an error if none remain.",
     )
     return parser
 
@@ -760,6 +782,15 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
             raise SystemExit(
                 f"{flag}: query lengths must be among {list(allowed)}, got {invalid}"
             )
+
+    # A rung is traced at its query length plus two positions (TraceSpec), and the
+    # top bucket is a power of two at or above --max-context-length.
+    widest_prompt = max(args.dev_prompt_qlens or SHIPPING_PROMPT_QLENS)
+    if args.max_context_length is not None and args.max_context_length <= widest_prompt:
+        raise SystemExit(
+            f"--max-context-length must exceed the prefill query length {widest_prompt} "
+            f"(got {args.max_context_length})."
+        )
 
     if args.compression is None and args.compression_config is None:
         args.compression_config = DEFAULT_IOS_COMPRESSION_CONFIG

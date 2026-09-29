@@ -93,6 +93,13 @@ def sliding_ring_size(sliding_window: int, max_query_len: int) -> int:
     return ((raw + max_query_len - 1) // max_query_len) * max_query_len
 
 
+def _ple_quant_scale(ple_weight: torch.Tensor, embed_scale: float) -> torch.Tensor:
+    """``quantize_per_tensor``'s symmetric INT8 scale for ``ple_weight * embed_scale``,
+    without an fp32 copy of the table: scaling by a positive constant commutes with
+    ``max|x|``."""
+    return torch.clamp(ple_weight.abs().max().float() * embed_scale, min=1e-6) / 127
+
+
 class RMSNormNoScale(nn.Module):
     """RMSNorm without learnable scale (for v_norm)."""
 
@@ -410,8 +417,8 @@ class Gemma4Model(nn.Module):
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         # RoPE cos/sin are precomputed in the runner and passed in as graph inputs: a 131k
-        # position index overflows a 16-bit input, and a 32-bit one fails to
-        # compile.
+        # position index overflows a 16-bit position input, and a 32-bit one feeding the
+        # RoPE gather fails to compile.
 
     def _compute_per_layer_inputs(
         self,
@@ -682,6 +689,11 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         length: each (context bucket, query length) pair is its own program, with the
         caches at ``spec.cache_seq_len`` and ``spec.query_len`` query positions.
         """
+        if self.disable_embedding_quantization:
+            raise ValueError(
+                "The iOS graph takes INT8 ple_embeddings; disable_embedding_quantization "
+                "is for eager tests"
+            )
         if config.sliding_window != self.SLIDING_WINDOW:
             raise ValueError(
                 f"sliding_window={config.sliding_window}, but the export assumes "
@@ -760,7 +772,8 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     @override
     def export_static_shape_configs(cls, config, max_context_length: int) -> dict:
         # Only the gather is specialized (over IOS_STATIC_QUERY_LENS, as for every iOS
-        # model); the transformer rungs are traced at fully static shapes.
+        # model); the transformer rungs are traced at fully static shapes, one per
+        # context bucket (passed here as max_context_length).
         base = super().export_static_shape_configs(config, max_context_length)
         return {
             LOAD_EMBEDDINGS_FUNCTION_NAME: {},
@@ -773,8 +786,9 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     def export_hardware_constraints(
         cls, max_context_length: int
     ) -> dict[str, dict[str, HardwareConstraints]]:
-        """The base constraints for a ``max_context_length`` global cache, with the
-        sliding ring's caches aligned to the ring depth instead."""
+        """The base constraints for one rung, whose global cache is
+        ``max_context_length`` (the rung's context bucket) long, with the sliding
+        ring's caches aligned to the ring depth instead."""
         constraints = super().export_hardware_constraints(max_context_length)
         sliding_cache = HardwareConstraints(
             AllocationType.IOSurface,
@@ -864,41 +878,36 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         ple_dim = config.hidden_size_per_layer_input
 
         # Extract PLE embedding weight (externalized from graph)
-        if ple_dim > 0:
-            ple_key = "model.embed_tokens_per_layer.weight"
-            if ple_key not in state_dict:
-                raise KeyError(f"checkpoint has no per-layer embedding table ({ple_key})")
-            ple_weight = state_dict.pop(ple_key)
-            expected_dim = num_layers * ple_dim
-            if ple_weight.shape[1] > expected_dim:
-                ple_weight = ple_weight[:, :expected_dim].contiguous()
-            self._ple_weight = ple_weight
+        if ple_dim == 0:
+            raise NotImplementedError(
+                "Gemma 4 iOS supports the per-layer-embedding (E2B/E4B) variants only"
+            )
+        ple_key = "model.embed_tokens_per_layer.weight"
+        if ple_key not in state_dict:
+            raise KeyError(f"checkpoint has no per-layer embedding table ({ple_key})")
+        ple_weight = state_dict.pop(ple_key)
+        expected_dim = num_layers * ple_dim
+        if ple_weight.shape[1] > expected_dim:
+            ple_weight = ple_weight[:, :expected_dim].contiguous()
+        self._ple_weight = ple_weight
 
-            # PLE quant params, used only to dequantize an INT8 ``ple_embeddings``
-            # graph input at runtime. Skip quantization when embedding quantization
-            # is disabled, mirroring the embedding table below: identity scale/zp so
-            # the PLE path stays fp (the runner then supplies fp ``ple_embeddings``
-            # with the ``sqrt(ple_dim)`` embed scale folded in externally).
-            if not self.disable_embedding_quantization:
-                # The scale quantize_per_tensor derives in dump_ple_embedding, without
-                # quantizing the multi-GB table twice: scaling by a positive constant
-                # commutes with max|x|.
-                ple_embed_scale = config.hidden_size_per_layer_input**0.5
-                ple_scale = (
-                    torch.clamp(ple_weight.abs().max().float() * ple_embed_scale, min=1e-6) / 127
-                )
-            else:
-                ple_scale = torch.tensor(1.0)
-            state_dict["extend.ple_scale"] = ple_scale.to(ple_weight.dtype)
-            state_dict["extend.ple_zero_point"] = torch.tensor(0, dtype=torch.int8)
+        # PLE quant params, used to dequantize the INT8 ``ple_embeddings`` graph input.
+        # With embedding quantization disabled (eager parity tests only; the export
+        # rejects it) the scale is identity, so the tests can feed fp rows.
+        if not self.disable_embedding_quantization:
+            ple_scale = _ple_quant_scale(ple_weight, ple_dim**0.5)
+        else:
+            ple_scale = torch.tensor(1.0)
+        state_dict["extend.ple_scale"] = ple_scale.to(ple_weight.dtype)
+        state_dict["extend.ple_zero_point"] = torch.tensor(0, dtype=torch.int8)
 
-            # Truncate per_layer_model_projection if needed
-            proj_key = "model.per_layer_model_projection.weight"
-            if proj_key in state_dict:
-                full_proj = state_dict[proj_key]
-                expected_out = num_layers * ple_dim
-                if full_proj.shape[0] > expected_out:
-                    state_dict[proj_key] = full_proj[:expected_out, :]
+        # Truncate per_layer_model_projection if needed
+        proj_key = "model.per_layer_model_projection.weight"
+        if proj_key in state_dict:
+            full_proj = state_dict[proj_key]
+            expected_out = num_layers * ple_dim
+            if full_proj.shape[0] > expected_out:
+                state_dict[proj_key] = full_proj[:expected_out, :]
 
         # Reshape weights for Conv2d and handle shared layers
         for i in range(num_layers):
@@ -970,24 +979,34 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         """Dump the externalized PLE embedding table as a quantized INT8 safetensors file."""
         import os
 
+        if self.disable_embedding_quantization:
+            raise ValueError(
+                "The PLE sidecar is INT8; disable_embedding_quantization is for eager tests"
+            )
         ple_weight = self._ple_weight
-        config = self.config
-        ple_dim = config.hidden_size_per_layer_input
+        ple_dim = self.config.hidden_size_per_layer_input
         embed_scale = str(ple_dim**0.5)
+        ple_scale = _ple_quant_scale(ple_weight, float(embed_scale))
 
-        ple_scaled = ple_weight.float() * float(embed_scale)
-        ple_q, ple_scale, ple_zp = quantize_per_tensor(ple_scaled, nbits=8, symmetric=True)
+        # quantize_per_tensor's rounding, a block of rows at a time so the table never
+        # has a full fp32 copy.
+        ple_q = torch.empty(ple_weight.shape, dtype=torch.int8)
+        for start in range(0, ple_weight.shape[0], 8192):
+            rows = ple_weight[start : start + 8192].float() * float(embed_scale)
+            ple_q[start : start + 8192] = torch.clamp(torch.round(rows / ple_scale), -128, 127).to(
+                torch.int8
+            )
 
         os.makedirs(output_path, exist_ok=True)
         ple_path = os.path.join(output_path, f"{model_name}_ple.safetensors")
 
         save_file(
-            {"embed_tokens_per_layer": ple_q.contiguous()},
+            {"embed_tokens_per_layer": ple_q},
             ple_path,
             metadata={
                 "embed_scale": embed_scale,
                 "ple_scale": str(float(ple_scale)),
-                "ple_zero_point": str(int(ple_zp)),
+                "ple_zero_point": "0",
                 "dtype": "SI8",
             },
         )

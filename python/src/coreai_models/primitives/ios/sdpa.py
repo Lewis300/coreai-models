@@ -145,12 +145,20 @@ class SDPA(nn.Module):
         return final_score
 
 
+#: Largest dimension the accelerator's transposes handle; BlockedSDPA keeps every
+#: transposed key axis within it.
+_MAX_TRANSPOSE_DIM = 65536
+
+#: fp16-safe stand-in for -inf in the online-softmax running max.
+_FP16_NEG_INF = -40000.0
+
+
 class BlockedSDPA(nn.Module):
     """Blocked / flash global attention for large-context iOS."""
 
     def __init__(
         self,
-        head_dim: int | None = None,
+        head_dim: int,
         scale: float | torch.Tensor | None = None,
         block_size: int = 8192,
     ) -> None:
@@ -162,11 +170,6 @@ class BlockedSDPA(nn.Module):
                 self._scale_factor = nn.Buffer(scale, persistent=False)
             else:
                 if scale is None:
-                    if head_dim is None:
-                        raise ValueError(
-                            "BlockedSDPA needs head_dim to derive the default scale; "
-                            "pass head_dim or an explicit scale."
-                        )
                     scale = head_dim**-0.5
                 self._scale_factor = nn.Buffer(torch.tensor(scale), persistent=False)
 
@@ -188,7 +191,6 @@ class BlockedSDPA(nn.Module):
             ``(1, n_heads*head_dim, 1, q_len)`` — identical layout to ``SDPA``.
         """
         head_dim, block_size = self.head_dim, self.block_size
-        assert head_dim is not None, "BlockedSDPA requires a concrete head_dim"
         ctx = key.shape[-1]
 
         queries = query.split(head_dim, dim=1)  # each (1, head_dim, 1, q_len)
@@ -199,12 +201,12 @@ class BlockedSDPA(nn.Module):
         # Fold 1/sqrt(block_size) into the exp weights so no fp16 accumulator grows with the key
         # count (plain flash sums overflow fp16 past ~15k keys on the accelerator).
         inv_block = 1.0 / float(block_size) ** 0.5
-        # Above 65536, form p@v as (v @ pᵀ)ᵀ (transpose the small p, not the value cache);
-        # the direct p@v is a faster kernel at/below it, so keep it there.
-        hoist_safe = ctx > 65536
-        # Slice K/V/mask into <=65536-wide super-chunks so the transpose the compiler hoists
-        # for the scores matmul stays within the per-dim limit.
-        xpose_span = max(block_size, (65536 // block_size) * block_size)
+        # Above the transpose limit, form p@v as (v @ pᵀ)ᵀ (transpose the small p, not the
+        # value cache); the direct p@v is a faster kernel at/below it, so keep it there.
+        hoist_safe = ctx > _MAX_TRANSPOSE_DIM
+        # Slice K/V/mask into super-chunks no wider than the limit so the transpose the
+        # compiler hoists for the scores matmul stays within it.
+        xpose_span = max(block_size, (_MAX_TRANSPOSE_DIM // block_size) * block_size)
 
         # Pre-permute each Q head to (1, 1, q_len, head_dim) once (block-independent).
         qp = [q.permute(0, 2, 3, 1) for q in queries]
@@ -217,8 +219,8 @@ class BlockedSDPA(nn.Module):
             # through the matmul unit once for all of them.
             q_stack = torch.cat([qp[h] for h in group], dim=2)  # (1, 1, G·q_len, head_dim)
             rows = q_stack.shape[2]
-            # -40000 is the fp16-safe -inf; den is the block-scaled denominator, o the output.
-            m = torch.full((1, 1, rows, 1), -40000.0, dtype=query.dtype, device=query.device)
+            # den is the block-scaled denominator, o the output.
+            m = torch.full((1, 1, rows, 1), _FP16_NEG_INF, dtype=query.dtype, device=query.device)
             den = torch.zeros((1, 1, rows, 1), dtype=query.dtype, device=query.device)
             o = torch.zeros((1, rows, head_dim), dtype=query.dtype, device=query.device)
             for c_lo in range(0, ctx, xpose_span):

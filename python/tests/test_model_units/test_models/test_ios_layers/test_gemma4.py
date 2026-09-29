@@ -13,8 +13,12 @@ single HF forward (which applies sliding-window attention internally). The key
 case is a prompt longer than both W and S so the ring wraps.
 """
 
+import os
+import tempfile
+
 import pytest
 import torch
+from safetensors import safe_open
 
 pytest.importorskip("transformers")
 
@@ -26,12 +30,13 @@ except Exception:  # pragma: no cover - requires transformers>=5.5
     Gemma4ForCausalLM = None
 
 from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
-from coreai_models.models.base import TraceSpec  # noqa: E402
+from coreai_models.models.base import TraceSpec, _is_layer_key_beyond  # noqa: E402
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
     Gemma4ForCausalLMForiOS,
     _compute_kv_layout,
     sliding_ring_size,
 )
+from coreai_models.primitives.ios.quantization import quantize_per_tensor  # noqa: E402
 from coreai_models.primitives.ios.rope import RoPECache  # noqa: E402
 from tests._runner_infra._deps import _hf_hub_reachable  # noqa: E402
 
@@ -146,6 +151,16 @@ def _build_ios_model(cfg, hf_sd):
     return model
 
 
+def _build_quantized_ios_model(cfg, hf_sd):
+    """The model as exported: INT8 embedding table and PLE path."""
+    sd = dict(hf_sd)
+    model = Gemma4ForCausalLMForiOS(cfg, model_device="cpu", disable_embedding_quantization=False)
+    model.to(DTYPE).eval()
+    model._mutate_state_dict(sd)
+    model.load_state_dict(sd, assign=True, strict=True)
+    return model
+
+
 def _ple_input_fp(hf_model, cfg, token_ids):
     # Build the fp ``ple_embeddings`` graph input the way export quantizes it
     # (ple_weight[token] * sqrt(ple_dim)), but kept fp to avoid INT8 noise.
@@ -214,7 +229,7 @@ def test_export_contract_describes_one_rung():
     """The export hooks describe one fully static (context bucket, query length) rung."""
     cfg = _make_config()
     cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW
-    model = _build_ios_model(cfg, dict(Gemma4ForCausalLM(cfg).state_dict()))
+    model = _build_quantized_ios_model(cfg, Gemma4ForCausalLM(cfg).state_dict())
     ctx, q_len, ring = 1024, 8, Gemma4ForCausalLMForiOS.SLIDING_RING_SIZE
     spec = TraceSpec(max_context_length=4 * ctx, cache_seq_len=ctx, query_len=q_len)
 
@@ -236,6 +251,62 @@ def test_export_contract_describes_one_rung():
     cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW // 2
     with pytest.raises(ValueError, match="sliding_window"):
         model.build_reference_inputs(cfg, torch.float16, spec)
+
+
+def test_export_rejects_unquantized_ple():
+    """The graph and the runner take INT8 ple_embeddings, so an fp PLE path can't export."""
+    cfg = _make_config()
+    cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW
+    model = _build_ios_model(cfg, dict(Gemma4ForCausalLM(cfg).state_dict()))
+    spec = TraceSpec(max_context_length=1024, cache_seq_len=1024, query_len=8)
+    with pytest.raises(ValueError, match="INT8"):
+        model.build_reference_inputs(cfg, torch.float16, spec)
+    with pytest.raises(ValueError, match="INT8"):
+        model.dump_ple_embedding(tempfile.mkdtemp(), "m")
+
+
+def test_ple_sidecar_matches_graph_scale():
+    """The sidecar's INT8 rows and scale are what the graph dequantizes with."""
+    torch.manual_seed(0)
+    cfg = _make_config()
+    model = _build_quantized_ios_model(cfg, Gemma4ForCausalLM(cfg).state_dict())
+    embed_scale = cfg.hidden_size_per_layer_input**0.5
+    ref_q, ref_scale, _ = quantize_per_tensor(
+        model._ple_weight.float() * embed_scale, nbits=8, symmetric=True
+    )
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        safe_open(model.dump_ple_embedding(tmp, "m"), "pt") as f,
+    ):
+        rows = f.get_tensor("embed_tokens_per_layer")
+        sidecar_scale = float(f.metadata()["ple_scale"])
+    assert torch.equal(rows, ref_q)
+    assert sidecar_scale == float(ref_scale)
+    assert model.extend.ple_scale.item() == float(ref_scale.to(model.extend.ple_scale.dtype))
+
+
+def test_rejects_checkpoints_without_per_layer_embeddings():
+    cfg = _make_config()
+    cfg.hidden_size_per_layer_input = 0
+    model = Gemma4ForCausalLMForiOS(cfg, model_device="cpu", disable_embedding_quantization=False)
+    with pytest.raises(NotImplementedError, match="per-layer-embedding"):
+        model._mutate_state_dict({})
+
+
+@pytest.mark.parametrize(
+    "key, beyond",
+    [
+        ("model.layers.3.self_attn.q_proj.weight", True),
+        ("layers.3.self_attn.q_proj.weight", True),
+        ("model.language_model.layers.1.mlp.up_proj.weight", False),
+        ("layers.1.mlp.up_proj.weight", False),
+        ("model.embed_tokens.weight", False),
+        ("model.sublayers.9.weight", False),
+    ],
+)
+def test_is_layer_key_beyond_with_and_without_prefix(key, beyond):
+    """A stripped ``layers.N.`` key is filtered like a prefixed one."""
+    assert _is_layer_key_beyond(key, 2) is beyond
 
 
 def test_kv_layout_dead_slot_compaction():
@@ -336,8 +407,9 @@ def test_final_logit_softcap_left_to_runner():
 # embeddings, so the compare isn't muddied by INT8 embedding noise) and mimics the
 # Swift runner's chunked prefill — precomputed dual RoPE rows, the flat global
 # cache + sliding ring, and the fp PLE sidecar — then compares per-position logits
-# to a single HuggingFace forward. It is heavy (loads a ~2B model twice) and needs
-# network + weights + transformers>=5.5, so it is opt-in via ``-m slow``.
+# to a single HuggingFace forward. It is heavy (downloads and loads a ~2B model
+# twice), so it only runs with RUN_GEMMA4_E2B_PARITY=1, plus network, weights and
+# transformers>=5.5.
 # ---------------------------------------------------------------------------
 
 E2B_MODEL_ID = "google/gemma-4-E2B-it"
@@ -421,6 +493,8 @@ def _e2b_prefill_logits(model, rope, cfg, token_ids, q_len, S, ctx, dtype):
 @pytest.mark.flaky(reruns=0)
 def test_e2b_full_parity_hf_vs_torch():
     """Real E2B: our iOS torch model's chunked-prefill logits match a HF forward."""
+    if os.environ.get("RUN_GEMMA4_E2B_PARITY") != "1":
+        pytest.skip("set RUN_GEMMA4_E2B_PARITY=1 to download and compare the real E2B")
     if Gemma4ForCausalLM is None:
         pytest.skip("gemma4 requires transformers>=5.5")
     if not _hf_hub_reachable(E2B_MODEL_ID):
@@ -472,7 +546,7 @@ def test_e2b_full_parity_hf_vs_torch():
         ios_logits = torch.tanh(ios_logits / final_cap) * final_cap
 
     hf = Gemma4ForConditionalGeneration.from_pretrained(
-        E2B_MODEL_ID, config=hf_cfg, torch_dtype=dtype
+        E2B_MODEL_ID, config=hf_cfg, dtype=dtype
     ).eval()
     with torch.no_grad():
         hf_logits = (

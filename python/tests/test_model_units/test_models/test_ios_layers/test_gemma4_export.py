@@ -3,14 +3,16 @@
 # Use of this source code is governed by a BSD-3-clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-"""The Gemma 4 export recipe, run end to end through Core AI conversion.
+"""The Gemma 4 export recipe (``models/gemma4/export.py``).
 
-The recipe is co-located at ``models/gemma4/export.py`` (not part of the
-installed package), so it is loaded by path. A tiny synthetic Gemma 4 is
-exported as a one-bucket ladder, converted, saved, and loaded back, and the
-emitted functions are checked against the names the runner looks up.
+The recipe is not part of the installed package, so it is loaded by path. Its CLI
+checks and metadata are tested directly; a tiny synthetic Gemma 4 is traced over a
+non-power-of-two ladder, and exported as a one-bucket ladder through Core AI
+conversion, saved, and loaded back, with the emitted functions checked against the
+names the runner looks up.
 """
 
+import argparse
 import asyncio
 import importlib.util
 import tempfile
@@ -29,6 +31,7 @@ from coreai_models.models.ios.gemma4_text import Gemma4ForCausalLMForiOS  # noqa
 from tests._runner_infra._deps import _HAS_COREAI, _MSG_COREAI_NOT_FOUND  # noqa: E402
 from tests.test_model_units.test_models.test_ios_layers.test_gemma4 import (  # noqa: E402
     Gemma4ForCausalLM,
+    _build_quantized_ios_model,
     _make_config,
 )
 
@@ -52,12 +55,7 @@ def test_ladder_converts_and_loads():
     cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW
     # Quantized embeddings, as shipped: the gather then lowers to the fused
     # dequant-gather, which only converts when traced dynamic in the query length.
-    sd = dict(Gemma4ForCausalLM(cfg).state_dict())
-    model = Gemma4ForCausalLMForiOS(cfg, model_device="cpu", disable_embedding_quantization=False)
-    model.to(torch.float32).eval()
-    model._mutate_state_dict(sd)
-    model.load_state_dict(sd, assign=True, strict=True)
-    model = model.half()
+    model = _build_quantized_ios_model(cfg, Gemma4ForCausalLM(cfg).state_dict()).half()
     ctx = 1024
 
     program = asyncio.run(export_g4._export_blocked_ladder(model, model.config, ctx))
@@ -87,3 +85,72 @@ def test_ladder_converts_and_loads():
     assert {name: loaded.get(name) for name in expected} == expected
     # Anything else is a composite the lowering emits (the fused dequant-gather).
     assert all(name.startswith("fused_") for name in set(loaded) - set(expected)), sorted(loaded)
+
+
+def _tiny_export_model():
+    torch.manual_seed(0)
+    cfg = _make_config()
+    cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW
+    return _build_quantized_ios_model(cfg, Gemma4ForCausalLM(cfg).state_dict()).half()
+
+
+def test_non_power_of_two_context_traces_every_rung():
+    """The ladder rounds up to a power of two; every rung, including the top one above
+    --max-context-length, must still trace."""
+    model = _tiny_export_model()
+    buckets = export_g4.context_ladder(2000)
+    assert buckets == [1024, 2048]
+    names = [name for name, *_ in export_g4._export_programs(model, model.config, buckets)]
+    assert names == [
+        "load_embeddings",
+        "gather_embeddings",
+        "extend_1024_8",
+        "prompt_opt_1024_64",
+        "extend_2048_8",
+        "prompt_opt_2048_64",
+    ]
+
+
+def test_dev_ladder_only_rejects_buckets_outside_the_ladder():
+    dev = export_g4.DevOverrides(ladder_only=(4096,))
+    with pytest.raises(SystemExit, match="none of these buckets"):
+        export_g4.context_ladder(2000, dev)
+    assert export_g4.context_ladder(131072, export_g4.DevOverrides(ladder_only=(8192,))) == [8192]
+
+
+def _cli_args(*argv: str) -> argparse.Namespace:
+    return export_g4.build_parser().parse_args(["--model", "google/gemma-4-E2B-it", *argv])
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (("--max-context-length", "64"), "must exceed the prefill query length"),
+        (("--max-context-length", "262144"), "supports at most"),
+        (("--dev-prompt-qlens", "32"), "must be among"),
+    ],
+)
+def test_cli_rejects_invalid_arguments(argv, message):
+    with pytest.raises(SystemExit, match=message):
+        export_g4._resolve_defaults(_cli_args(*argv))
+
+
+def test_cli_accepts_small_and_default_contexts():
+    for argv in ((), ("--max-context-length", "65"), ("--dev-prompt-qlens", "16")):
+        export_g4._resolve_defaults(_cli_args(*argv))
+
+
+def test_metadata_extras_require_what_the_runner_needs():
+    cfg = _make_config()
+    extras = export_g4._ios_metadata_extras(cfg)
+    assert extras["sliding_window"] == cfg.sliding_window
+    assert set(extras["rope"]) == {
+        "sliding_head_dim",
+        "global_head_dim",
+        "sliding_rope_theta",
+        "global_rope_theta",
+        "partial_rotary_factor",
+    }
+    del cfg.rope_parameters["full_attention"]["partial_rotary_factor"]
+    with pytest.raises(ValueError, match="partial_rotary_factor"):
+        export_g4._ios_metadata_extras(cfg)
