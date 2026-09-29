@@ -9,10 +9,11 @@ Google's Gemma 4 models for on-device inference via Core AI (iOS).
 | Gemma 4 E2B Instruct | 5.0B       | Yes |
 | Gemma 4 E4B Instruct | 8.0B       | Yes |
 
-These are the Gemma 4 checkpoints sized for a phone. Both use Per-Layer
-Embeddings (PLE) and a graph shape that doesn't fit the generic
-`coreai.llm.export` pipeline, so they export through the standalone
-[`export.py`](export.py).
+These are the Gemma 4 checkpoints sized for a phone. They export through the
+standalone [`export.py`](export.py) rather than the generic `coreai.llm.export`
+pipeline, for two reasons: the blocked attention's graph depends on the context
+length, so each context bucket is traced as its own static graph, and the
+Per-Layer Embeddings (PLE) table is dumped as a sidecar next to the asset.
 
 ## Gated Access
 

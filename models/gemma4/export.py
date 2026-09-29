@@ -8,7 +8,9 @@
 """Standalone export recipe for the Gemma 4 PLE variants (E2B / E4B), iOS.
 
 The Per-Layer-Embeddings variants don't fit the generic ``coreai.llm.export``
-pipeline, so they ship as a standalone recipe (see ``models/gemma4/README.md``):
+pipeline, for two reasons: each context bucket needs its own statically traced
+graph, and the PLE table has to be dumped as a sidecar. So they ship as a standalone
+recipe (see ``models/gemma4/README.md``):
 
     cd models/gemma4
     uv run export.py --model google/gemma-4-E2B-it --max-context-length 32768
