@@ -47,7 +47,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -88,6 +87,7 @@ from coreai_models.export.mlir_ops import (
     register_custom_torch_lowering,
     remove_functionalization,
 )
+from coreai_models.export.pipeline import ExportConfig, _generate_output_name
 from coreai_models.models.base import BaseForCausalLMForiOS
 from coreai_models.models.ios.gemma4_text import (
     PLE_EMBEDDINGS_INPUT_NAME,
@@ -443,20 +443,6 @@ def _head_dim(config) -> int:
     if hasattr(config, "head_dim") and isinstance(config.head_dim, int):
         return config.head_dim
     return config.hidden_size // config.num_attention_heads
-
-
-def _default_output_name(hf_model_id: str) -> str:
-    """Bundle name for a checkpoint, following the shared LLM convention.
-
-    Every LLM bundle name is the lowercased HF tail with runs of non-alphanumerics
-    collapsed to ``_`` — ``Qwen/Qwen3-0.6B`` becomes ``qwen3_0_6b`` — so
-    ``google/gemma-4-E2B-it`` becomes ``gemma_4_e2b_it``. Mirrors
-    ``coreai_models.export.pipeline._generate_output_name``, which is not
-    importable here because it takes a whole ``ExportConfig``.
-    """
-    tail = hf_model_id.split("/")[-1]
-    base = re.sub(r"[^a-z0-9]+", "_", tail.lower()).strip("_")
-    return f"{base}_static"
 
 
 def _ple_total_dim(config) -> int:
@@ -949,6 +935,18 @@ async def _export_ios(args: argparse.Namespace) -> str:
     else:
         compression = "none"
 
+    output_name = args.output_name or _generate_output_name(
+        ExportConfig(
+            hf_model_id=hf_model_id,
+            variant="iOS",
+            compression=compression,
+            compression_config_object=palettization_config,
+        )
+    )
+    bundle_path, aimodel_path = _resolve_bundle_paths(
+        args.output_dir, output_name, args.overwrite
+    )
+
     logger.info(
         f"Loading {hf_model_id} (iOS, dtype={target_dtype}, max_ctx={max_ctx})..."
     )
@@ -1002,19 +1000,10 @@ async def _export_ios(args: argparse.Namespace) -> str:
             dev=dev,
         )
 
-        # ---- Bundle paths ----
-        output_name = args.output_name or _default_output_name(hf_model_id)
-        bundle_path, aimodel_path = _resolve_bundle_paths(
-            args.output_dir, output_name, args.overwrite
-        )
-
         # ---- PLE sidecar (while the model is still in memory) ----
-        ple_filename = None
-        if hasattr(model, "dump_ple_embedding") and hasattr(model, "_ple_weight"):
-            logger.info("Dumping Per-Layer Embeddings (PLE) artifact...")
-            ple_path = model.dump_ple_embedding(str(bundle_path), output_name)
-            ple_filename = Path(ple_path).name
-            logger.info(f"Wrote PLE artifact to {ple_path}")
+        logger.info("Dumping Per-Layer Embeddings (PLE) artifact...")
+        ple_path = model.dump_ple_embedding(str(bundle_path), output_name)
+        logger.info(f"Wrote PLE artifact to {ple_path}")
 
         del model
 
@@ -1034,9 +1023,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
         # parameters from `language`; the PLE sidecar is declared in the generic
         # `assets` role map, which is the single path the runner resolves through.
         extras = _ios_metadata_extras(hf_config)
-        assets = {}
-        if ple_filename is not None:
-            assets["per_layer_embeddings"] = ple_filename
+        assets = {"per_layer_embeddings": Path(ple_path).name}
         _patch_language_metadata(
             bundle_path, hf_model_id, hf_config, extras, assets=assets
         )

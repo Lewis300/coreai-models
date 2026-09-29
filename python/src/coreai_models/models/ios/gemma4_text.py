@@ -561,8 +561,12 @@ class Gemma4Model(nn.Module):
         # so the graph carries no second dynamic offset.
         global_offset = in_step
 
+        if ple_embeddings is None:
+            raise ValueError(
+                "ple_embeddings is required: Gemma 4 always takes per-layer embeddings"
+            )
         per_layer_inputs = None
-        if self.hidden_size_per_layer_input and ple_embeddings is not None:
+        if self.hidden_size_per_layer_input:
             per_layer_inputs = self._compute_per_layer_inputs(ple_embeddings, h)
 
         for i, layer in enumerate(self.layers):
@@ -947,28 +951,29 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         # Extract PLE embedding weight (externalized from graph)
         if ple_dim > 0:
             ple_key = "model.embed_tokens_per_layer.weight"
-            if ple_key in state_dict:
-                ple_weight = state_dict.pop(ple_key)
-                expected_dim = num_layers * ple_dim
-                if ple_weight.shape[1] > expected_dim:
-                    ple_weight = ple_weight[:, :expected_dim].contiguous()
-                self._ple_weight = ple_weight
+            if ple_key not in state_dict:
+                raise KeyError(f"checkpoint has no per-layer embedding table ({ple_key})")
+            ple_weight = state_dict.pop(ple_key)
+            expected_dim = num_layers * ple_dim
+            if ple_weight.shape[1] > expected_dim:
+                ple_weight = ple_weight[:, :expected_dim].contiguous()
+            self._ple_weight = ple_weight
 
-                # PLE quant params, used only to dequantize an INT8 ``ple_embeddings``
-                # graph input at runtime. Skip quantization when embedding quantization
-                # is disabled, mirroring the embedding table below: identity scale/zp so
-                # the PLE path stays fp (the runner then supplies fp ``ple_embeddings``
-                # with the ``sqrt(ple_dim)`` embed scale folded in externally).
-                if not self.disable_embedding_quantization:
-                    ple_embed_scale = config.hidden_size_per_layer_input**0.5
-                    _, ple_scale, ple_zp = quantize_per_tensor(
-                        (ple_weight.float() * ple_embed_scale), nbits=8, symmetric=True
-                    )
-                    self._ple_scale_pending = ple_scale.to(torch.float16)
-                    self._ple_zp_pending = ple_zp
-                else:
-                    self._ple_scale_pending = torch.tensor(1.0, dtype=torch.float16)
-                    self._ple_zp_pending = torch.tensor(0, dtype=torch.int8)
+            # PLE quant params, used only to dequantize an INT8 ``ple_embeddings``
+            # graph input at runtime. Skip quantization when embedding quantization
+            # is disabled, mirroring the embedding table below: identity scale/zp so
+            # the PLE path stays fp (the runner then supplies fp ``ple_embeddings``
+            # with the ``sqrt(ple_dim)`` embed scale folded in externally).
+            if not self.disable_embedding_quantization:
+                ple_embed_scale = config.hidden_size_per_layer_input**0.5
+                _, ple_scale, ple_zp = quantize_per_tensor(
+                    (ple_weight.float() * ple_embed_scale), nbits=8, symmetric=True
+                )
+                self._ple_scale_pending = ple_scale.to(torch.float16)
+                self._ple_zp_pending = ple_zp
+            else:
+                self._ple_scale_pending = torch.tensor(1.0, dtype=torch.float16)
+                self._ple_zp_pending = torch.tensor(0, dtype=torch.int8)
 
             # Truncate per_layer_model_projection if needed
             proj_key = "model.per_layer_model_projection.weight"
