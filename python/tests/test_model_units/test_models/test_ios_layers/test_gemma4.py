@@ -423,21 +423,11 @@ def test_e2b_full_parity_hf_vs_torch():
     ios_logits = _e2b_prefill_logits(model, rope, cfg, token_ids, q_len, S, max_ctx, dtype)
     del model  # free the iOS model before loading the HF reference (peak = one model)
 
-    # Match HF's math to what the iOS model actually computes. The iOS decoder applies
-    # neither the attention logit cap nor ``final_logit_softcapping`` (the latter moved to
-    # the Swift runner, since ``tanh`` is best run on the CPU rather than in the graph),
-    # so: disable the
-    # attention cap on the HF reference, and stand in for the runner by applying the final
-    # cap to *our* logits below. Without both, no sane atol/rtol holds. Nulling via the
-    # config before construction ensures it sticks even if a module caches the value at
-    # init. (The tiny-config tests leave the attention cap unset in their synthetic config.)
+    # Match HF's math to what the iOS model actually computes. The iOS decoder doesn't
+    # apply ``final_logit_softcapping`` (it moved to the Swift runner, since ``tanh`` is
+    # best run on the CPU rather than in the graph), so stand in for the runner by
+    # applying the cap to *our* logits below.
     hf_cfg = AutoConfig.from_pretrained(E2B_MODEL_ID)
-    for _c in (hf_cfg, getattr(hf_cfg, "text_config", None)):
-        if _c is None:
-            continue
-        for _attr in ("attention_logit_cap", "attn_logit_softcapping"):
-            if getattr(_c, _attr, None) is not None:
-                setattr(_c, _attr, None)
 
     # The cap the Swift runner reads out of bundle metadata and applies on the CPU.
     final_cap = getattr(cfg, "final_logit_softcapping", None)
@@ -470,8 +460,8 @@ def test_e2b_full_parity_hf_vs_torch():
     assert agreement >= 0.9, (
         f"per-position top-1 agreement {agreement:.3f} too low (max_abs={max_abs:.3f})"
     )
-    # Numerical closeness, with the attention cap disabled on HF above and fp
-    # embeddings (``disable_embedding_quantization``), so the only spread vs HF is fp32
+    # Numerical closeness, with the final cap applied above and fp embeddings
+    # (``disable_embedding_quantization``), so the only spread vs HF is fp32
     # op ordering through the deep stack + the flash online-softmax recurrence. Looser
     # than the tiny-config's 1e-3 because a real 2B model accumulates more.
     torch.testing.assert_close(ios_logits, hf_logits, atol=1e-2, rtol=1e-2)
