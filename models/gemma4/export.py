@@ -480,7 +480,11 @@ async def _convert_to_coreai(
 
     coreai_program: AIProgram = converter.to_coreai()
 
+    # Hardware constraints must be set before a graph's static shape config.
     for name, graph, ctx, _ in programs:
+        constraints = model.export_hardware_constraints(ctx)[graph]
+        if constraints:
+            coreai_program.set_hardware_constraints(name, constraints)
         static_shapes = model.export_static_shape_configs(config, ctx)[graph]
         if graph == GATHER_EMBEDDINGS_FUNCTION_NAME:
             static_shapes = {
@@ -490,12 +494,6 @@ async def _convert_to_coreai(
             }
         if static_shapes:
             coreai_program.set_static_shape_config(name, static_shapes)
-        constraints = model.export_hardware_constraints(ctx)[graph]
-        if constraints:
-            coreai_program.set_hardware_constraints(name, constraints)
-
-    logger.info("Applying optimization passes...")
-    coreai_program.optimize()
 
     return coreai_program
 
