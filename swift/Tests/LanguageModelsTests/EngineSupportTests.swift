@@ -177,8 +177,7 @@ struct EngineSupportTests {
             files: ["model_ple.safetensors"])
         let bundle = try LanguageBundle(at: url)
 
-        // `language.states` overrides the footprint heuristic in StaticStateFactory.
-        // It reached no engine at all until the tools were wired to pass it.
+        // `language.states` is checked against the footprint in StaticStateFactory.
         #expect(bundle.states?["sliding_key_cache"] == .slidingCache)
     }
 

@@ -38,7 +38,23 @@ public struct SlidingWindowInputHandler: StaticInputHandler {
         ringDepth: Int,
         maskDescriptors: BucketedInputDescriptors,
         stepDescriptors: BucketedInputDescriptors
-    ) {
+    ) throws {
+        guard ringDepth > 0 else {
+            throw InferenceRuntimeError.invalidState(
+                "Graph declares sliding-window inputs but no `sliding_key_cache` state to size the ring")
+        }
+        // Mask is `(1, S, 1, q_len)`. Its ring must be the cache's, and deep enough
+        // that a chunk's in-window keys never collide: `S >= window + q_len - 1`.
+        for descriptor in maskDescriptors.descriptors {
+            let shape = descriptor.shape
+            guard shape.count == 4, shape[1] == ringDepth, ringDepth >= window + shape[3] - 1 else {
+                throw InferenceRuntimeError.invalidState(
+                    "'\(Self.maskInputName)' has shape \(shape) but the sliding cache ring depth is "
+                        + "\(ringDepth) and the window is \(window) — expected (1, \(ringDepth), 1, q_len) "
+                        + "with \(ringDepth) >= window + q_len - 1")
+            }
+        }
+
         self.window = window
         self.ringDepth = ringDepth
         self.maskDescriptors = maskDescriptors
@@ -65,6 +81,7 @@ public struct SlidingWindowInputHandler: StaticInputHandler {
             let tokensInBatch = context.tokens.count
             let alignedStep = context.alignedStep
             let window = self.window
+            let ringDepth = self.ringDepth
             try buffers.withMutableBuffer(Self.maskInputName) { array in
                 // Mask shape is `(1, S, 1, q_len)`: one row per ring slot. Start
                 // fully masked with the fp16-safe `-inf` sentinel, then unmask, for
@@ -76,8 +93,7 @@ public struct SlidingWindowInputHandler: StaticInputHandler {
                 // in the same chunk stay masked.
                 array.mutableView(as: LogitsScalarType.self)
                     .withUnsafeMutablePointer { ptr, shape, strides in
-                        let ringDepth = shape[1]
-                        for slot in 0..<shape[1] {
+                        for slot in 0..<ringDepth {
                             for query in 0..<shape[3] {
                                 let offset = slot &* strides[1] &+ query &* strides[3]
                                 ptr[offset] = causalMaskSentinel
@@ -100,7 +116,7 @@ public struct SlidingWindowInputHandler: StaticInputHandler {
         if !stepDescriptors.isEmpty {
             let descriptor = try stepDescriptors.require(key, input: Self.stepInputName)
             buffers.ensureCapacity(name: Self.stepInputName, descriptor: descriptor)
-            let offset = ringDepth > 0 ? context.alignedStep % ringDepth : context.alignedStep
+            let offset = context.alignedStep % ringDepth
             try buffers.withMutableBuffer(Self.stepInputName) { array in
                 fillNDArray(&array, as: Int32.self, count: 1) { _ in Int32(offset) }
             }

@@ -41,6 +41,9 @@ public struct BucketedInputDescriptors: Sendable {
 
     public var isEmpty: Bool { byKey.isEmpty }
 
+    /// Every bucket's descriptor, in no particular order.
+    public var descriptors: Dictionary<StaticBucketKey, NDArrayDescriptor>.Values { byKey.values }
+
     public func descriptor(for key: StaticBucketKey) -> NDArrayDescriptor? { byKey[key] }
 
     /// Look up the bucket's descriptor, or throw naming what was available.

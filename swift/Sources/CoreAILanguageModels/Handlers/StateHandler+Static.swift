@@ -180,6 +180,7 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
         case interleaveOutsideSequence(state: String, dimension: Int, sequenceDimension: Int)
         case paddedBuffer(state: String, context: Int, expected: Int, actual: Int)
         case unsupportedScalarType(state: String, type: String)
+        case inconsistentAcrossBuckets(state: String, context: Int)
 
         public var description: String {
             switch self {
@@ -201,6 +202,10 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
                     + "bytes of elements) — per-group run copy would land at wrong offsets"
             case .unsupportedScalarType(let state, let type):
                 return "State '\(state)' has unsupported scalar type \(type) for prefix re-layout"
+            case .inconsistentAcrossBuckets(let state, let context):
+                return
+                    "State '\(state)' at ctx \(context) differs in scalar type or interleave from the "
+                    + "smallest bucket — prefix re-layout needs both to match"
             }
         }
     }
@@ -221,6 +226,13 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
                     throw LayoutError.missingDescriptor(state: name, context: context)
                 }
                 try Self.validateLayout(descriptor, state: name, context: context)
+                let reference = descriptorsByContext[smallest]![name]!
+                guard descriptor.scalarType == reference.scalarType,
+                    descriptor.interleaveLayout?.dimension == reference.interleaveLayout?.dimension,
+                    descriptor.interleaveLayout?.factor == reference.interleaveLayout?.factor
+                else {
+                    throw LayoutError.inconsistentAcrossBuckets(state: name, context: context)
+                }
             }
         }
 
@@ -265,14 +277,6 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
                 sequenceDimension: sequenceDimension)
         }
         guard let width = byteWidth(descriptor.scalarType) else {
-            throw LayoutError.unsupportedScalarType(
-                state: state, type: String(describing: descriptor.scalarType))
-        }
-        // copyPrefix reinterprets storage through `LogitsScalarType` while taking
-        // strides from the logical shape, so a bucketed state must share that
-        // element width. fp16/bf16 are both 2 bytes; fp32 would re-lay-out at the
-        // wrong offsets and silently corrupt the carried prefix on a crossing.
-        guard width == MemoryLayout<LogitsScalarType>.stride else {
             throw LayoutError.unsupportedScalarType(
                 state: state, type: String(describing: descriptor.scalarType))
         }
@@ -346,16 +350,18 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
         let sourceGroupStride = sourceSequence * factor
         let destinationGroupStride = destinationSequence * factor
         let runElements = copyLength * factor
+        guard let width = byteWidth(source.scalarType) else {
+            preconditionFailure("copyPrefix: unsupported scalar type \(source.scalarType)")
+        }
 
-        let sourceView = source.view(as: LogitsScalarType.self)
-        sourceView.withUnsafePointer { sourcePointer, _, _ in
-            let destinationView = destination.mutableView(as: LogitsScalarType.self)
-            destinationView.withUnsafeMutablePointer { destinationPointer, _, _ in
+        // Raw byte copy: a typed view traps when the scalar type differs from the
+        // view's (e.g. bf16 through Float16), and the bytes are copied verbatim anyway.
+        source.rawView().withUnsafeBytes { sourceBytes, _, _ in
+            destination.mutableRawView().withUnsafeMutableBytes { destinationBytes, _, _ in
                 for group in 0..<groupCount {
-                    destinationPointer.advanced(by: group * destinationGroupStride)
-                        .update(
-                            from: sourcePointer.advanced(by: group * sourceGroupStride),
-                            count: runElements)
+                    (destinationBytes + group * destinationGroupStride * width).copyMemory(
+                        from: sourceBytes + group * sourceGroupStride * width,
+                        byteCount: runElements * width)
                 }
             }
         }
@@ -448,12 +454,18 @@ public enum StaticStateFactory {
                 continue
             }
 
-            // The asset decides: a state that is one buffer across every bucket
-            // cannot be bucketed, whatever the metadata says.
+            // The asset decides; metadata can only assert what it already says.
             let varies = storageVariesByContext(name: name, descriptorsByContext: descriptorsByContext)
             let isBucketed: Bool
             switch stateKinds?[name] {
             case .slidingCache, .fixed:
+                guard !varies else {
+                    throw InferenceRuntimeError.invalidState(
+                        "State '\(name)' is declared fixed-size in metadata.json but its buffer "
+                            + "differs across context buckets — a single allocation would be indexed "
+                            + "with the wrong strides by the smaller buckets. Drop the entry or "
+                            + "declare it `kv_cache`.")
+                }
                 isBucketed = false
             case .kvCache:
                 guard varies else {

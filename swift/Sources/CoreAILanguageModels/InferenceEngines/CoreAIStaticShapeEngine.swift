@@ -235,7 +235,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let ringDepth = Self.slidingRingDepth(descriptor: referenceDescriptor)
             CLILogger.log("Input handler: sliding window \(window), ring depth \(ringDepth)")
             handlers.append(
-                SlidingWindowInputHandler(
+                try SlidingWindowInputHandler(
                     window: window, ringDepth: ringDepth,
                     maskDescriptors: slidingMask, stepDescriptors: slidingStep))
         }
