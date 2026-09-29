@@ -141,9 +141,6 @@ def _build_ios_model(cfg, hf_sd):
     model.to(DTYPE).eval()
     model._mutate_state_dict(sd)
     model.load_state_dict(sd, assign=True, strict=True)
-    if hasattr(model, "_ple_scale_pending"):
-        model.extend.ple_scale = model._ple_scale_pending
-        model.extend.ple_zp = model._ple_zp_pending
     return model
 
 

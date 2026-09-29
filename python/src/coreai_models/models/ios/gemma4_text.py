@@ -505,8 +505,8 @@ class Gemma4Extend(nn.Module):
         self.embed_scale = config.hidden_size**0.5
         self.emb_zero_point = nn.Parameter(torch.zeros([], dtype=torch.int8), requires_grad=False)
         self.emb_scale = nn.Parameter(torch.ones([], dtype=torch.float16), requires_grad=False)
-        self.ple_scale: torch.Tensor | None = None
-        self.ple_zp: torch.Tensor | None = None
+        self.ple_scale = nn.Parameter(torch.ones([], dtype=torch.float16), requires_grad=False)
+        self.ple_zp = nn.Parameter(torch.zeros([], dtype=torch.int8), requires_grad=False)
         self.prefill_mode = False
 
         # E2B/E4B tie word embeddings: the output projection reuses the embedding table.
@@ -674,6 +674,22 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             "models/gemma4/export.py rather than coreai_models.export.ios."
         )
 
+    @classmethod
+    @override
+    def export_static_shape_configs(cls, config, max_context_length: int) -> dict:
+        raise NotImplementedError(
+            "Gemma 4 builds static shapes per context bucket; export through "
+            "models/gemma4/export.py rather than coreai_models.export.ios."
+        )
+
+    @classmethod
+    @override
+    def export_hardware_constraints(cls, max_context_length: int) -> dict:
+        raise NotImplementedError(
+            "Gemma 4 builds hardware constraints per context bucket; export through "
+            "models/gemma4/export.py rather than coreai_models.export.ios."
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -787,13 +803,6 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         strict = num_layers is None
         model.load_state_dict(text_sd, assign=True, strict=strict)
 
-        # Attach the PLE scale/zp computed in _mutate_state_dict
-        if hasattr(model, "_ple_scale_pending"):
-            model.extend.ple_scale = model._ple_scale_pending
-            model.extend.ple_zp = model._ple_zp_pending
-            del model._ple_scale_pending
-            del model._ple_zp_pending
-
         if mmap_path is not None:
             from coreai_models.models.base import move_model_to_disk
 
@@ -832,11 +841,10 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
                 ple_scale = (
                     torch.clamp(ple_weight.abs().max().float() * ple_embed_scale, min=1e-6) / 127
                 )
-                self._ple_scale_pending = ple_scale.to(torch.float16)
-                self._ple_zp_pending = torch.tensor(0, dtype=torch.int8)
             else:
-                self._ple_scale_pending = torch.tensor(1.0, dtype=torch.float16)
-                self._ple_zp_pending = torch.tensor(0, dtype=torch.int8)
+                ple_scale = torch.tensor(1.0)
+            state_dict["extend.ple_scale"] = ple_scale.to(ple_weight.dtype)
+            state_dict["extend.ple_zp"] = torch.tensor(0, dtype=torch.int8)
 
             # Truncate per_layer_model_projection if needed
             proj_key = "model.per_layer_model_projection.weight"

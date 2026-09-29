@@ -33,10 +33,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-import yaml
 from coreai.authoring import AIProgram
 from coreai.authoring.types import AllocationType, HardwareConstraints
-from coreai_opt.palettization.config.palettization_config import KMeansPalettizerConfig
 from coreai_torch import TorchConverter
 from transformers import AutoConfig, GenerationConfig
 
@@ -66,6 +64,7 @@ from coreai_models.export.mlir_ops import (
     remove_functionalization,
 )
 from coreai_models.export.pipeline import ExportConfig, _generate_output_name
+from coreai_models.llm.export import _load_compression_config_object
 from coreai_models.models.base import BaseForCausalLMForiOS
 from coreai_models.models.ios.gemma4_text import (
     PLE_EMBEDDINGS_INPUT_NAME,
@@ -243,44 +242,6 @@ def _resolve_bundle_paths(
 # ===========================================================================
 
 
-def _load_compression_yaml(yaml_path: Path):  # type: ignore[no-untyped-def]
-    """Load a coreai-opt compression YAML and validate it.
-
-    iOS compresses via k-means palettization, so the YAML's single top-level
-    key must be ``kmeans_palettization_config``. Returned as a prebuilt
-    ``KMeansPalettizerConfig``.
-
-    A YAML for another mechanism is rejected rather than silently ignored.
-    """
-    with yaml_path.open() as fh:
-        data = yaml.safe_load(fh)
-
-    if not isinstance(data, dict):
-        raise SystemExit(f"{yaml_path}: expected a YAML mapping at top level.")
-
-    pipeline_level_options = data.pop("coreai_models", {}) or {}
-    if len(data) != 1:
-        raise SystemExit(
-            f"{yaml_path}: expected exactly one coreai-opt top-level key "
-            f"('kmeans_palettization_config'), got {sorted(data)}."
-        )
-    top_key = next(iter(data))
-    inner = data[top_key]
-
-    if top_key == "kmeans_palettization_config":
-        if pipeline_level_options:
-            raise SystemExit(
-                f"{yaml_path}: palettization recipes do not support the "
-                "'coreai_models' block."
-            )
-        return KMeansPalettizerConfig.from_dict({top_key: inner})
-
-    raise SystemExit(
-        f"{yaml_path}: unknown top-level key '{top_key}'. "
-        "Expected 'kmeans_palettization_config'."
-    )
-
-
 # ===========================================================================
 # iOS: per-context blocked ladder of statically-shaped programs
 # ===========================================================================
@@ -403,12 +364,6 @@ def context_ladder(
     return buckets
 
 
-def _head_dim(config) -> int:
-    if hasattr(config, "head_dim") and isinstance(config.head_dim, int):
-        return config.head_dim
-    return config.hidden_size // config.num_attention_heads
-
-
 def _ple_total_dim(config) -> int:
     """Width of one token's externalized Per-Layer Embeddings row.
 
@@ -497,7 +452,7 @@ def _build_ios_reference_inputs(
     in_step = torch.zeros((1,), dtype=torch.int32)
     sliding_in_step = torch.zeros((1,), dtype=torch.int32)
 
-    head_dim = _head_dim(config)
+    head_dim = config.head_dim
     global_head_dim = config.global_head_dim
     n_kv = config.num_key_value_heads
     n_global_storing = model.extend.model.n_global_storing
@@ -773,7 +728,7 @@ async def _export_blocked_ladder(
     dev: DevOverrides = DevOverrides(),
 ) -> AIProgram:
     """Export the Gemma4 model as a per-context blocked-flash ladder AIProgram."""
-    head_dim = _head_dim(config)
+    head_dim = config.head_dim
     global_head_dim = config.global_head_dim
     n_kv = config.num_key_value_heads
 
@@ -837,7 +792,7 @@ def _build_palettization_inputs(
     q = _CALIB_QUERY_LEN
     vocab_size = config.vocab_size
 
-    head_dim = _head_dim(config)
+    head_dim = config.head_dim
     global_head_dim = config.global_head_dim
     n_kv = config.num_key_value_heads
     n_global_storing = model.extend.model.n_global_storing
@@ -893,7 +848,9 @@ async def _export_ios(args: argparse.Namespace) -> str:
     # unset. Resolved before any weights are loaded so a bad recipe fails fast.
     palettization_config = None
     if args.compression_config is not None:
-        palettization_config = _load_compression_yaml(args.compression_config)
+        palettization_config = _load_compression_config_object(
+            args.compression_config, "iOS"
+        )
         compression = args.compression_config.stem
     else:
         compression = "none"
@@ -1093,13 +1050,20 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
             "at that bucket."
         )
 
+    # The sliding ring and every context bucket are multiples of MAX_QUERY_LEN, so a
+    # query length that divides it never wraps or straddles a cache write.
+    for flag, qlens in (
+        ("--dev-extend-qlens", args.dev_extend_qlens),
+        ("--dev-prompt-qlens", args.dev_prompt_qlens),
+    ):
+        invalid = [q for q in qlens or () if MAX_QUERY_LEN % q]
+        if invalid:
+            raise SystemExit(
+                f"{flag}: query lengths must divide {MAX_QUERY_LEN}, got {invalid}"
+            )
+
     if args.compression is None and args.compression_config is None:
         args.compression_config = DEFAULT_IOS_COMPRESSION_CONFIG
-
-    if args.compression_config is not None and not args.compression_config.is_file():
-        raise SystemExit(
-            f"--compression-config: file not found: {args.compression_config}"
-        )
 
 
 def main() -> None:
