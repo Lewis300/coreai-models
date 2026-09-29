@@ -249,10 +249,17 @@ def test_kv_layout_dead_slot_compaction():
     assert layout[5] == (False, True, 0)
 
 
-def test_sliding_parity_with_ring_wrap():
-    """Chunked prefill over a prompt longer than both W and S matches HF."""
+@pytest.mark.parametrize(
+    "kv_block_size",
+    [None, 8, 12],
+    ids=["one global block", "4 global blocks", "3 ragged global blocks"],
+)
+def test_sliding_parity_with_ring_wrap(kv_block_size):
+    """Chunked prefill over a prompt longer than both W and S matches HF, with the
+    global attention's flash loop running over one or several blocks."""
     torch.manual_seed(0)
     cfg = _make_config()
+    cfg.kv_block_size = kv_block_size
     hf = Gemma4ForCausalLM(cfg).to(DTYPE).eval()
     ios = _build_ios_model(cfg, dict(hf.state_dict()))
 
