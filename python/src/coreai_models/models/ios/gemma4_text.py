@@ -507,14 +507,11 @@ class Gemma4Extend(nn.Module):
         self.emb_scale = nn.Parameter(torch.ones([], dtype=torch.float16), requires_grad=False)
         self.ple_scale: torch.Tensor | None = None
         self.ple_zp: torch.Tensor | None = None
-        self.tie_word_embeddings = config.tie_word_embeddings
         self.prefill_mode = False
 
-        # Tied embeddings reuse the embedding table for the projection, so there is no
-        # separate `lm_head` module to hold.
-        self.lm_head: nn.Linear | None = None
+        # E2B/E4B tie word embeddings: the output projection reuses the embedding table.
         if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            raise NotImplementedError("Gemma 4 iOS supports tied word embeddings only")
 
         # Two compacted KV caches, both FLAT (single dynamic write offset, so each
         # attention region has ≤1 dynamic-offset slice):
@@ -584,17 +581,8 @@ class Gemma4Extend(nn.Module):
                 + self.global_cache.v_cache[:1, :1, :1, :1, :1]
             )
 
-        if self.lm_head is not None:
-            return self.lm_head(out.transpose(-2, -3))
-
-        # Tied embeddings: the projection reuses the embedding table, so the caller must
-        # supply it. `embedding_table` is optional in the signature only because the
-        # untied path above ignores it.
         if embedding_table is None:
-            raise ValueError(
-                "embedding_table is required when the model ties word embeddings "
-                "(no lm_head to project with)."
-            )
+            raise ValueError("embedding_table is required for the tied output projection")
 
         table = embedding_table
         if table.dtype == torch.int8:
@@ -769,9 +757,6 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             if k.startswith(prefix):
                 text_sd["model." + k[len(prefix) :]] = v
 
-        if "lm_head.weight" not in text_sd and "model.embed_tokens.weight" in text_sd:
-            text_sd["lm_head.weight"] = text_sd["model.embed_tokens.weight"]
-
         del hf_model, full_sd
 
         if num_layers is not None:
@@ -840,12 +825,15 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             # the PLE path stays fp (the runner then supplies fp ``ple_embeddings``
             # with the ``sqrt(ple_dim)`` embed scale folded in externally).
             if not self.disable_embedding_quantization:
+                # The scale quantize_per_tensor derives in dump_ple_embedding, without
+                # quantizing the multi-GB table twice: scaling by a positive constant
+                # commutes with max|x|.
                 ple_embed_scale = config.hidden_size_per_layer_input**0.5
-                _, ple_scale, ple_zp = quantize_per_tensor(
-                    (ple_weight.float() * ple_embed_scale), nbits=8, symmetric=True
+                ple_scale = (
+                    torch.clamp(ple_weight.abs().max().float() * ple_embed_scale, min=1e-6) / 127
                 )
                 self._ple_scale_pending = ple_scale.to(torch.float16)
-                self._ple_zp_pending = ple_zp
+                self._ple_zp_pending = torch.tensor(0, dtype=torch.int8)
             else:
                 self._ple_scale_pending = torch.tensor(1.0, dtype=torch.float16)
                 self._ple_zp_pending = torch.tensor(0, dtype=torch.int8)
@@ -922,9 +910,6 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         state_dict["extend.emb_zero_point"] = zero_point
         state_dict.pop("model.embed_tokens.weight")
 
-        # Handle lm_head
-        if not config.tie_word_embeddings:
-            state_dict["extend.lm_head.weight"] = state_dict["lm_head.weight"]
         state_dict.pop("lm_head.weight", None)
 
     def dump_ple_embedding(self, output_path: str, model_name: str) -> str:

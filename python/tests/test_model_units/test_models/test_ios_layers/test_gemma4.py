@@ -396,7 +396,7 @@ def test_e2b_full_parity_hf_vs_torch():
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4ForConditionalGeneration,
         )
-    except Exception as exc:  # pragma: no cover
+    except ImportError as exc:  # pragma: no cover
         pytest.skip(f"transformers gemma4 symbols unavailable: {exc}")
 
     dtype = torch.float32  # tightest parity; the shipped path is fp16 + palettized
@@ -414,7 +414,7 @@ def test_e2b_full_parity_hf_vs_torch():
             target_dtype=dtype,
             disable_embedding_quantization=True,  # fp embeddings -> clean HF parity
         ).eval()
-    except Exception as exc:  # pragma: no cover - gated/download failures
+    except OSError as exc:  # pragma: no cover - gated/download failures
         pytest.skip(f"could not load E2B weights: {exc}")
 
     cfg = model.config
