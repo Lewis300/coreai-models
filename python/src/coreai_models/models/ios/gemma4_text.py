@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 from coreai.authoring.types import AllocationType, HardwareConstraints
 from safetensors.torch import save_file
+from transformers import Gemma4ForConditionalGeneration
 from typing_extensions import override
 
 from coreai_models._constants import (
@@ -509,7 +510,7 @@ class Gemma4Extend(nn.Module):
         self.emb_zero_point = nn.Parameter(torch.zeros([], dtype=torch.int8), requires_grad=False)
         self.emb_scale = nn.Parameter(torch.ones([], dtype=torch.float16), requires_grad=False)
         self.ple_scale = nn.Parameter(torch.ones([], dtype=torch.float16), requires_grad=False)
-        self.ple_zp = nn.Parameter(torch.zeros([], dtype=torch.int8), requires_grad=False)
+        self.ple_zero_point = nn.Parameter(torch.zeros([], dtype=torch.int8), requires_grad=False)
         self.prefill_mode = False
 
         # E2B/E4B tie word embeddings: the output projection reuses the embedding table.
@@ -556,7 +557,7 @@ class Gemma4Extend(nn.Module):
         # Dequantize PLE if INT8
         if ple_embeddings is not None and ple_embeddings.dtype == torch.int8:
             ple_embeddings = dequantize_per_tensor(
-                ple_embeddings, self.ple_scale, self.ple_zp, transformer_input.dtype
+                ple_embeddings, self.ple_scale, self.ple_zero_point, transformer_input.dtype
             )
 
         out = self.model(
@@ -599,6 +600,8 @@ class Gemma4Extend(nn.Module):
 
 class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     """Gemma4 iOS text-only CausalLM (extracted from multimodal HF model)."""
+
+    _HF_MODEL_CLASS = Gemma4ForConditionalGeneration
 
     #: Sliding-attention window of the supported checkpoints (E2B, E4B).
     SLIDING_WINDOW = 512
@@ -837,73 +840,19 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
 
         return text_config
 
-    @classmethod
-    def from_hf(
-        cls,
-        huggingface_model_id: str,
-        max_context_length: int | None = None,
-        target_dtype: torch.dtype = torch.float16,
-        mmap_path: str | None = None,
-        num_layers: int | None = None,
-        disable_embedding_quantization: bool = False,
-    ) -> "Gemma4ForCausalLMForiOS":
-        """Load from HF multimodal model, extracting text decoder only."""
-        from transformers import Gemma4ForConditionalGeneration
-
-        hf_model = Gemma4ForConditionalGeneration.from_pretrained(
-            huggingface_model_id, torch_dtype=target_dtype
-        )
-
-        config = cls._get_reauthored_config(
-            hf_model.config, max_context_length, num_layers=num_layers
-        )
-
-        full_sd = hf_model.state_dict()
-        prefix = "model.language_model."
-        text_sd: dict[str, torch.Tensor] = {}
-        for k, v in full_sd.items():
-            if k.startswith(prefix):
-                text_sd["model." + k[len(prefix) :]] = v
-
-        del hf_model, full_sd
-
-        if num_layers is not None:
-            from coreai_models.models.base import _is_layer_key_beyond
-
-            text_sd = {k: v for k, v in text_sd.items() if not _is_layer_key_beyond(k, num_layers)}
-
-        model = cls(
-            config,
-            model_device="meta",
-            disable_embedding_quantization=disable_embedding_quantization,
-        )
-        model.to(dtype=target_dtype)
-
-        model._mutate_state_dict(text_sd)
-
-        for k, v in text_sd.items():
-            if (
-                v.dtype != target_dtype
-                and v.is_floating_point()
-                and "embedding_table" not in k
-                and "zero_point" not in k
-            ):
-                raise ValueError(
-                    f"tensor {k} in incorrect dtype {v.dtype}. Expected {target_dtype}."
-                )
-
-        strict = num_layers is None
-        model.load_state_dict(text_sd, assign=True, strict=strict)
-
-        if mmap_path is not None:
-            from coreai_models.models.base import move_model_to_disk
-
-            move_model_to_disk(model, path=mmap_path)
-
-        return model
-
     def _mutate_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         """Transform HF state dict for iOS Gemma4 model."""
+        # The checkpoint is multimodal; keep only the text decoder, as `model.*`.
+        prefix = "model.language_model."
+        if any(k.startswith(prefix) for k in state_dict):
+            text = {
+                "model." + k[len(prefix) :]: v
+                for k, v in state_dict.items()
+                if k.startswith(prefix)
+            }
+            state_dict.clear()
+            state_dict.update(text)
+
         config = self.config
         num_layers = config.num_hidden_layers
         first_kv_shared_idx = num_layers - config.num_kv_shared_layers
@@ -936,7 +885,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
             else:
                 ple_scale = torch.tensor(1.0)
             state_dict["extend.ple_scale"] = ple_scale.to(ple_weight.dtype)
-            state_dict["extend.ple_zp"] = torch.tensor(0, dtype=torch.int8)
+            state_dict["extend.ple_zero_point"] = torch.tensor(0, dtype=torch.int8)
 
             # Truncate per_layer_model_projection if needed
             proj_key = "model.per_layer_model_projection.weight"
