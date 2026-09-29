@@ -8,38 +8,17 @@
 """Standalone export recipe for the Gemma 4 PLE variants (E2B / E4B), iOS.
 
 The Per-Layer-Embeddings variants don't fit the generic ``coreai.llm.export``
-pipeline, so they ship as a standalone recipe. This recipe is the only iOS path
-for Gemma 4 -- see ``models/gemma4/README.md``.
-
-Runs in the workspace environment; no dependency overlay is needed, since the
-workspace pins ``transformers>=5.5,<6.0`` which carries ``transformers.models.gemma4``:
+pipeline, so they ship as a standalone recipe (see ``models/gemma4/README.md``):
 
     cd models/gemma4
     uv run export.py --model google/gemma-4-E2B-it --max-context-length 32768
 
-The export is a per-context blocked ladder of *statically*-shaped programs:
-
-* Every context bucket is its own pair of entrypoints (``extend_{ctx}`` /
-  ``prompt_opt_{ctx}``), each further specialized by query length, because the
-  flash block loop is unrolled into the graph.
-* A flat global KV cache (one dynamic write offset) paired with a fixed-depth
-  sliding-window ring, plus the shared ``load_embeddings`` /
-  ``gather_embeddings`` helper functions.
-* RoPE arrives precomputed as ``rope_cos``/``rope_sin`` inputs instead of
-  ``position_ids`` (a 131k position overflows a 16-bit input).
-* An externalized INT8 Per-Layer Embeddings (PLE) sidecar written next to the
-  asset, plus per-function hardware constraints and static shape configs.
-* Compression is k-means palettization, driven by a coreai-opt YAML
-  (``gemma4_4bit_palettized.yaml``). ``--compression`` selects a named
-  palettization preset instead.
-
-The recipe reuses the shared building blocks (``TorchConverter``, the
-compression helpers, ``bundle_llm_asset``) so the resulting bundle layout
-matches every other LLM export.
-
-Developer overrides (comma-separated flags): ``--dev-extend-qlens`` /
-``--dev-prompt-qlens`` (per-function query-length ladder), ``--dev-ladder-only``
-(restrict to specific context buckets). See ``DevOverrides``.
+The export is a per-context ladder of statically-shaped programs. Each context
+bucket gets its own ``extend_{ctx}`` / ``prompt_opt_{ctx}`` entrypoints, further
+specialized by query length, because the flash block loop is unrolled into the
+graph. A flat global KV cache pairs with a fixed-depth sliding-window ring, RoPE
+arrives precomputed as ``rope_cos``/``rope_sin``, and the INT8 Per-Layer
+Embeddings table is written as a sidecar next to the asset.
 """
 
 import argparse
@@ -48,7 +27,6 @@ import json
 import logging
 import os
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass
@@ -91,7 +69,7 @@ from coreai_models.export.pipeline import ExportConfig, _generate_output_name
 from coreai_models.models.base import BaseForCausalLMForiOS
 from coreai_models.models.ios.gemma4_text import (
     PLE_EMBEDDINGS_INPUT_NAME,
-    QUERY_LENGTHS,
+    MAX_QUERY_LEN,
     ROPE_COS_INPUT_NAME,
     ROPE_SIN_INPUT_NAME,
     SLIDING_CAUSAL_MASK_INPUT_NAME,
@@ -104,8 +82,6 @@ from coreai_models.models.ios.gemma4_text import (
     sliding_ring_size,
 )
 
-# The iOS KV-cache interleave factor moved onto the iOS base class when the export
-# contract was introduced; the Gemma4 ladder still constrains its caches by hand.
 KV_CACHE_INTERLEAVE_FACTOR = BaseForCausalLMForiOS.KV_CACHE_INTERLEAVE_FACTOR
 
 logger = logging.getLogger("gemma4.export")
@@ -123,12 +99,6 @@ SUPPORTED_MODELS = (
     "google/gemma-4-E2B-it",
     "google/gemma-4-E4B-it",
 )
-
-PRECISIONS = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-}
 
 # Gemma 4 checkpoints are multimodal: the text decoder is nested under
 # `text_config`.
@@ -315,12 +285,6 @@ def _load_compression_yaml(yaml_path: Path):  # type: ignore[no-untyped-def]
 # iOS: per-context blocked ladder of statically-shaped programs
 # ===========================================================================
 
-# Flash chunk width for the blocked global attention (not a cache dimension). The
-# global cache stays FLAT (one dynamic write offset) and BlockedSDPA walks it in
-# block_size chunks so each score op's key axis stays within the accelerator's
-# per-dimension size limit.
-DEFAULT_KV_BLOCK_SIZE = 8192
-
 # Shipping per-function-type query lengths. Decode (``extend``) only needs q=8 (a
 # single new token); prefill (``prompt_opt``) runs at q=64, and the runner routes a
 # <=64-token initial prompt/tail through ``prompt_opt`` too, so an ``extend`` q=64
@@ -416,7 +380,7 @@ def _prompt_query_lengths(dev: DevOverrides = DevOverrides()) -> list[int]:
 
 
 def context_ladder(
-    max_context_length: int, block_size: int, dev: DevOverrides = DevOverrides()
+    max_context_length: int, dev: DevOverrides = DevOverrides()
 ) -> list[int]:
     """Context-length buckets for the flat-cache flash ladder: the sparse
     :data:`SHIPPING_CONTEXT_LADDER` entries that fit under the smallest power of two
@@ -516,7 +480,7 @@ def _export_aux_programs(
 
 
 def _build_ios_reference_inputs(
-    model: torch.nn.Module, config, max_context_length: int, vocab_size: int, ctx: int
+    model: torch.nn.Module, config, max_context_length: int, ctx: int
 ) -> dict:
     """Build reference input tensors for one context bucket of the Gemma4 ladder.
 
@@ -527,7 +491,9 @@ def _build_ios_reference_inputs(
     batch_size = 1
     query_len = 8
 
-    input_ids = torch.randint(1, vocab_size, (batch_size, query_len), dtype=torch.int32)
+    input_ids = torch.randint(
+        1, config.vocab_size, (batch_size, query_len), dtype=torch.int32
+    )
     in_step = torch.zeros((1,), dtype=torch.int32)
     sliding_in_step = torch.zeros((1,), dtype=torch.int32)
 
@@ -536,7 +502,7 @@ def _build_ios_reference_inputs(
     n_kv = config.num_key_value_heads
     n_global_storing = model.extend.model.n_global_storing
     n_sliding_storing = model.extend.model.n_sliding_storing
-    sliding_ring = sliding_ring_size(config.sliding_window, max(QUERY_LENGTHS))
+    sliding_ring = sliding_ring_size(config.sliding_window, MAX_QUERY_LEN)
 
     key_cache = torch.zeros(
         n_global_storing, 1, n_kv * global_head_dim, 1, ctx, dtype=torch.float16
@@ -803,7 +769,6 @@ async def _export_blocked_ladder(
     model: torch.nn.Module,
     config,
     max_context_length: int,
-    vocab_size: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
     dev: DevOverrides = DevOverrides(),
 ) -> AIProgram:
@@ -812,8 +777,8 @@ async def _export_blocked_ladder(
     global_head_dim = config.global_head_dim
     n_kv = config.num_key_value_heads
 
-    block_size = getattr(model.extend.model, "kv_block_size", DEFAULT_KV_BLOCK_SIZE)
-    buckets = context_ladder(max_context_length, block_size, dev)
+    block_size = model.extend.model.kv_block_size
+    buckets = context_ladder(max_context_length, dev)
     logger.info(
         f"iOS flat-cache context ladder: block_size={block_size} contexts={buckets}"
     )
@@ -827,9 +792,7 @@ async def _export_blocked_ladder(
             f"Exporting context bucket: ctx={ctx} "
             f"(flash chunks={(ctx + block_size - 1) // block_size})..."
         )
-        inputs = _build_ios_reference_inputs(
-            model, config, max_context_length, vocab_size, ctx
-        )
+        inputs = _build_ios_reference_inputs(model, config, max_context_length, ctx)
         extend_program, prompt_program = _export_forward_pair(
             model,
             inputs["forward_inputs"],
@@ -851,7 +814,7 @@ async def _export_blocked_ladder(
         kv_cached_embed_size=n_kv * global_head_dim,
         hidden_size=config.hidden_size,
         ple_total_dim=_ple_total_dim(config),
-        sliding_ring=sliding_ring_size(config.sliding_window, max(QUERY_LENGTHS)),
+        sliding_ring=sliding_ring_size(config.sliding_window, MAX_QUERY_LEN),
         n_sliding_storing=model.extend.model.n_sliding_storing,
         sliding_channels=n_kv * head_dim,
         n_global_storing=model.extend.model.n_global_storing,
@@ -879,7 +842,7 @@ def _build_palettization_inputs(
     n_kv = config.num_key_value_heads
     n_global_storing = model.extend.model.n_global_storing
     n_sliding_storing = model.extend.model.n_sliding_storing
-    sliding_ring = sliding_ring_size(config.sliding_window, max(QUERY_LENGTHS))
+    sliding_ring = sliding_ring_size(config.sliding_window, MAX_QUERY_LEN)
     ctx = min(MIN_CONTEXT_LENGTH, max_context_length)
 
     input_ids = torch.randint(1, vocab_size, (batch_size, q), dtype=torch.int32)
@@ -920,7 +883,7 @@ def _build_palettization_inputs(
 
 async def _export_ios(args: argparse.Namespace) -> str:
     hf_model_id: str = args.model
-    target_dtype = PRECISIONS[args.compute_precision]
+    target_dtype = torch.float16
     max_ctx = args.max_context_length or IOS_MAX_CONTEXT_LENGTH
     dev = DevOverrides.from_args(args)
     dev.log_if_set()
@@ -958,10 +921,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
     with tempfile.TemporaryDirectory(prefix="gemma4_export_") as temp_dir:
         hf_config = _text_config(hf_model_id)
 
-        # Same guard the macOS path applies: the ladder cap is checked in
-        # `_resolve_platform_defaults` (it is a static property of the shipping
-        # ladder), but the model's own window is only known once its config is
-        # loaded.
+        # The model's own window is only known once its config is loaded.
         native_max_ctx = getattr(hf_config, "max_position_embeddings", None)
         if native_max_ctx is not None and max_ctx > native_max_ctx:
             raise SystemExit(
@@ -978,12 +938,6 @@ async def _export_ios(args: argparse.Namespace) -> str:
         ).eval()
         hf_config.max_position_embeddings = max_ctx
 
-        if not (hasattr(model, "extend") and hasattr(model.extend, "sliding_cache")):
-            raise SystemExit(
-                f"'{hf_model_id}' is not a Gemma4 sliding-cache model — use "
-                "`coreai.llm.export` for other models."
-            )
-
         # ---- Palettization (skipped for --compression none) ----
         if palettization_config is not None:
             logger.info(f"Applying palettization ({compression})...")
@@ -995,7 +949,6 @@ async def _export_ios(args: argparse.Namespace) -> str:
             model,
             hf_config,
             max_ctx,
-            hf_config.vocab_size,
             include_debug_info=args.include_debug_info,
             dev=dev,
         )
@@ -1046,13 +999,6 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="HuggingFace model ID. Verified on: " + ", ".join(SUPPORTED_MODELS),
     )
-    parser.add_argument(
-        "--platform",
-        choices=["iOS"],
-        default="iOS",
-        help="Target platform. iOS only on this branch; the flag is kept so "
-        "invocations that name the platform explicitly keep working.",
-    )
     compression_group = parser.add_mutually_exclusive_group()
     compression_group.add_argument(
         "--compression-config",
@@ -1069,12 +1015,6 @@ def build_parser() -> argparse.ArgumentParser:
         "presets are not used for Gemma 4: the shipped YAML recipes are "
         "mixed-precision, which the presets cannot express. Pass "
         "--compression-config <yaml> for a custom recipe.",
-    )
-    parser.add_argument(
-        "--compute-precision",
-        choices=sorted(PRECISIONS),
-        default=None,
-        help="Compute precision for the model weights (iOS requires float16)",
     )
     parser.add_argument(
         "--max-context-length",
@@ -1135,7 +1075,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_platform_defaults(args: argparse.Namespace) -> None:
+def _resolve_defaults(args: argparse.Namespace) -> None:
     """Fill in the defaults and reject invalid combinations.
 
     Compression defaults to the ``kmeans_palettization_config`` YAML shipped
@@ -1143,20 +1083,12 @@ def _resolve_platform_defaults(args: argparse.Namespace) -> None:
     recipe. ``--compression`` only accepts ``none``, which skips compression
     entirely.
     """
-    if args.compute_precision is None:
-        args.compute_precision = "float16"
-
-    if args.compute_precision != "float16":
-        raise SystemExit(
-            f"--platform iOS requires --compute-precision float16 "
-            f"(got '{args.compute_precision}')."
-        )
     if (
         args.max_context_length is not None
         and args.max_context_length > IOS_MAX_CONTEXT_LENGTH
     ):
         raise SystemExit(
-            f"--platform iOS supports at most {IOS_MAX_CONTEXT_LENGTH} tokens "
+            f"--max-context-length supports at most {IOS_MAX_CONTEXT_LENGTH} tokens "
             f"(got {args.max_context_length}); the static-shape ladder tops out "
             "at that bucket."
         )
@@ -1177,7 +1109,7 @@ def main() -> None:
         format="%(levelname)s: %(message)s",
     )
 
-    _resolve_platform_defaults(args)
+    _resolve_defaults(args)
 
     if args.model not in SUPPORTED_MODELS:
         logger.warning(
@@ -1190,6 +1122,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 11):
-        raise SystemExit("Gemma 4 export requires Python 3.11+")
     main()

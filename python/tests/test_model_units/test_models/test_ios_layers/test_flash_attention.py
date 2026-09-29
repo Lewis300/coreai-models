@@ -23,8 +23,6 @@ pinned from two directions:
     the cross-block rescale and the fp16 overflow guards (the ``inv_block`` weight
     scaling, the -40000 pseudo -inf) against an out-of-repo implementation rather
     than against another primitive in this package.
-
-Converted from ``python/scripts/flash_attention_parity.py``.
 """
 
 import pytest

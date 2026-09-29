@@ -203,7 +203,7 @@ class BlockedSDPA(nn.Module):
         # the direct p@v is a faster kernel at/below it, so keep it there.
         hoist_safe = ctx > 65536
         # Slice K/V/mask into <=65536-wide super-chunks so the transpose the compiler hoists
-        # for the scores matmul stays within the per-dim limit (see class docstring).
+        # for the scores matmul stays within the per-dim limit.
         xpose_span = max(block_size, (65536 // block_size) * block_size)
 
         # Pre-permute each Q head to (1, 1, q_len, head_dim) once (block-independent).
@@ -214,7 +214,7 @@ class BlockedSDPA(nn.Module):
             c0 = head_dim * kv_idx  # this KV head's K/V channel base
             group = range(kv_idx * kv_group_size, (kv_idx + 1) * kv_group_size)
             # Fold the group's Q heads onto one matmul's row axis so the K/V block streams
-            # through the matmul unit once for all of them (see class docstring).
+            # through the matmul unit once for all of them.
             q_stack = torch.cat([qp[h] for h in group], dim=2)  # (1, 1, G·q_len, head_dim)
             rows = q_stack.shape[2]
             # -40000 is the fp16-safe -inf; den is the block-scaled denominator, o the output.

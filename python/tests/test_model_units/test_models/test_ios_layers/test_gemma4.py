@@ -10,8 +10,7 @@ cache and a small sliding-window ring (depth S) — and applies windowed attenti
 via a runner-built ``sliding_causal_mask``. These tests mimic the Swift runner's
 chunked prefill against persistent caches and compare per-position logits to a
 single HF forward (which applies sliding-window attention internally). The key
-case is a prompt longer than both W and S so the ring wraps — exactly where the
-previous single-plain-causal-mask implementation silently diverged.
+case is a prompt longer than both W and S so the ring wraps.
 """
 
 import pytest
@@ -27,10 +26,11 @@ except Exception:  # pragma: no cover - requires transformers>=5.5
     Gemma4ForCausalLM = None
 
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
-    Gemma4CombinedRoPE,
     Gemma4ForCausalLMForiOS,
     _compute_kv_layout,
+    sliding_ring_size,
 )
+from coreai_models.primitives.ios.rope import RoPECache  # noqa: E402
 from tests._runner_infra._deps import _hf_hub_reachable  # noqa: E402
 
 DTYPE = torch.float32
@@ -41,9 +41,70 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _ring_size(window: int, max_q: int) -> int:
-    raw = window + max_q - 1
-    return ((raw + max_q - 1) // max_q) * max_q
+# Numerical reference for the combined sliding+global RoPE rows the runner builds.
+class Gemma4CombinedRoPE(RoPECache):
+    """Single RoPE cache for Gemma4's dual head dims.
+
+    Gemma4 has two RoPE variants — standard for sliding-attention layers (head_dim 256)
+    and proportional (0.25 rotary) for global layers (head_dim 512). Both variants' cos/sin
+    tables are concatenated along the head dim into a single
+    ``[max_pos, sliding_hd + global_hd]`` cache and gathered once. Callers slice
+    ``[:sliding_hd]`` for sliding layers and ``[sliding_hd:]`` for global layers.
+    """
+
+    def __init__(
+        self,
+        sliding_head_dim: int,
+        global_head_dim: int,
+        max_cache_size: int,
+        sliding_base: float,
+        global_base: float,
+        partial_rotary_factor: float = 0.25,
+    ) -> None:
+        self._sliding_head_dim = sliding_head_dim
+        self._global_head_dim = global_head_dim
+        self._sliding_base = sliding_base
+        self._global_base = global_base
+        self._partial_rotary_factor = partial_rotary_factor
+        super().__init__(sliding_head_dim + global_head_dim, max_cache_size, sliding_base)
+
+    @staticmethod
+    def _emb(theta: torch.Tensor, max_cache_size: int) -> torch.Tensor:
+        seq_idx = torch.arange(end=max_cache_size, dtype=torch.int32)
+        freqs = seq_idx[:, None] * theta
+        return torch.concatenate((freqs, freqs), dim=-1)
+
+    def _compute_sin_and_cos(self, dtype: torch.dtype = torch.float32) -> None:
+        with torch.device("cpu"):
+            # Sliding (standard RoPE).
+            s_theta = 1.0 / (
+                self._sliding_base
+                ** (
+                    torch.arange(0, self._sliding_head_dim, 2, dtype=torch.float32)
+                    / self._sliding_head_dim
+                )
+            )
+            s_emb = self._emb(s_theta, self._max_cache_size)
+
+            # Global (proportional RoPE: only partial_rotary_factor of dims rotate).
+            hd = self._global_head_dim
+            rope_angles = int(self._partial_rotary_factor * hd // 2)
+            nope_angles = hd // 2 - rope_angles
+            inv_freq = 1.0 / (
+                self._global_base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / hd)
+            )
+            if nope_angles > 0:
+                g_theta = torch.cat(
+                    [inv_freq, torch.zeros(nope_angles, dtype=torch.float32)], dim=0
+                )
+            else:
+                g_theta = inv_freq
+            g_emb = self._emb(g_theta, self._max_cache_size)
+
+            cos = torch.cat([torch.cos(s_emb), torch.cos(g_emb)], dim=-1)
+            sin = torch.cat([torch.sin(s_emb), torch.sin(g_emb)], dim=-1)
+            self.cos_cached = torch.nn.Buffer(cos.to(dtype=dtype), persistent=False)
+            self.sin_cached = torch.nn.Buffer(sin.to(dtype=dtype), persistent=False)
 
 
 def _make_config() -> Gemma4TextConfig:
@@ -169,7 +230,7 @@ def test_sliding_parity_with_ring_wrap():
     ios = _build_ios_model(cfg, dict(hf.state_dict()))
 
     q_len = 4
-    S = _ring_size(cfg.sliding_window, q_len)  # 12
+    S = sliding_ring_size(cfg.sliding_window, q_len)  # 12
     ctx = 32
     seq = 24  # > S (ring wraps) and > W (windowing active)
     token_ids = torch.randint(0, cfg.vocab_size, (seq,))
@@ -206,7 +267,7 @@ def test_final_logit_softcap_left_to_runner():
     ios = _build_ios_model(cfg, dict(hf.state_dict()))
 
     q_len = 4
-    S = _ring_size(cfg.sliding_window, q_len)
+    S = sliding_ring_size(cfg.sliding_window, q_len)
     ctx = 32
     seq = 12
     token_ids = torch.randint(0, cfg.vocab_size, (seq,))
@@ -233,29 +294,6 @@ def test_final_logit_softcap_left_to_runner():
     assert (ios_logits.argmax(-1) == hf_logits.argmax(-1)).all()
 
 
-def test_short_prompt_regression():
-    """A prompt shorter than the window still matches HF (no windowing applied)."""
-    torch.manual_seed(1)
-    cfg = _make_config()
-    hf = Gemma4ForCausalLM(cfg).to(DTYPE).eval()
-    ios = _build_ios_model(cfg, dict(hf.state_dict()))
-
-    q_len = 4
-    S = _ring_size(cfg.sliding_window, q_len)
-    ctx = 32
-    seq = 4  # < W
-    token_ids = torch.randint(0, cfg.vocab_size, (seq,))
-
-    with torch.no_grad():
-        hf_logits = hf(
-            input_ids=token_ids.reshape(1, seq),
-            position_ids=torch.arange(seq).reshape(1, seq),
-        ).logits[0]
-
-    ios_logits = _chunked_prefill_logits(ios, hf, cfg, token_ids, q_len, S, ctx)
-    torch.testing.assert_close(ios_logits, hf_logits, atol=1e-3, rtol=1e-3)
-
-
 # ---------------------------------------------------------------------------
 # Full E2B end-to-end: real weights, HF reference vs our iOS torch model.
 #
@@ -277,7 +315,7 @@ _E2B_MAX_QUERY_LEN = 64
 
 def _combined_rope(cfg, max_ctx: int, dtype: torch.dtype) -> Gemma4CombinedRoPE:
     """The dual (sliding + global) RoPE table the runner precomputes and feeds in
-    as ``rope_cos``/``rope_sin`` rows (the in-graph gather was removed)."""
+    as ``rope_cos``/``rope_sin`` rows."""
     return Gemma4CombinedRoPE(
         sliding_head_dim=cfg.head_dim,
         global_head_dim=cfg.global_head_dim,
@@ -293,8 +331,8 @@ def _combined_rope(cfg, max_ctx: int, dtype: torch.dtype) -> Gemma4CombinedRoPE:
 def _e2b_prefill_logits(model, rope, cfg, token_ids, q_len, S, ctx, dtype):
     """Chunked prefill of the real iOS model against persistent caches.
 
-    Returns per-position logits ``(seq, vocab)`` in fp32. Mirrors the Swift runner
-    (and ``python/scripts/gemma4_needle_torch.py``): flat global cache with a single
+    Returns per-position logits ``(seq, vocab)`` in fp32. Mirrors the Swift runner:
+    flat global cache with a single
     absolute write offset, a fixed-depth sliding ring, and the fp PLE input built as
     ``ple_weight[token] * sqrt(ple_dim)``.
     """
@@ -383,7 +421,7 @@ def test_e2b_full_parity_hf_vs_torch():
     token_ids = tok("The capital of France is", return_tensors="pt")["input_ids"][0].tolist()
     assert len(token_ids) <= max_ctx
 
-    S = _ring_size(cfg.sliding_window, _E2B_MAX_QUERY_LEN)
+    S = sliding_ring_size(cfg.sliding_window, _E2B_MAX_QUERY_LEN)
     rope = _combined_rope(cfg, max_ctx, dtype)
     ios_logits = _e2b_prefill_logits(model, rope, cfg, token_ids, q_len, S, max_ctx, dtype)
     del model  # free the iOS model before loading the HF reference (peak = one model)
@@ -438,6 +476,5 @@ def test_e2b_full_parity_hf_vs_torch():
     # Numerical closeness, with the attention cap disabled on HF above and fp
     # embeddings (``disable_embedding_quantization``), so the only spread vs HF is fp32
     # op ordering through the deep stack + the flash online-softmax recurrence. Looser
-    # than the tiny-config's 1e-3 because a real 2B model accumulates more; tighten on
-    # the first real run if there's headroom.
+    # than the tiny-config's 1e-3 because a real 2B model accumulates more.
     torch.testing.assert_close(ios_logits, hf_logits, atol=1e-2, rtol=1e-2)

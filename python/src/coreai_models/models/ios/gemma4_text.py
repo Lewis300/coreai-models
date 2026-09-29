@@ -54,32 +54,16 @@ from coreai_models.primitives.ios.quantization import (
     quantize_per_tensor,
 )
 from coreai_models.primitives.ios.rms_norm import RMSNorm
-from coreai_models.primitives.ios.rope import RoPECache, apply_rope
+from coreai_models.primitives.ios.rope import apply_rope
 from coreai_models.primitives.ios.sdpa import SDPA, BlockedSDPA
-
-# The workspace pin (`transformers>=5.5,<6.0`) carries `transformers.models.gemma4`, so
-# no dependency overlay is needed. The import stays optional so a transformers build
-# without the gemma4 module doesn't break importing this module; `_HF_MODEL_CLASS` is
-# only consumed when actually loading Gemma 4 weights, which then fails loudly.
-try:
-    from transformers.models.gemma4.modeling_gemma4 import (  # type: ignore[import-not-found]
-        Gemma4ForCausalLM as HFGemma4ForCausalLM,
-    )
-except ImportError:  # pragma: no cover - depends on the installed transformers
-    HFGemma4ForCausalLM = None  # type: ignore[assignment,misc]
 
 # Flash chunk width for the global (full-attention) ``BlockedSDPA`` over the flat cache:
 # the largest key-axis chunk whose per-block score/softmax stays within the accelerator's
 # supported tensor sizes (8192 empirically). Overridable via the config attribute
-# ``kv_block_size`` (tests use a small value to exercise multiple chunks cheaply); must be
-# a multiple of max(QUERY_LENGTHS) for the no-straddle write.
+# ``kv_block_size``.
 DEFAULT_KV_BLOCK_SIZE = 8192
 
 # Gemma4-specific graph I/O names, extending the shared iOS ones in `_constants`.
-# These are the runner<->graph contract for the dual-RoPE rows, the sliding-window
-# ring and the externalized per-layer embeddings. They live here rather than in the
-# export recipe because they describe this model's graphs, and the export contract
-# hooks below are what the recipe reads them through.
 ROPE_COS_INPUT_NAME = "rope_cos"
 ROPE_SIN_INPUT_NAME = "rope_sin"
 SLIDING_CAUSAL_MASK_INPUT_NAME = "sliding_causal_mask"
@@ -90,9 +74,8 @@ SLIDING_KEY_CACHE_OUTPUT_NAME = "new_sliding_k_cache"
 SLIDING_VALUE_CACHE_OUTPUT_NAME = "new_sliding_v_cache"
 PLE_EMBEDDINGS_INPUT_NAME = "ple_embeddings"
 
-# Per-function query-length ladder for iOS static-shape specialization. ``max``
-# sizes the sliding-cache ring (a prefill chunk's width).
-QUERY_LENGTHS = [8, 16, 64]
+# Widest iOS static-shape query length (a prefill chunk); sizes the sliding-cache ring.
+MAX_QUERY_LEN = max(BaseForCausalLMForiOS.IOS_STATIC_QUERY_LENS)
 
 
 def sliding_ring_size(sliding_window: int, max_query_len: int) -> int:
@@ -104,71 +87,6 @@ def sliding_ring_size(sliding_window: int, max_query_len: int) -> int:
     """
     raw = sliding_window + max_query_len - 1
     return ((raw + max_query_len - 1) // max_query_len) * max_query_len
-
-
-class Gemma4CombinedRoPE(RoPECache):
-    """Single RoPE cache for Gemma4's dual head dims.
-
-    Gemma4 has two RoPE variants — standard for sliding-attention layers (head_dim 256)
-    and proportional (0.25 rotary) for global layers (head_dim 512). Both variants' cos/sin
-    tables are concatenated along the head dim into a single
-    ``[max_pos, sliding_hd + global_hd]`` cache and gathered once. Callers slice
-    ``[:sliding_hd]`` for sliding layers and ``[sliding_hd:]`` for global layers.
-    """
-
-    def __init__(
-        self,
-        sliding_head_dim: int,
-        global_head_dim: int,
-        max_cache_size: int,
-        sliding_base: float,
-        global_base: float,
-        partial_rotary_factor: float = 0.25,
-    ) -> None:
-        self._sliding_head_dim = sliding_head_dim
-        self._global_head_dim = global_head_dim
-        self._sliding_base = sliding_base
-        self._global_base = global_base
-        self._partial_rotary_factor = partial_rotary_factor
-        super().__init__(sliding_head_dim + global_head_dim, max_cache_size, sliding_base)
-
-    @staticmethod
-    def _emb(theta: torch.Tensor, max_cache_size: int) -> torch.Tensor:
-        seq_idx = torch.arange(end=max_cache_size, dtype=torch.int32)
-        freqs = seq_idx[:, None] * theta
-        return torch.concatenate((freqs, freqs), dim=-1)
-
-    def _compute_sin_and_cos(self, dtype: torch.dtype = torch.float32) -> None:
-        with torch.device("cpu"):
-            # Sliding (standard RoPE).
-            s_theta = 1.0 / (
-                self._sliding_base
-                ** (
-                    torch.arange(0, self._sliding_head_dim, 2, dtype=torch.float32)
-                    / self._sliding_head_dim
-                )
-            )
-            s_emb = self._emb(s_theta, self._max_cache_size)
-
-            # Global (proportional RoPE: only partial_rotary_factor of dims rotate).
-            hd = self._global_head_dim
-            rope_angles = int(self._partial_rotary_factor * hd // 2)
-            nope_angles = hd // 2 - rope_angles
-            inv_freq = 1.0 / (
-                self._global_base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / hd)
-            )
-            if nope_angles > 0:
-                g_theta = torch.cat(
-                    [inv_freq, torch.zeros(nope_angles, dtype=torch.float32)], dim=0
-                )
-            else:
-                g_theta = inv_freq
-            g_emb = self._emb(g_theta, self._max_cache_size)
-
-            cos = torch.cat([torch.cos(s_emb), torch.cos(g_emb)], dim=-1)
-            sin = torch.cat([torch.sin(s_emb), torch.sin(g_emb)], dim=-1)
-            self.cos_cached = torch.nn.Buffer(cos.to(dtype=dtype), persistent=False)
-            self.sin_cached = torch.nn.Buffer(sin.to(dtype=dtype), persistent=False)
 
 
 class RMSNormNoScale(nn.Module):
@@ -212,18 +130,12 @@ class Attention(nn.Module):
     def __init__(
         self,
         config,
-        layer_idx: int,
         is_sliding: bool,
         is_kv_shared: bool,
         slot: int,
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
         self.is_sliding = is_sliding
-        # Both caches are flat. Global (full-attention) layers run the chunked flash
-        # ``BlockedSDPA`` over the flat slot; sliding layers use the small S=576 ring + flat
-        # ``SDPA``. Both share the same (q, k, v, mask) signature.
-        self.is_blocked = not is_sliding
         self.is_kv_shared = is_kv_shared
         # Slot in this layer's type-specific cache: the read+write slot for
         # storing layers, the source layer's slot for shared (read-only) layers.
@@ -234,8 +146,10 @@ class Attention(nn.Module):
         self.n_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim if is_sliding else config.global_head_dim
 
+        # Global layers run the chunked flash ``BlockedSDPA`` over the flat cache;
+        # sliding layers use plain ``SDPA`` over the small ring.
         self.sdpa: nn.Module
-        if self.is_blocked:
+        if not is_sliding:
             block_size = getattr(config, "kv_block_size", None) or DEFAULT_KV_BLOCK_SIZE
             self.sdpa = BlockedSDPA(head_dim=self.head_dim, scale=1.0, block_size=block_size)
         else:
@@ -270,7 +184,7 @@ class Attention(nn.Module):
         ``(1, ctx, 1, q_len)`` global mask; global layers walk it in block_size chunks
         inside ``BlockedSDPA``.
         """
-        batch_size, query_len, _, hidden_size = x.shape
+        batch_size, query_len, _, _ = x.shape
         n_heads, n_kv_heads = self.n_heads, self.n_kv_heads
         head_dim = self.head_dim
 
@@ -282,11 +196,11 @@ class Attention(nn.Module):
         query = query.transpose(-3, -1).reshape(batch_size, query_len, n_heads, head_dim)
         query = self.q_norm(query)
         query = apply_rope(query, rope_cos, rope_sin, head_axis=2)
+        # Q back to BC1S for SDPA
+        query = query.reshape(batch_size, query_len, 1, n_heads * head_dim).transpose(-3, -1)
 
         if self.is_kv_shared:
             assert cache is not None
-            # Reshape Q back to BC1S for SDPA
-            query = query.reshape(batch_size, query_len, 1, n_heads * head_dim).transpose(-3, -1)
             # Read the whole flat cache slot from the source layer (read-only):
             # (1, C, 1, seq) for both sliding (seq=S) and global (seq=ctx).
             key = cache.k_cache[self.slot]
@@ -316,8 +230,6 @@ class Attention(nn.Module):
                 # plain mutable_slice_update.
                 key, value = cache.update_and_fetch(self.slot, write_offset, key, value, query_len)
 
-            # Q back to BC1S for SDPA
-            query = query.reshape(batch_size, query_len, 1, n_heads * head_dim).transpose(-3, -1)
             output = self.sdpa(query, key, value, causal_mask)
 
         output = self.o_proj(output)
@@ -330,7 +242,6 @@ class TransformerBlock(nn.Module):
     def __init__(
         self,
         config,
-        layer_idx: int,
         is_sliding: bool,
         is_kv_shared: bool,
         slot: int,
@@ -341,7 +252,6 @@ class TransformerBlock(nn.Module):
 
         self.self_attn = Attention(
             config=config,
-            layer_idx=layer_idx,
             is_sliding=is_sliding,
             is_kv_shared=is_kv_shared,
             slot=slot,
@@ -486,7 +396,6 @@ class Gemma4Model(nn.Module):
             layers.append(
                 TransformerBlock(
                     config,
-                    layer_idx=i,
                     is_sliding=is_sliding,
                     is_kv_shared=is_kv_shared,
                     slot=slot,
@@ -496,13 +405,9 @@ class Gemma4Model(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
-        # RoPE cos/sin are precomputed in the runner and passed in as graph inputs
-        # (``rope_cos`` / ``rope_sin``, the combined sliding+global table rows for the
-        # chunk's positions) — see ``forward``. The in-graph gather (and its ~400 MB cos/sin
-        # constant tables) is removed because a 131k position index overflows a 16-bit input
-        # and a 32-bit position input fails to compile.
-        # ``Gemma4CombinedRoPE`` is kept as the numerical reference the runner / parity
-        # reimplements (its ``_compute_sin_and_cos``).
+        # RoPE cos/sin are precomputed in the runner and passed in as graph inputs: a 131k
+        # position index overflows a 16-bit input, and a 32-bit one fails to
+        # compile.
 
     def _compute_per_layer_inputs(
         self,
@@ -556,11 +461,6 @@ class Gemma4Model(nn.Module):
         global_cos = rope_cos[..., head_dim:]
         global_sin = rope_sin[..., head_dim:]
 
-        # Global cache is FLAT: the single dynamic write offset is the absolute position
-        # ``in_step``. ``BlockedSDPA`` walks the flat slot in block_size chunks internally,
-        # so the graph carries no second dynamic offset.
-        global_offset = in_step
-
         if ple_embeddings is None:
             raise ValueError(
                 "ple_embeddings is required: Gemma 4 always takes per-layer embeddings"
@@ -581,7 +481,7 @@ class Gemma4Model(nn.Module):
             else:
                 rope_cos, rope_sin = global_cos, global_sin
                 cache, attn_mask = global_cache, causal_mask
-                write_offset = global_offset
+                write_offset = in_step
 
             h = layer(
                 h,
@@ -709,37 +609,15 @@ class Gemma4Extend(nn.Module):
 class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     """Gemma4 iOS text-only CausalLM (extracted from multimodal HF model)."""
 
-    _HF_MODEL_CLASS = HFGemma4ForCausalLM  # We override from_hf directly
-
-    def __init__(
-        self, config, model_device: str = "cpu", disable_embedding_quantization: bool = False
-    ) -> None:
-        # INT8 embedding table by default (the iOS default); routes the token
-        # gather through the fused_dequant_gather composite. Tests pass
-        # ``disable_embedding_quantization=True`` to isolate logic from quant noise.
-        super().__init__(
-            config, model_device, disable_embedding_quantization=disable_embedding_quantization
-        )
-
     def _init_model(self, config) -> None:
         self.extend = Gemma4Extend(config)
 
     # ------------------------------------------------------------------
     # Export contract
     #
-    # Gemma 4 keeps the base's four entrypoints but widens the transformer's I/O:
-    # RoPE arrives as precomputed `rope_cos`/`rope_sin` rows rather than being
-    # gathered in-graph from `position_ids`, attention carries a second
-    # sliding-window mask/step/cache pair alongside the global one, and the
-    # per-layer embedding table is externalized into `ple_embeddings`.
-    #
-    # Per-layer embeddings are unconditional: every supported checkpoint (E2B,
-    # E4B) ships `model.embed_tokens_per_layer.weight`, and the HF default for
-    # `hidden_size_per_layer_input` is non-zero. A Gemma 4 variant without them
-    # would need these hooks to grow a config argument.
-    #
-    # The shapes behind these names are per-bucket and live in the export recipe,
-    # which traces one program per context bucket — see `models/gemma4/export.py`.
+    # Gemma 4 keeps the base's four entrypoints but widens the transformer's I/O
+    # with precomputed RoPE rows, a sliding-window mask/step/cache pair, and
+    # `ple_embeddings`. The per-bucket shapes live in `models/gemma4/export.py`.
     # ------------------------------------------------------------------
 
     @classmethod
@@ -794,11 +672,8 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
 
     @override
     def build_reference_inputs(self, config, target_dtype, spec) -> dict[str, dict]:
-        # The base builds one set of reference tensors for one transformer graph.
-        # Gemma 4 traces a ladder — one program per context bucket, each with its
-        # own cache extent — so the tensors depend on which rung is being traced,
-        # which this signature cannot express. `models/gemma4/export.py` builds
-        # them per bucket instead.
+        # Gemma 4 traces one program per context bucket, which this single-graph
+        # signature can't express.
         raise NotImplementedError(
             "Gemma 4 builds reference inputs per context bucket; export through "
             "models/gemma4/export.py rather than coreai_models.export.ios."
@@ -927,7 +802,7 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         strict = num_layers is None
         model.load_state_dict(text_sd, assign=True, strict=strict)
 
-        # Register PLE scale/zp as buffers after load_state_dict
+        # Attach the PLE scale/zp computed in _mutate_state_dict
         if hasattr(model, "_ple_scale_pending"):
             model.extend.ple_scale = model._ple_scale_pending
             model.extend.ple_zp = model._ple_zp_pending
