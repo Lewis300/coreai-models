@@ -237,6 +237,7 @@ def _build_safetensors_key_index(
     safetensors_files: list[str],
     num_layers: int | None = None,
     hf_state_dict_prefix: str = "",
+    extra_shared_keys: list[str] | None = None,
 ) -> tuple[dict[int, dict[str, str]], dict[str, str]]:
     """Build a key-to-file index from safetensors files without loading tensors.
 
@@ -244,15 +245,24 @@ def _build_safetensors_key_index(
     to load only a sub-model from multimodal checkpoints (e.g., set
     ``hf_state_dict_prefix="language_model."`` to ignore vision/projector keys).
 
+    ``extra_shared_keys`` names exact keys to index as shared regardless of the
+    prefix, for weights stored outside the prefixed sub-model (e.g. ``lm_head.weight``
+    at the root of a checkpoint whose decoder lives under ``model.language_model.``).
+
     Returns ``(per_layer_index, shared_index)`` keyed by *original* safetensors
     keys (prefix not stripped); callers must strip before assigning.
     """
-    layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+    # "layers.{i}." is what a longer prefix such as "model.language_model." leaves.
+    layer_pattern = re.compile(r"(?:model\.)?layers\.(\d+)\.")
+    extra_keys = set(extra_shared_keys or ())
     per_layer: dict[int, dict[str, str]] = {}
     shared: dict[str, str] = {}
     for path in safetensors_files:
         with safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():  # noqa: SIM118
+                if key in extra_keys:
+                    shared[key] = path
+                    continue
                 if not key.startswith(hf_state_dict_prefix):
                     continue
                 stripped = key.removeprefix(hf_state_dict_prefix)
@@ -303,6 +313,9 @@ class BaseForCausalLM(torch.nn.Module):
 
     # Subclasses must override this with their specific HuggingFace model class
     _HF_MODEL_CLASS: type | None = None
+    # Exact safetensors keys to load as shared params regardless of
+    # `hf_state_dict_prefix`, for weights sitting outside the prefixed sub-model.
+    _extra_hf_shared_keys: list[str] = []
 
     #: Whether the macOS exporter emits a second, LM-head-less ``prefill`` graph
     #: beside ``main``. Opt in per model: ``forward`` must honour
@@ -740,6 +753,7 @@ class BaseForCausalLM(torch.nn.Module):
             safetensors_files,
             num_layers=num_layers,
             hf_state_dict_prefix=hf_state_dict_prefix,
+            extra_shared_keys=cls._extra_hf_shared_keys,
         )
 
         # Shared params first (embeddings, norm, lm_head, ...).
