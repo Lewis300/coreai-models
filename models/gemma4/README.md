@@ -52,8 +52,8 @@ uv run export.py --model google/gemma-4-E2B-it
 > shipped alongside the script,
 > [`4bit_palettized.yaml`](4bit_palettized.yaml). iOS requires
 > `float16` and defaults to a 131072 context, which is also its maximum. Bigger
-> contexts cost export time and program size, so pass `--max-context-length` if
-> you need less.
+> contexts cost export time and program size, so pass `--max-context-length` (a
+> power of two) if you need less.
 
 **Options:**
 
@@ -81,11 +81,6 @@ attention unrolls its block loop, so the graph depends on the context length. A
 flat global KV cache is paired with a fixed-depth sliding-window ring, RoPE
 arrives precomputed as `rope_cos`/`rope_sin` inputs, and the INT8 Per-Layer
 Embeddings table is written as a sidecar next to the asset.
-
-Developer overrides (comma-separated flags): `--dev-extend-qlens` /
-`--dev-prompt-qlens` (per-function query-length ladder), `--dev-ladder-only`
-(restrict to specific context buckets). These narrow what the ladder emits so a
-single rung can be debugged quickly; a shipping export passes none of them.
 
 ### Runner side
 

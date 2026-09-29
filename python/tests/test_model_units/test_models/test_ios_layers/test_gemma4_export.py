@@ -94,11 +94,11 @@ def _tiny_export_model():
     return _build_quantized_ios_model(cfg, Gemma4ForCausalLM(cfg).state_dict()).half()
 
 
-def test_non_power_of_two_context_traces_every_rung():
-    """The ladder rounds up to a power of two; every rung, including the top one above
-    --max-context-length, must still trace."""
+def test_short_context_ladder_traces_every_rung():
+    """A --max-context-length below the top shipping bucket becomes the ladder's last
+    rung, and every rung traces."""
     model = _tiny_export_model()
-    buckets = export_g4.context_ladder(2000)
+    buckets = export_g4.context_ladder(2048)
     assert buckets == [1024, 2048]
     names = [name for name, *_ in export_g4._export_programs(model, model.config, buckets)]
     assert names == [
@@ -111,13 +111,6 @@ def test_non_power_of_two_context_traces_every_rung():
     ]
 
 
-def test_dev_ladder_only_rejects_buckets_outside_the_ladder():
-    dev = export_g4.DevOverrides(ladder_only=(4096,))
-    with pytest.raises(SystemExit, match="none of these buckets"):
-        export_g4.context_ladder(2000, dev)
-    assert export_g4.context_ladder(131072, export_g4.DevOverrides(ladder_only=(8192,))) == [8192]
-
-
 def _cli_args(*argv: str) -> argparse.Namespace:
     return export_g4.build_parser().parse_args(["--model", "google/gemma-4-E2B-it", *argv])
 
@@ -126,8 +119,9 @@ def _cli_args(*argv: str) -> argparse.Namespace:
     "argv, message",
     [
         (("--max-context-length", "64"), "must exceed the prefill query length"),
+        (("--max-context-length", "2000"), "power of two"),
+        (("--max-context-length", "0"), "power of two"),
         (("--max-context-length", "262144"), "supports at most"),
-        (("--dev-prompt-qlens", "32"), "must be among"),
     ],
 )
 def test_cli_rejects_invalid_arguments(argv, message):
@@ -136,7 +130,7 @@ def test_cli_rejects_invalid_arguments(argv, message):
 
 
 def test_cli_accepts_small_and_default_contexts():
-    for argv in ((), ("--max-context-length", "65"), ("--dev-prompt-qlens", "16")):
+    for argv in ((), ("--max-context-length", "128"), ("--max-context-length", "32768")):
         export_g4._resolve_defaults(_cli_args(*argv))
 
 

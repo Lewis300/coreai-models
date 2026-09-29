@@ -29,7 +29,6 @@ import logging
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -241,80 +240,13 @@ SHIPPING_CONTEXT_LADDER = [1024, 8192, 32768, 131072]
 IOS_MAX_CONTEXT_LENGTH = SHIPPING_CONTEXT_LADDER[-1]
 
 
-def _int_list(raw: str) -> tuple[int, ...]:
-    """argparse type for a comma-separated positive-int list."""
-    try:
-        values = tuple(int(x) for x in raw.split(",") if x.strip())
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"expected comma-separated integers, got {raw!r}"
-        ) from exc
-    if not values:
-        raise argparse.ArgumentTypeError("expected at least one integer")
-    if any(v <= 0 for v in values):
-        raise argparse.ArgumentTypeError(f"values must be positive, got {list(values)}")
-    return values
-
-
-@dataclass(frozen=True)
-class DevOverrides:
-    """Developer-only narrowing of what the ladder emits, from the ``--dev-*`` flags.
-
-    A full export traces every context bucket at every query length, which is slow
-    enough that debugging one rung is impractical. These cut the matrix down. A
-    shipping export leaves all three unset, which is what :data:`SHIPPING_EXTEND_QLENS`,
-    :data:`SHIPPING_PROMPT_QLENS` and :data:`SHIPPING_CONTEXT_LADDER` describe.
-    """
-
-    extend_qlens: Optional[tuple[int, ...]] = None
-    prompt_qlens: Optional[tuple[int, ...]] = None
-    ladder_only: Optional[tuple[int, ...]] = None
-
-    @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "DevOverrides":
-        return cls(
-            extend_qlens=args.dev_extend_qlens,
-            prompt_qlens=args.dev_prompt_qlens,
-            ladder_only=args.dev_ladder_only,
-        )
-
-    def log_if_set(self) -> None:
-        """Log any narrowing, so a debug artifact is never mistaken for a shipping one."""
-        for label, value in (
-            ("extend query lengths", self.extend_qlens),
-            ("prompt query lengths", self.prompt_qlens),
-            ("context buckets", self.ladder_only),
-        ):
-            if value:
-                logger.warning(f"DEV OVERRIDE: {label} restricted to {list(value)}")
-
-
-def _extend_query_lengths(dev: DevOverrides = DevOverrides()) -> list[int]:
-    """Q-lengths to specialize the decode (``extend_*``) functions for.
-
-    ``--dev-extend-qlens`` overrides; defaults to :data:`SHIPPING_EXTEND_QLENS`.
-    """
-    return list(dev.extend_qlens or SHIPPING_EXTEND_QLENS)
-
-
-def _prompt_query_lengths(dev: DevOverrides = DevOverrides()) -> list[int]:
-    """Q-lengths to specialize the prefill (``prompt_opt_*``) functions for.
-
-    ``--dev-prompt-qlens`` overrides; defaults to :data:`SHIPPING_PROMPT_QLENS`.
-    """
-    return list(dev.prompt_qlens or SHIPPING_PROMPT_QLENS)
-
-
-def context_ladder(
-    max_context_length: int, dev: DevOverrides = DevOverrides()
-) -> list[int]:
+def context_ladder(max_context_length: int) -> list[int]:
     """Context-length buckets for the flat-cache flash ladder: the sparse
     :data:`SHIPPING_CONTEXT_LADDER` entries that fit under the smallest power of two
     covering ``max_context_length`` (always including that cap).
 
     Each context size is its own statically-shaped program (the flash block loop is
     unrolled, so ``ceil(ctx / block_size)`` is baked into the graph).
-    ``--dev-ladder-only`` emits only those buckets.
     """
     ctx_max = 1
     while ctx_max < max_context_length:
@@ -323,14 +255,6 @@ def context_ladder(
     buckets.append(ctx_max)
     buckets = sorted(set(buckets))
 
-    if dev.ladder_only:
-        kept = [b for b in buckets if b in set(dev.ladder_only)]
-        if not kept:
-            raise SystemExit(
-                f"--dev-ladder-only {list(dev.ladder_only)}: none of these buckets are in "
-                f"the ladder for --max-context-length {max_context_length}: {buckets}"
-            )
-        buckets = kept
     return buckets
 
 
@@ -357,7 +281,6 @@ def _export_programs(
     model: Gemma4ForCausalLMForiOS,
     config,
     buckets: list[int],
-    dev: DevOverrides = DevOverrides(),
 ) -> list[tuple[str, str, int, torch.export.ExportedProgram]]:
     """Trace one program per emitted entrypoint.
 
@@ -370,8 +293,6 @@ def _export_programs(
     the ladder rounds that up to a power of two, so the top bucket can exceed it.
     """
     ladder_max = buckets[-1]
-    extend_qlens = _extend_query_lengths(dev)
-    prompt_qlens = _prompt_query_lengths(dev)
     decomp_table = _ios_decomp_table()
     block_size = model.extend.model.kv_block_size
 
@@ -419,8 +340,8 @@ def _export_programs(
         # The transformer entry is used for both emitted entrypoints.
         for ctx in buckets:
             for entrypoint, prefill, qlens in (
-                (EXTEND_FUNCTION_NAME, False, extend_qlens),
-                (PROMPT_OPT_FUNCTION_NAME, True, prompt_qlens),
+                (EXTEND_FUNCTION_NAME, False, SHIPPING_EXTEND_QLENS),
+                (PROMPT_OPT_FUNCTION_NAME, True, SHIPPING_PROMPT_QLENS),
             ):
                 model.set_prefill_mode(prefill)
                 for q in qlens:
@@ -503,13 +424,12 @@ async def _export_blocked_ladder(
     config,
     max_context_length: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
-    dev: DevOverrides = DevOverrides(),
 ) -> AIProgram:
     """Export the Gemma4 model as a per-context blocked-flash ladder AIProgram."""
-    buckets = context_ladder(max_context_length, dev)
+    buckets = context_ladder(max_context_length)
     logger.info(f"iOS context ladder: {buckets}")
-    programs = _export_programs(model, config, buckets, dev)
-    gather_qlens = set(_extend_query_lengths(dev)) | set(_prompt_query_lengths(dev))
+    programs = _export_programs(model, config, buckets)
+    gather_qlens = set(SHIPPING_EXTEND_QLENS) | set(SHIPPING_PROMPT_QLENS)
     return await _convert_to_coreai(
         model, programs, config, gather_qlens, include_debug_info
     )
@@ -549,8 +469,6 @@ async def _export_ios(args: argparse.Namespace) -> str:
     hf_model_id: str = args.model
     target_dtype = torch.float16
     max_ctx = args.max_context_length or IOS_MAX_CONTEXT_LENGTH
-    dev = DevOverrides.from_args(args)
-    dev.log_if_set()
 
     # Palettization comes from a coreai-opt YAML: DEFAULT_IOS_COMPRESSION_CONFIG
     # unless --compression-config overrides it. `--compression none` leaves it
@@ -629,7 +547,6 @@ async def _export_ios(args: argparse.Namespace) -> str:
             hf_config,
             max_ctx,
             include_debug_info=args.include_debug_info,
-            dev=dev,
         )
 
         del model
@@ -696,7 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-context-length",
         type=int,
         default=None,
-        help=f"Maximum context length (default and max: {IOS_MAX_CONTEXT_LENGTH})",
+        help="Maximum context length, a power of two "
+        f"(default and max: {IOS_MAX_CONTEXT_LENGTH})",
     )
     parser.add_argument(
         "--output-dir",
@@ -722,31 +640,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", "-v", action="store_true", help="Enable DEBUG logging"
     )
 
-    # Developer-only narrowing. A full ladder traces every context bucket at every
-    # query length; these cut that down so one rung can be debugged in minutes.
-    # Shipping exports pass none of them -- see `DevOverrides`.
-    dev_group = parser.add_argument_group("developer overrides")
-    dev_group.add_argument(
-        "--dev-extend-qlens",
-        type=_int_list,
-        metavar="N[,N...]",
-        help="Query lengths to specialize the decode (extend_*) functions for, "
-        f"instead of the shipping {list(SHIPPING_EXTEND_QLENS)}.",
-    )
-    dev_group.add_argument(
-        "--dev-prompt-qlens",
-        type=_int_list,
-        metavar="N[,N...]",
-        help="Query lengths to specialize the prefill (prompt_opt_*) functions for, "
-        f"instead of the shipping {list(SHIPPING_PROMPT_QLENS)}.",
-    )
-    dev_group.add_argument(
-        "--dev-ladder-only",
-        type=_int_list,
-        metavar="CTX[,CTX...]",
-        help="Emit only these context buckets. Buckets outside the ladder for the "
-        "requested --max-context-length are ignored; it is an error if none remain.",
-    )
     return parser
 
 
@@ -768,22 +661,17 @@ def _resolve_defaults(args: argparse.Namespace) -> None:
             "at that bucket."
         )
 
-    # Query lengths must be ones the gather is specialized for; all of them divide
-    # MAX_QUERY_LEN, so a cache write never wraps or straddles the ring or a bucket.
-    for flag, qlens in (
-        ("--dev-extend-qlens", args.dev_extend_qlens),
-        ("--dev-prompt-qlens", args.dev_prompt_qlens),
+    # The top context bucket is --max-context-length itself, so it must be one.
+    if args.max_context_length is not None and (
+        args.max_context_length <= 0
+        or args.max_context_length & (args.max_context_length - 1)
     ):
-        allowed = Gemma4ForCausalLMForiOS.IOS_STATIC_QUERY_LENS
-        invalid = [q for q in qlens or () if q not in allowed]
-        if invalid:
-            raise SystemExit(
-                f"{flag}: query lengths must be among {list(allowed)}, got {invalid}"
-            )
+        raise SystemExit(
+            f"--max-context-length must be a power of two (got {args.max_context_length})."
+        )
 
-    # A rung is traced at its query length plus two positions (TraceSpec), and the
-    # top bucket is a power of two at or above --max-context-length.
-    widest_prompt = max(args.dev_prompt_qlens or SHIPPING_PROMPT_QLENS)
+    # A rung is traced at its query length plus two positions (TraceSpec).
+    widest_prompt = max(SHIPPING_PROMPT_QLENS)
     if args.max_context_length is not None and args.max_context_length <= widest_prompt:
         raise SystemExit(
             f"--max-context-length must exceed the prefill query length {widest_prompt} "
