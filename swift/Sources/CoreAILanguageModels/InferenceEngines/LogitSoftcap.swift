@@ -27,6 +27,13 @@ enum LogitSoftcap {
     ///
     /// No-ops for a non-positive `cap` or an empty buffer.
     static func apply(cap: Float, to logits: inout [LogitsScalarType]) {
+        var scratch: [Float] = []
+        apply(cap: cap, to: &logits, scratch: &scratch)
+    }
+
+    /// ``apply(cap:to:)`` with a caller-owned `scratch`, reused across calls so a
+    /// decode loop doesn't allocate a vocab-sized buffer every token.
+    static func apply(cap: Float, to logits: inout [LogitsScalarType], scratch: inout [Float]) {
         guard cap > 0, !logits.isEmpty else { return }
 
         let count = logits.count
@@ -35,7 +42,9 @@ enum LogitSoftcap {
         // vForce's tanh wants Float32, so widen (and pre-divide) into scratch, transform
         // in place, then narrow back. The scratch allocation is ~1 MB at Gemma's vocab
         // size — negligible next to the forward pass that produced these logits.
-        var scratch = [Float](repeating: 0, count: count)
+        if scratch.count != count {
+            scratch = [Float](repeating: 0, count: count)
+        }
         for i in 0..<count {
             scratch[i] = Float(logits[i]) * inverseCap
         }

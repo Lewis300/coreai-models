@@ -83,6 +83,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private let inputHandlers: [any StaticInputHandler]
     private var inputBuffers: InputBuffers
 
+    // Reused by LogitSoftcap so decode doesn't allocate a vocab-sized buffer per token.
+    private var softcapScratch: [Float] = []
+
     // Number of tokens already processed in the current sequence.
     public private(set) var processedTokenCount: Int = 0
 
@@ -202,7 +205,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             }
             CLILogger.log("Input handler: precomputed dual-RoPE rows")
             handlers.append(
-                DualRoPEInputHandler(
+                try DualRoPEInputHandler(
                     rope: rope,
                     cosDescriptors: .collect(DualRoPEInputHandler.cosInputName, from: functionsByKey),
                     sinDescriptors: .collect(DualRoPEInputHandler.sinInputName, from: functionsByKey)))
@@ -241,7 +244,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 "Input handler: per-layer embeddings (vocab=\(table.vocabSize), "
                     + "rowWidth=\(table.rowWidth)) from \(url.lastPathComponent)")
             handlers.append(
-                PerLayerEmbeddingsInputHandler(
+                try PerLayerEmbeddingsInputHandler(
                     table: table,
                     descriptors: .collect(
                         PerLayerEmbeddingsInputHandler.inputName, from: functionsByKey)))
@@ -548,7 +551,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // — before both the returned logits and the sampler, so parity dumps and the
         // sampled token see the same capped values the reference implementation produces.
         if let cap = config.finalLogitSoftcapping {
-            LogitSoftcap.apply(cap: Float(cap), to: &logitBuffer)
+            LogitSoftcap.apply(cap: Float(cap), to: &logitBuffer, scratch: &softcapScratch)
         }
 
         let actualLogits = returnsLogits ? logitBuffer : nil

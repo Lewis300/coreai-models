@@ -39,8 +39,19 @@ struct DualRoPEInputHandler: StaticInputHandler {
         rope: RoPEConfig,
         cosDescriptors: BucketedInputDescriptors,
         sinDescriptors: BucketedInputDescriptors
-    ) {
-        self.theta = Self.buildTheta(rope)
+    ) throws {
+        let theta = Self.buildTheta(rope)
+        // The combined table is `sliding ‖ global`, so the graph's row width must
+        // equal the theta count exactly. A wider row would keep stale pooled-buffer
+        // contents in its tail, which reads as a plausible-but-wrong RoPE row.
+        for (name, descriptors) in [(Self.cosInputName, cosDescriptors), (Self.sinInputName, sinDescriptors)] {
+            for descriptor in descriptors.descriptors where descriptor.shape.last != theta.count {
+                throw InferenceRuntimeError.invalidState(
+                    "\(name) row width \(descriptor.shape.last ?? -1) != combined RoPE table "
+                        + "width \(theta.count)")
+            }
+        }
+        self.theta = theta
         self.cosDescriptors = cosDescriptors
         self.sinDescriptors = sinDescriptors
     }
@@ -102,14 +113,6 @@ struct DualRoPEInputHandler: StaticInputHandler {
         transform: (Double) -> Double
     ) throws {
         let descriptor = try descriptors.require(key, input: name)
-        // The combined table is `sliding ‖ global`, so the graph's row width must
-        // equal the theta count exactly. A wider row would keep stale pooled-buffer
-        // contents in its tail, which reads as a plausible-but-wrong RoPE row.
-        guard descriptor.shape.last == theta.count else {
-            throw InferenceRuntimeError.invalidState(
-                "\(name) row width \(descriptor.shape.last ?? -1) != combined RoPE table "
-                    + "width \(theta.count)")
-        }
         buffers.ensureCapacity(name: name, descriptor: descriptor)
         let batchSize = context.batchSize
         let alignedStep = context.alignedStep

@@ -104,14 +104,15 @@ struct PerLayerEmbeddings: Sendable {
     ///
     /// Tokens beyond `tokenIDs.count` (padding up to `batchSize`) are left as
     /// whatever `dest` already contains (callers pass a zeroed buffer).
-    func gather(tokenIDs: [Int32], batchSize: Int, into dest: UnsafeMutableBufferPointer<Int8>) {
+    func gather(
+        tokenIDs: some Collection<Int32>, batchSize: Int, into dest: UnsafeMutableBufferPointer<Int8>
+    ) {
         precondition(dest.count >= batchSize * rowWidth, "PLE destination buffer too small")
-        let count = min(batchSize, tokenIDs.count)
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress else { return }
             let src = base.advanced(by: dataStart).assumingMemoryBound(to: Int8.self)
-            for i in 0..<count {
-                let token = Int(tokenIDs[i])
+            for (i, tokenID) in tokenIDs.prefix(batchSize).enumerated() {
+                let token = Int(tokenID)
                 guard token >= 0, token < vocabSize else { continue }
                 let srcRow = src.advanced(by: token * rowWidth)
                 let dstRow = dest.baseAddress!.advanced(by: i * rowWidth)

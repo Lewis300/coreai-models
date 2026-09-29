@@ -18,7 +18,12 @@ struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
     private let table: PerLayerEmbeddings
     private let descriptors: BucketedInputDescriptors
 
-    init(table: PerLayerEmbeddings, descriptors: BucketedInputDescriptors) {
+    init(table: PerLayerEmbeddings, descriptors: BucketedInputDescriptors) throws {
+        for descriptor in descriptors.descriptors where descriptor.shape.last != table.rowWidth {
+            throw InferenceRuntimeError.invalidState(
+                "PLE row width mismatch: graph expects \(descriptor.shape.last ?? -1), "
+                    + "table has \(table.rowWidth)")
+        }
         self.table = table
         self.descriptors = descriptors
     }
@@ -31,16 +36,10 @@ struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
         let key = StaticBucketKey(batchSize: context.batchSize, contextBucket: context.contextBucket)
         let descriptor = try descriptors.require(key, input: Self.inputName)
 
-        let rowWidth = descriptor.shape.last ?? table.rowWidth
-        guard rowWidth == table.rowWidth else {
-            throw InferenceRuntimeError.invalidState(
-                "PLE row width mismatch: graph expects \(rowWidth), table has \(table.rowWidth)")
-        }
-
         buffers.ensureCapacity(name: Self.inputName, descriptor: descriptor)
 
         let elementCount = descriptor.shape.reduce(1, *)
-        let tokenIDs = Array(context.tokens)
+        let tokenIDs = context.tokens
         let batchSize = context.batchSize
         let table = self.table
 
