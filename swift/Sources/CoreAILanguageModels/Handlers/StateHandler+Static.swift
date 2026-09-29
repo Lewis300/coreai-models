@@ -309,11 +309,6 @@ struct StaticStateSet {
     /// States with one buffer across every bucket, allocated at the maximum.
     let fixed: FixedStaticState?
 
-    init(bucketed: BucketedStaticState?, fixed: FixedStaticState?) {
-        self.bucketed = bucketed
-        self.fixed = fixed
-    }
-
     /// Lay out the bucketed states for the bucket about to run. Fixed states
     /// need nothing: one buffer serves every bucket, and `bind` slices it.
     func prepare(contextBucket: Int, writtenTokenCount: Int) throws {
