@@ -87,6 +87,63 @@ struct BucketedStaticStatePrefixTests {
 
         #expect(read(destination, count: 4 * 16).allSatisfy { $0 == 0 })
     }
+
+    @Test("bf16: the prefix is copied as raw 16-bit elements")
+    func bfloat16CopiesRawBits() {
+        // A typed Float16 view traps on a BFloat16 array, so fill and read the raw
+        // bit patterns; the copy must move them verbatim.
+        let groups = 4
+        let oldContext = 8
+        let newContext = 16
+        let copyLength = 5
+        var source = NDArray(shape: [2, 1, 2, 1, oldContext], scalarType: .bfloat16)
+        source.mutableRawView().withUnsafeMutableBytes { raw, _, _ in
+            let bits = raw.assumingMemoryBound(to: UInt16.self)
+            for index in 0..<(groups * oldContext) {
+                bits[index] = UInt16(index / oldContext * 1000 + index % oldContext)
+            }
+        }
+        var destination = NDArray(shape: [2, 1, 2, 1, newContext], scalarType: .bfloat16)
+        zeroFillNDArray(&destination)
+
+        BucketedStaticState.copyPrefix(from: source, to: &destination, copyLength: copyLength)
+
+        var values: [UInt16] = []
+        destination.rawView().withUnsafeBytes { raw, _, _ in
+            let bits = raw.assumingMemoryBound(to: UInt16.self)
+            values = (0..<(groups * newContext)).map { bits[$0] }
+        }
+        for group in 0..<groups {
+            for position in 0..<newContext {
+                let expected = position < copyLength ? UInt16(group * 1000 + position) : 0
+                #expect(values[group * newContext + position] == expected)
+            }
+        }
+    }
+
+    @Test("fp32: 4-byte elements land at the new sequence stride")
+    func float32CopiesFourByteElements() {
+        let groups = 4
+        let oldContext = 8
+        let newContext = 16
+        let copyLength = 6
+        var source = NDArray(shape: [2, 1, 2, 1, oldContext], scalarType: .float32)
+        fillNDArray(&source, as: Float.self, count: groups * oldContext) { index in
+            Float(index / oldContext * 1000 + index % oldContext)
+        }
+        var destination = NDArray(shape: [2, 1, 2, 1, newContext], scalarType: .float32)
+        zeroFillNDArray(&destination)
+
+        BucketedStaticState.copyPrefix(from: source, to: &destination, copyLength: copyLength)
+
+        let values = readNDArray(destination, as: Float.self, count: groups * newContext)
+        for group in 0..<groups {
+            for position in 0..<newContext {
+                let expected: Float = position < copyLength ? Float(group * 1000 + position) : 0
+                #expect(values[group * newContext + position] == expected)
+            }
+        }
+    }
 }
 
 // MARK: - Fixed vs bucketed classification
