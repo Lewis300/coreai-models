@@ -13,10 +13,10 @@ pipeline, so they ship as a standalone recipe (see ``models/gemma4/README.md``):
     cd models/gemma4
     uv run export.py --model google/gemma-4-E2B-it --max-context-length 32768
 
-The export is a per-context ladder of statically-shaped programs. Each context
-bucket gets its own ``extend_{ctx}`` / ``prompt_opt_{ctx}`` entrypoints, further
-specialized by query length, because the flash block loop is unrolled into the
-graph. A flat global KV cache pairs with a fixed-depth sliding-window ring, RoPE
+The export follows ``coreai_models.export.ios``, except that each (context bucket,
+query length) pair is traced as its own fully static program,
+``extend_{ctx}_{q}`` / ``prompt_opt_{ctx}_{q}``: ``BlockedSDPA`` unrolls its block
+loop, so the graph depends on the context length. A flat global KV cache pairs with a fixed-depth sliding-window ring, RoPE
 arrives precomputed as ``rope_cos``/``rope_sin``, and the INT8 Per-Layer
 Embeddings table is written as a sidecar next to the asset.
 """
@@ -34,25 +34,17 @@ from typing import Any, Optional
 
 import torch
 from coreai.authoring import AIProgram
-from coreai.authoring.types import AllocationType, HardwareConstraints
 from coreai_torch import TorchConverter
 from transformers import AutoConfig, GenerationConfig
 
 from coreai_models._constants import (
-    CAUSAL_MASK_INPUT_NAME,
     DEFAULT_INCLUDE_DEBUG_INFO,
     EMBEDDING_TABLE_INPUT_NAME,
     EXTEND_FUNCTION_NAME,
     GATHER_EMBEDDINGS_FUNCTION_NAME,
-    IN_STEP_INPUT_NAME,
-    KEY_CACHE_INPUT_NAME,
-    KEY_CACHE_OUTPUT_NAME,
     LOAD_EMBEDDINGS_FUNCTION_NAME,
     PROMPT_OPT_FUNCTION_NAME,
-    TOKEN_IDS_INPUT_NAME,
     TRANSFORMER_INPUT_NAME,
-    VALUE_CACHE_INPUT_NAME,
-    VALUE_CACHE_OUTPUT_NAME,
 )
 from coreai_models.export.bundle import bundle_llm_asset
 from coreai_models.export.compression import (
@@ -65,23 +57,11 @@ from coreai_models.export.mlir_ops import (
 )
 from coreai_models.export.pipeline import ExportConfig, _generate_output_name
 from coreai_models.llm.export import _load_compression_config_object
-from coreai_models.models.base import BaseForCausalLMForiOS
+from coreai_models.models.base import TraceSpec
 from coreai_models.models.ios.gemma4_text import (
-    PLE_EMBEDDINGS_INPUT_NAME,
     MAX_QUERY_LEN,
-    ROPE_COS_INPUT_NAME,
-    ROPE_SIN_INPUT_NAME,
-    SLIDING_CAUSAL_MASK_INPUT_NAME,
-    SLIDING_IN_STEP_INPUT_NAME,
-    SLIDING_KEY_CACHE_INPUT_NAME,
-    SLIDING_KEY_CACHE_OUTPUT_NAME,
-    SLIDING_VALUE_CACHE_INPUT_NAME,
-    SLIDING_VALUE_CACHE_OUTPUT_NAME,
     Gemma4ForCausalLMForiOS,
-    sliding_ring_size,
 )
-
-KV_CACHE_INTERLEAVE_FACTOR = BaseForCausalLMForiOS.KV_CACHE_INTERLEAVE_FACTOR
 
 logger = logging.getLogger("gemma4.export")
 
@@ -254,10 +234,6 @@ def _resolve_bundle_paths(
 SHIPPING_EXTEND_QLENS = [8]
 SHIPPING_PROMPT_QLENS = [64]
 
-# Smallest context bucket. Short prompts pay only this context (a single ctx-wide
-# flash chunk).
-MIN_CONTEXT_LENGTH = 1024
-
 # Shipping context ladder: a SPARSE set of buckets (<=4 up to 131072). A dense
 # power-of-two ladder produces too many functions and blows past the accelerator's
 # per-program I/O cap; this sparse ladder keeps every bucket (including 131072)
@@ -271,9 +247,6 @@ SHIPPING_CONTEXT_LADDER = [1024, 8192, 32768, 131072]
 # default, so an export covers the model's full context unless `--max-context-length`
 # asks for less.
 IOS_MAX_CONTEXT_LENGTH = SHIPPING_CONTEXT_LADDER[-1]
-
-# Calibration trace query length (extend runs a single new token; q=8 covers it).
-_CALIB_QUERY_LEN = 8
 
 
 def _int_list(raw: str) -> tuple[int, ...]:
@@ -364,16 +337,6 @@ def context_ladder(
     return buckets
 
 
-def _ple_total_dim(config) -> int:
-    """Width of one token's externalized Per-Layer Embeddings row.
-
-    Every supported checkpoint (E2B, E4B) ships per-layer embeddings, so the
-    ``ple_embeddings`` graph input is unconditional — see the export contract on
-    :class:`Gemma4ForCausalLMForiOS`.
-    """
-    return config.num_hidden_layers * config.hidden_size_per_layer_input
-
-
 def _ios_decomp_table():
     """iOS decomposition table: keep ``silu`` as-is (the accelerator has a fused op)."""
     decomp_table = torch.export.default_decompositions()
@@ -382,458 +345,165 @@ def _ios_decomp_table():
     return decomp_table
 
 
-def _export_forward_pair(
-    model: torch.nn.Module,
-    forward_inputs: dict,
-    forward_dynamic_shapes: dict,
-    decomp_table,
-) -> tuple:
-    """Export the (extend decode, prompt prefill) pair for one set of inputs.
-
-    Resets to decode mode before the extend export so this is safe to call in a
-    loop (one pair per context bucket).
-    """
-    with torch.no_grad():
-        model.set_prefill_mode(False)
-        logger.info("Exporting extend module...")
-        extend_program = torch.export.export(
-            model.extend,
-            args=(),
-            kwargs=forward_inputs,
-            dynamic_shapes=forward_dynamic_shapes,
-        ).run_decompositions(decomp_table)
-        remove_functionalization(extend_program)
-
-        model.set_prefill_mode(True)
-        logger.info("Exporting extend module (prefill mode)...")
-        prompt_program = torch.export.export(
-            model.extend,
-            args=(),
-            kwargs=forward_inputs,
-            dynamic_shapes=forward_dynamic_shapes,
-        ).run_decompositions(decomp_table)
-        remove_functionalization(prompt_program)
-    return extend_program, prompt_program
-
-
-def _export_aux_programs(
-    model: torch.nn.Module,
-    embed_tokens_inputs: tuple,
-    embed_tokens_dynamic_shapes: dict,
-) -> tuple:
-    """Export the (gather_embeddings, load_embeddings) programs (bucket-independent)."""
-    with torch.no_grad():
-        logger.info("Exporting gather_embeddings module...")
-        gather_program = torch.export.export(
-            model.gather_embeddings,
-            args=embed_tokens_inputs,
-            dynamic_shapes=embed_tokens_dynamic_shapes,
-        )
-        logger.info("Exporting load_embeddings module...")
-        load_program = torch.export.export(model.load_embeddings, args=tuple())
-    return gather_program, load_program
-
-
-def _build_ios_reference_inputs(
-    model: torch.nn.Module, config, max_context_length: int, ctx: int
-) -> dict:
-    """Build reference input tensors for one context bucket of the Gemma4 ladder.
-
-    The global cache is FLAT ``(n_global_storing, 1, C_g, 1, ctx)`` (a single
-    dynamic write offset); the sliding cache is a fixed-depth ring. RoPE arrives as
-    precomputed ``rope_cos``/``rope_sin`` rows instead of ``position_ids``.
-    """
-    batch_size = 1
-    query_len = 8
-
-    input_ids = torch.randint(
-        1, config.vocab_size, (batch_size, query_len), dtype=torch.int32
+def _reference_inputs(
+    model: Gemma4ForCausalLMForiOS,
+    config,
+    max_context_length: int,
+    ctx: int,
+    query_len: int,
+) -> dict[str, dict]:
+    """The model's reference inputs for one rung, checked against its contract."""
+    spec = TraceSpec(
+        max_context_length=max_context_length, cache_seq_len=ctx, query_len=query_len
     )
-    in_step = torch.zeros((1,), dtype=torch.int32)
-    sliding_in_step = torch.zeros((1,), dtype=torch.int32)
-
-    head_dim = config.head_dim
-    global_head_dim = config.global_head_dim
-    n_kv = config.num_key_value_heads
-    n_global_storing = model.extend.model.n_global_storing
-    n_sliding_storing = model.extend.model.n_sliding_storing
-    sliding_ring = sliding_ring_size(config.sliding_window, MAX_QUERY_LEN)
-
-    key_cache = torch.zeros(
-        n_global_storing, 1, n_kv * global_head_dim, 1, ctx, dtype=torch.float16
+    reference_inputs = model.build_reference_inputs(config, torch.float16, spec)
+    model.validate_export_contract(
+        reference_inputs, model.build_dynamic_shapes(config, spec)
     )
-    value_cache = key_cache.clone()
-    sliding_key_cache = torch.zeros(
-        n_sliding_storing, 1, n_kv * head_dim, 1, sliding_ring, dtype=torch.float16
-    )
-    sliding_value_cache = sliding_key_cache.clone()
-    causal_mask = torch.zeros(1, ctx, 1, query_len, dtype=torch.float16)
-    sliding_causal_mask = torch.zeros(
-        1, sliding_ring, 1, query_len, dtype=torch.float16
-    )
-    rope_width = head_dim + global_head_dim
-    rope_cos = torch.zeros(1, query_len, rope_width, dtype=torch.float16)
-    rope_sin = torch.zeros(1, query_len, rope_width, dtype=torch.float16)
-
-    embedding_table = model.load_embeddings.embedding_table
-    transformer_input = model.gather_embeddings(input_ids, embedding_table)
-
-    forward_inputs = {
-        TRANSFORMER_INPUT_NAME: transformer_input,
-        ROPE_COS_INPUT_NAME: rope_cos,
-        ROPE_SIN_INPUT_NAME: rope_sin,
-        IN_STEP_INPUT_NAME: in_step,
-        SLIDING_IN_STEP_INPUT_NAME: sliding_in_step,
-        CAUSAL_MASK_INPUT_NAME: causal_mask,
-        SLIDING_CAUSAL_MASK_INPUT_NAME: sliding_causal_mask,
-        KEY_CACHE_INPUT_NAME: key_cache,
-        VALUE_CACHE_INPUT_NAME: value_cache,
-        SLIDING_KEY_CACHE_INPUT_NAME: sliding_key_cache,
-        SLIDING_VALUE_CACHE_INPUT_NAME: sliding_value_cache,
-        EMBEDDING_TABLE_INPUT_NAME: embedding_table,
-    }
-
-    forward_inputs[PLE_EMBEDDINGS_INPUT_NAME] = torch.randint(
-        -128, 127, (batch_size, query_len, 1, _ple_total_dim(config)), dtype=torch.int8
-    )
-
-    seq_len_dim = torch.export.Dim("seq_len", max=max_context_length)
-    # ctx (global cache seq) and the sliding ring depth are STATIC per bucket; only
-    # the query/seq dim is dynamic.
-    forward_dynamic_shapes: dict = {
-        TRANSFORMER_INPUT_NAME: {1: seq_len_dim},
-        ROPE_COS_INPUT_NAME: {1: seq_len_dim},
-        ROPE_SIN_INPUT_NAME: {1: seq_len_dim},
-        IN_STEP_INPUT_NAME: None,
-        SLIDING_IN_STEP_INPUT_NAME: None,
-        CAUSAL_MASK_INPUT_NAME: {3: seq_len_dim},
-        SLIDING_CAUSAL_MASK_INPUT_NAME: {3: seq_len_dim},
-        KEY_CACHE_INPUT_NAME: None,
-        VALUE_CACHE_INPUT_NAME: None,
-        SLIDING_KEY_CACHE_INPUT_NAME: None,
-        SLIDING_VALUE_CACHE_INPUT_NAME: None,
-        EMBEDDING_TABLE_INPUT_NAME: None,
-        PLE_EMBEDDINGS_INPUT_NAME: {1: seq_len_dim},
-    }
-
-    embed_tokens_inputs = (input_ids, embedding_table)
-    embed_tokens_dynamic_shapes = {
-        "input_ids": {1: seq_len_dim},
-        EMBEDDING_TABLE_INPUT_NAME: None,
-    }
-
-    return {
-        "forward_inputs": forward_inputs,
-        "embed_tokens_inputs": embed_tokens_inputs,
-        "forward_dynamic_shapes": forward_dynamic_shapes,
-        "embed_tokens_dynamic_shapes": embed_tokens_dynamic_shapes,
-    }
+    return reference_inputs
 
 
-async def _convert_blocked_ladder_to_coreai(
-    ladder: list,
-    gather_embeddings_program,
-    load_embeddings_program,
-    kv_cached_embed_size: int,
-    hidden_size: int,
-    ple_total_dim: int,
-    sliding_ring: int,
-    n_sliding_storing: int,
-    sliding_channels: int,
-    n_global_storing: int,
-    rope_width: int,
-    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+def _export_programs(
+    model: Gemma4ForCausalLMForiOS,
+    config,
+    max_context_length: int,
+    buckets: list[int],
     dev: DevOverrides = DevOverrides(),
-) -> AIProgram:
-    """Convert a flat-global-cache context ladder to a single multi-function AIProgram.
+) -> list[tuple[str, str, int, torch.export.ExportedProgram]]:
+    """Trace one fully static program per emitted function.
 
-    ``ladder`` is a list of ``(ctx, extend_program, prompt_program)``, one per
-    context bucket. Each is registered as its own entrypoint ``extend_{ctx}`` /
-    ``prompt_opt_{ctx}`` with ``q_len`` as the static-shape specialization, so the
-    emitted functions are ``extend_{ctx}_{q}`` / ``prompt_opt_{ctx}_{q}``. Shared
-    weights are referenced (not copied) across programs; the runner right-sizes the
-    global cache to the running bucket's ctx.
+    Mirrors ``coreai_models.export.ios._export_programs``, except that every
+    (context bucket, query length) pair is its own program, named
+    ``{entrypoint}_{ctx}_{q}`` (``gather_embeddings_{q}`` for the gather). Returns
+    ``(function name, contract graph, context bucket, program)`` tuples.
     """
-    converter = TorchConverter(
-        mode=TorchConverter.Mode.DEBUG
-        if include_debug_info
-        else TorchConverter.Mode.RELEASE
+    extend_qlens = _extend_query_lengths(dev)
+    prompt_qlens = _prompt_query_lengths(dev)
+    decomp_table = _ios_decomp_table()
+    block_size = model.extend.model.kv_block_size
+
+    def trace(module, kwargs: dict) -> torch.export.ExportedProgram:
+        return torch.export.export(module, args=(), kwargs=kwargs)
+
+    programs: list[tuple[str, str, int, torch.export.ExportedProgram]] = []
+    with torch.no_grad():
+        logger.info(f"Exporting {LOAD_EMBEDDINGS_FUNCTION_NAME}...")
+        programs.append(
+            (
+                LOAD_EMBEDDINGS_FUNCTION_NAME,
+                LOAD_EMBEDDINGS_FUNCTION_NAME,
+                buckets[0],
+                trace(model.load_embeddings, {}),
+            )
+        )
+        for q in sorted(set(extend_qlens) | set(prompt_qlens)):
+            name = f"{GATHER_EMBEDDINGS_FUNCTION_NAME}_{q}"
+            logger.info(f"Exporting {name}...")
+            ref = _reference_inputs(model, config, max_context_length, buckets[0], q)
+            gather = ref[GATHER_EMBEDDINGS_FUNCTION_NAME]
+            programs.append(
+                (
+                    name,
+                    GATHER_EMBEDDINGS_FUNCTION_NAME,
+                    buckets[0],
+                    trace(model.gather_embeddings, gather),
+                )
+            )
+
+        # The transformer entry is used for both emitted entrypoints.
+        for ctx in buckets:
+            for entrypoint, prefill, qlens in (
+                (EXTEND_FUNCTION_NAME, False, extend_qlens),
+                (PROMPT_OPT_FUNCTION_NAME, True, prompt_qlens),
+            ):
+                model.set_prefill_mode(prefill)
+                for q in qlens:
+                    name = f"{entrypoint}_{ctx}_{q}"
+                    logger.info(
+                        f"Exporting {name} "
+                        f"(flash chunks={(ctx + block_size - 1) // block_size})..."
+                    )
+                    ref = _reference_inputs(model, config, max_context_length, ctx, q)
+                    program = trace(model.extend, ref[EXTEND_FUNCTION_NAME])
+                    program = program.run_decompositions(decomp_table)
+                    remove_functionalization(program)
+                    programs.append((name, EXTEND_FUNCTION_NAME, ctx, program))
+
+    return programs
+
+
+async def _convert_to_coreai(
+    model: Gemma4ForCausalLMForiOS,
+    programs: list[tuple[str, str, int, torch.export.ExportedProgram]],
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> AIProgram:
+    """Convert the traced programs to one AIProgram with iOS constraints.
+
+    Mirrors ``coreai_models.export.ios._convert_to_coreai``. The programs are traced
+    at fully static shapes, so there are no static shape configs to apply; the
+    hardware constraints come from the model's contract for each program's bucket.
+    """
+    inputs = model.export_input_names()
+    states = model.export_state_names()
+    outputs = model.export_output_names()
+
+    mode = (
+        TorchConverter.Mode.DEBUG if include_debug_info else TorchConverter.Mode.RELEASE
     )
+    converter = TorchConverter(mode=mode)
     register_custom_torch_lowering(converter)
-
-    # The graph I/O contract lives on the model class, so the recipe and the
-    # eager model cannot drift apart. Each name hook is keyed by graph; the
-    # ladder registers every bucket's pair of entrypoints against the single
-    # EXTEND entry, since all rungs share one signature and differ only in shape.
-    names = Gemma4ForCausalLMForiOS.export_input_names()
-    states = Gemma4ForCausalLMForiOS.export_state_names()
-    outputs = Gemma4ForCausalLMForiOS.export_output_names()
-
-    converter.add_exported_program(
-        load_embeddings_program,
-        input_names=list(names[LOAD_EMBEDDINGS_FUNCTION_NAME]),
-        output_names=list(outputs[LOAD_EMBEDDINGS_FUNCTION_NAME]),
-        entrypoint_name=LOAD_EMBEDDINGS_FUNCTION_NAME,
-    )
-    converter.add_exported_program(
-        gather_embeddings_program,
-        input_names=list(names[GATHER_EMBEDDINGS_FUNCTION_NAME]),
-        output_names=list(outputs[GATHER_EMBEDDINGS_FUNCTION_NAME]),
-        entrypoint_name=GATHER_EMBEDDINGS_FUNCTION_NAME,
-    )
-
-    input_names = list(names[EXTEND_FUNCTION_NAME])
-    state_names = list(states[EXTEND_FUNCTION_NAME])
-    output_names = list(outputs[EXTEND_FUNCTION_NAME])
-
-    entrypoints: list[tuple[str, int]] = []  # (entrypoint_name, ctx)
-    for ctx, extend_program, prompt_program in ladder:
-        extend_name = f"{EXTEND_FUNCTION_NAME}_{ctx}"
-        prompt_name = f"{PROMPT_OPT_FUNCTION_NAME}_{ctx}"
+    for name, graph, _, program in programs:
         converter.add_exported_program(
-            extend_program,
-            input_names=input_names,
-            state_names=state_names,
-            output_names=output_names,
-            entrypoint_name=extend_name,
+            program,
+            input_names=list(inputs[graph]),
+            state_names=list(states[graph]),
+            output_names=list(outputs[graph]),
+            entrypoint_name=name,
         )
-        converter.add_exported_program(
-            prompt_program,
-            input_names=input_names,
-            state_names=state_names,
-            output_names=output_names,
-            entrypoint_name=prompt_name,
-        )
-        entrypoints.append((extend_name, ctx))
-        entrypoints.append((prompt_name, ctx))
 
     coreai_program: AIProgram = converter.to_coreai()
 
-    # ----- Static shape configs (query-length specialization within each bucket) -----
-    extend_qlens = _extend_query_lengths(dev)
-    prompt_qlens = _prompt_query_lengths(dev)
-    gather_qlens = sorted(set(extend_qlens) | set(prompt_qlens))
-    gather_static_cfg = {
-        f'"{q_len}"': {TOKEN_IDS_INPUT_NAME: (1, q_len)} for q_len in gather_qlens
-    }
-    coreai_program.set_static_shape_config(
-        GATHER_EMBEDDINGS_FUNCTION_NAME, gather_static_cfg
-    )
-
-    def _forward_static_cfg(ctx: int, q_lens: list[int]) -> dict:
-        cfg_by_q: dict[str, dict[str, tuple[int, ...]]] = {}
-        for q_len in q_lens:
-            cfg = {
-                TRANSFORMER_INPUT_NAME: (1, q_len, 1, hidden_size),
-                ROPE_COS_INPUT_NAME: (1, q_len, rope_width),
-                ROPE_SIN_INPUT_NAME: (1, q_len, rope_width),
-                CAUSAL_MASK_INPUT_NAME: (1, ctx, 1, q_len),
-                KEY_CACHE_INPUT_NAME: (
-                    n_global_storing,
-                    1,
-                    kv_cached_embed_size,
-                    1,
-                    ctx,
-                ),
-                VALUE_CACHE_INPUT_NAME: (
-                    n_global_storing,
-                    1,
-                    kv_cached_embed_size,
-                    1,
-                    ctx,
-                ),
-                SLIDING_CAUSAL_MASK_INPUT_NAME: (1, sliding_ring, 1, q_len),
-                SLIDING_KEY_CACHE_INPUT_NAME: (
-                    n_sliding_storing,
-                    1,
-                    sliding_channels,
-                    1,
-                    sliding_ring,
-                ),
-                SLIDING_VALUE_CACHE_INPUT_NAME: (
-                    n_sliding_storing,
-                    1,
-                    sliding_channels,
-                    1,
-                    sliding_ring,
-                ),
-                PLE_EMBEDDINGS_INPUT_NAME: (1, q_len, 1, ple_total_dim),
-            }
-            cfg_by_q[f'"{q_len}"'] = cfg
-        return cfg_by_q
-
-    # ----- Hardware constraints (per-bucket ctx; channel interleave + seq-stride) -----
-    emb_table_constraints = HardwareConstraints(
-        AllocationType.IOSurface, interleave=[8, 1, 1], alignments=[1, 1, 1, 1]
-    )
-    sliding_cache_constraints = HardwareConstraints(
-        AllocationType.IOSurface,
-        interleave=[1, 1, KV_CACHE_INTERLEAVE_FACTOR, 1, 1],
-        alignments=[1, 1, 1, 1, KV_CACHE_INTERLEAVE_FACTOR * sliding_ring, 1],
-    )
-
-    def _forward_constraints(ctx: int) -> dict:
-        # Per-bucket seq-stride alignment = THIS bucket's ctx (channel stride =
-        # ctx*interleave). The runner right-sizes/grows the global KV cache to match
-        # the running bucket's ctx exactly; the sliding ring is fixed-size.
-        cache_constraints = HardwareConstraints(
-            AllocationType.IOSurface,
-            interleave=[1, 1, KV_CACHE_INTERLEAVE_FACTOR, 1, 1],
-            alignments=[1, 1, 1, 1, KV_CACHE_INTERLEAVE_FACTOR * ctx, 1],
-        )
-        return {
-            EMBEDDING_TABLE_INPUT_NAME: emb_table_constraints,
-            KEY_CACHE_INPUT_NAME: cache_constraints,
-            KEY_CACHE_OUTPUT_NAME: cache_constraints,
-            VALUE_CACHE_INPUT_NAME: cache_constraints,
-            VALUE_CACHE_OUTPUT_NAME: cache_constraints,
-            SLIDING_KEY_CACHE_INPUT_NAME: sliding_cache_constraints,
-            SLIDING_KEY_CACHE_OUTPUT_NAME: sliding_cache_constraints,
-            SLIDING_VALUE_CACHE_INPUT_NAME: sliding_cache_constraints,
-            SLIDING_VALUE_CACHE_OUTPUT_NAME: sliding_cache_constraints,
-        }
-
-    gather_constraints = {EMBEDDING_TABLE_INPUT_NAME: emb_table_constraints}
-    load_constraints = {EMBEDDING_TABLE_INPUT_NAME: emb_table_constraints}
+    for name, graph, ctx, _ in programs:
+        constraints = model.export_hardware_constraints(ctx)[graph]
+        if constraints:
+            coreai_program.set_hardware_constraints(name, constraints)
 
     logger.info("Applying optimization passes...")
-    coreai_program.set_hardware_constraints(
-        LOAD_EMBEDDINGS_FUNCTION_NAME, load_constraints
-    )
-    coreai_program.set_hardware_constraints(
-        GATHER_EMBEDDINGS_FUNCTION_NAME, gather_constraints
-    )
-    for entrypoint_name, ctx in entrypoints:
-        q_lens = (
-            prompt_qlens
-            if entrypoint_name.startswith(PROMPT_OPT_FUNCTION_NAME)
-            else extend_qlens
-        )
-        coreai_program.set_static_shape_config(
-            entrypoint_name, _forward_static_cfg(ctx, q_lens)
-        )
-        coreai_program.set_hardware_constraints(
-            entrypoint_name, _forward_constraints(ctx)
-        )
     coreai_program.optimize()
 
     return coreai_program
 
 
 async def _export_blocked_ladder(
-    model: torch.nn.Module,
+    model: Gemma4ForCausalLMForiOS,
     config,
     max_context_length: int,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
     dev: DevOverrides = DevOverrides(),
 ) -> AIProgram:
     """Export the Gemma4 model as a per-context blocked-flash ladder AIProgram."""
-    head_dim = config.head_dim
-    global_head_dim = config.global_head_dim
-    n_kv = config.num_key_value_heads
-
-    block_size = model.extend.model.kv_block_size
     buckets = context_ladder(max_context_length, dev)
-    logger.info(
-        f"iOS flat-cache context ladder: block_size={block_size} contexts={buckets}"
-    )
-
-    decomp_table = _ios_decomp_table()
-    ladder: list = []
-    gather_program = None
-    load_program = None
-    for ctx in buckets:
-        logger.info(
-            f"Exporting context bucket: ctx={ctx} "
-            f"(flash chunks={(ctx + block_size - 1) // block_size})..."
-        )
-        inputs = _build_ios_reference_inputs(model, config, max_context_length, ctx)
-        extend_program, prompt_program = _export_forward_pair(
-            model,
-            inputs["forward_inputs"],
-            inputs["forward_dynamic_shapes"],
-            decomp_table,
-        )
-        ladder.append((ctx, extend_program, prompt_program))
-        if gather_program is None:
-            gather_program, load_program = _export_aux_programs(
-                model,
-                inputs["embed_tokens_inputs"],
-                inputs["embed_tokens_dynamic_shapes"],
-            )
-
-    return await _convert_blocked_ladder_to_coreai(
-        ladder=ladder,
-        gather_embeddings_program=gather_program,
-        load_embeddings_program=load_program,
-        kv_cached_embed_size=n_kv * global_head_dim,
-        hidden_size=config.hidden_size,
-        ple_total_dim=_ple_total_dim(config),
-        sliding_ring=sliding_ring_size(config.sliding_window, MAX_QUERY_LEN),
-        n_sliding_storing=model.extend.model.n_sliding_storing,
-        sliding_channels=n_kv * head_dim,
-        n_global_storing=model.extend.model.n_global_storing,
-        rope_width=head_dim + global_head_dim,
-        include_debug_info=include_debug_info,
-        dev=dev,
-    )
+    logger.info(f"iOS context ladder: {buckets}")
+    programs = _export_programs(model, config, max_context_length, buckets, dev)
+    return await _convert_to_coreai(model, programs, include_debug_info)
 
 
-def _build_palettization_inputs(
-    model: torch.nn.Module, config, max_context_length: int
+def _palettization_inputs(
+    model: Gemma4ForCausalLMForiOS, config, max_context_length: int
 ) -> tuple:
-    """Construct the forward-trace inputs the palettizer calibrates against.
-
-    Mirrors the blocked-ladder graph contract; the global cache uses the smallest
-    context bucket (calibration only needs representative activations for weight
-    statistics).
-    """
-    batch_size = 1
-    q = _CALIB_QUERY_LEN
-    vocab_size = config.vocab_size
-
-    head_dim = config.head_dim
-    global_head_dim = config.global_head_dim
-    n_kv = config.num_key_value_heads
-    n_global_storing = model.extend.model.n_global_storing
-    n_sliding_storing = model.extend.model.n_sliding_storing
-    sliding_ring = sliding_ring_size(config.sliding_window, MAX_QUERY_LEN)
-    ctx = min(MIN_CONTEXT_LENGTH, max_context_length)
-
-    input_ids = torch.randint(1, vocab_size, (batch_size, q), dtype=torch.int32)
-    in_step = torch.zeros((1,), dtype=torch.int32)
-    sliding_in_step = torch.zeros((1,), dtype=torch.int32)
-    key_cache = torch.zeros(
-        n_global_storing, 1, n_kv * global_head_dim, 1, ctx, dtype=torch.float16
-    )
-    value_cache = key_cache.clone()
-    sliding_key_cache = torch.zeros(
-        n_sliding_storing, 1, n_kv * head_dim, 1, sliding_ring, dtype=torch.float16
-    )
-    sliding_value_cache = sliding_key_cache.clone()
-    causal_mask = torch.zeros(1, ctx, 1, q, dtype=torch.float16)
-    sliding_causal_mask = torch.zeros(1, sliding_ring, 1, q, dtype=torch.float16)
-    rope_width = head_dim + global_head_dim
-    rope_cos = torch.zeros(1, q, rope_width, dtype=torch.float16)
-    rope_sin = torch.zeros(1, q, rope_width, dtype=torch.float16)
-
-    inputs: tuple = (
-        input_ids,
-        rope_cos,
-        rope_sin,
-        in_step,
-        sliding_in_step,
-        causal_mask,
-        sliding_causal_mask,
-        key_cache,
-        value_cache,
-        sliding_key_cache,
-        sliding_value_cache,
-    )
-    ple_embeddings = torch.randint(
-        -128, 127, (batch_size, q, 1, _ple_total_dim(config)), dtype=torch.int8
-    )
-    return (*inputs, ple_embeddings)
+    """The palettizer's calibration inputs: the smallest rung's reference inputs,
+    as ``model.forward``'s positional arguments."""
+    ctx = min(SHIPPING_CONTEXT_LADDER[0], max_context_length)
+    ref = _reference_inputs(model, config, max_context_length, ctx, model.IOS_QUERY_LEN)
+    forward_inputs = {
+        "input_ids": ref[GATHER_EMBEDDINGS_FUNCTION_NAME]["input_ids"],
+        **{
+            k: v
+            for k, v in ref[EXTEND_FUNCTION_NAME].items()
+            if k not in (TRANSFORMER_INPUT_NAME, EMBEDDING_TABLE_INPUT_NAME)
+        },
+    }
+    return model.reference_inputs_as_args(forward_inputs)
 
 
 async def _export_ios(args: argparse.Namespace) -> str:
@@ -898,7 +568,7 @@ async def _export_ios(args: argparse.Namespace) -> str:
         # ---- Palettization (skipped for --compression none) ----
         if palettization_config is not None:
             logger.info(f"Applying palettization ({compression})...")
-            inputs = _build_palettization_inputs(model, hf_config, max_ctx)
+            inputs = _palettization_inputs(model, hf_config, max_ctx)
             model = palettize_pytorch_model(model, inputs, palettization_config)
 
         # ---- Blocked-ladder export ----

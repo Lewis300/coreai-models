@@ -28,8 +28,11 @@ Key differences from other iOS models (Qwen3, Llama):
     attention enables large contexts)
 """
 
+from typing import Any
+
 import torch
 import torch.nn as nn
+from coreai.authoring.types import AllocationType, HardwareConstraints
 from safetensors.torch import save_file
 from typing_extensions import override
 
@@ -47,7 +50,7 @@ from coreai_models._constants import (
     VALUE_CACHE_INPUT_NAME,
     VALUE_CACHE_OUTPUT_NAME,
 )
-from coreai_models.models.base import BaseForCausalLMForiOS
+from coreai_models.models.base import BaseForCausalLMForiOS, TraceSpec
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.quantization import (
     dequantize_per_tensor,
@@ -597,6 +600,13 @@ class Gemma4Extend(nn.Module):
 class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     """Gemma4 iOS text-only CausalLM (extracted from multimodal HF model)."""
 
+    #: Sliding-attention window of the supported checkpoints (E2B, E4B).
+    SLIDING_WINDOW = 512
+
+    #: Sliding-cache ring depth. A class constant because export_hardware_constraints
+    #: gets no config; build_reference_inputs checks the config agrees.
+    SLIDING_RING_SIZE = sliding_ring_size(SLIDING_WINDOW, MAX_QUERY_LEN)
+
     def _init_model(self, config) -> None:
         self.extend = Gemma4Extend(config)
 
@@ -605,7 +615,8 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
     #
     # Gemma 4 keeps the base's four entrypoints but widens the transformer's I/O
     # with precomputed RoPE rows, a sliding-window mask/step/cache pair, and
-    # `ple_embeddings`. The per-bucket shapes live in `models/gemma4/export.py`.
+    # `ple_embeddings`. Each hook describes one ladder rung; `models/gemma4/export.py`
+    # calls them once per (context bucket, query length).
     # ------------------------------------------------------------------
 
     @classmethod
@@ -659,36 +670,117 @@ class Gemma4ForCausalLMForiOS(BaseForCausalLMForiOS):
         }
 
     @override
-    def build_reference_inputs(self, config, target_dtype, spec) -> dict[str, dict]:
-        # Gemma 4 traces one program per context bucket, which this single-graph
-        # signature can't express.
-        raise NotImplementedError(
-            "Gemma 4 builds reference inputs per context bucket; export through "
-            "models/gemma4/export.py rather than coreai_models.export.ios."
+    def build_reference_inputs(
+        self, config, target_dtype: torch.dtype, spec: TraceSpec
+    ) -> dict[str, dict[str, Any]]:
+        """Reference inputs for one ladder rung, traced at fully static shapes.
+
+        ``BlockedSDPA`` unrolls its block loop, so the op count depends on the context
+        length: each (context bucket, query length) pair is its own program, with the
+        caches at ``spec.cache_seq_len`` and ``spec.query_len`` query positions.
+        """
+        if config.sliding_window != self.SLIDING_WINDOW:
+            raise ValueError(
+                f"sliding_window={config.sliding_window}, but the export assumes "
+                f"{self.SLIDING_WINDOW} (see SLIDING_RING_SIZE)."
+            )
+        ctx, query_len = spec.cache_seq_len, spec.query_len
+        head_dim, global_head_dim = config.head_dim, config.global_head_dim
+        n_kv = config.num_key_value_heads
+        ring = self.SLIDING_RING_SIZE
+        rope_width = head_dim + global_head_dim
+
+        embedding_table = self.load_embeddings.embedding_table
+        input_ids = torch.randint(1, config.vocab_size, (1, query_len), dtype=torch.int32)
+        # One graph's reference input is produced by running another.
+        transformer_input = self.gather_embeddings(input_ids, embedding_table)
+
+        key_cache = torch.zeros(
+            self.extend.model.n_global_storing,
+            1,
+            n_kv * global_head_dim,
+            1,
+            ctx,
+            dtype=torch.float16,
         )
+        sliding_key_cache = torch.zeros(
+            self.extend.model.n_sliding_storing,
+            1,
+            n_kv * head_dim,
+            1,
+            ring,
+            dtype=torch.float16,
+        )
+        ple_width = config.num_hidden_layers * config.hidden_size_per_layer_input
+
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {
+                "input_ids": input_ids,
+                "embedding_table": embedding_table,
+            },
+            # Exact signature order of Gemma4Extend.forward.
+            EXTEND_FUNCTION_NAME: {
+                TRANSFORMER_INPUT_NAME: transformer_input,
+                ROPE_COS_INPUT_NAME: torch.zeros(1, query_len, rope_width, dtype=torch.float16),
+                ROPE_SIN_INPUT_NAME: torch.zeros(1, query_len, rope_width, dtype=torch.float16),
+                IN_STEP_INPUT_NAME: torch.zeros((1,), dtype=torch.int32),
+                SLIDING_IN_STEP_INPUT_NAME: torch.zeros((1,), dtype=torch.int32),
+                CAUSAL_MASK_INPUT_NAME: torch.zeros(1, ctx, 1, query_len, dtype=torch.float16),
+                SLIDING_CAUSAL_MASK_INPUT_NAME: torch.zeros(
+                    1, ring, 1, query_len, dtype=torch.float16
+                ),
+                KEY_CACHE_INPUT_NAME: key_cache,
+                VALUE_CACHE_INPUT_NAME: key_cache.clone(),
+                SLIDING_KEY_CACHE_INPUT_NAME: sliding_key_cache,
+                SLIDING_VALUE_CACHE_INPUT_NAME: sliding_key_cache.clone(),
+                EMBEDDING_TABLE_INPUT_NAME: embedding_table,
+                PLE_EMBEDDINGS_INPUT_NAME: torch.randint(
+                    -128, 127, (1, query_len, 1, ple_width), dtype=torch.int8
+                ),
+            },
+        }
 
     @override
-    def build_dynamic_shapes(self, config, spec) -> dict:
-        raise NotImplementedError(
-            "Gemma 4 builds dynamic shapes per context bucket; export through "
-            "models/gemma4/export.py rather than coreai_models.export.ios."
-        )
+    def build_dynamic_shapes(self, config, spec: TraceSpec) -> dict[str, Any]:
+        # Every shape is static; see build_reference_inputs.
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: None,
+            GATHER_EMBEDDINGS_FUNCTION_NAME: None,
+            EXTEND_FUNCTION_NAME: None,
+        }
 
     @classmethod
     @override
     def export_static_shape_configs(cls, config, max_context_length: int) -> dict:
-        raise NotImplementedError(
-            "Gemma 4 builds static shapes per context bucket; export through "
-            "models/gemma4/export.py rather than coreai_models.export.ios."
-        )
+        # Programs are traced at fully static shapes, so nothing to specialize.
+        return {
+            LOAD_EMBEDDINGS_FUNCTION_NAME: {},
+            GATHER_EMBEDDINGS_FUNCTION_NAME: {},
+            EXTEND_FUNCTION_NAME: {},
+        }
 
     @classmethod
     @override
-    def export_hardware_constraints(cls, max_context_length: int) -> dict:
-        raise NotImplementedError(
-            "Gemma 4 builds hardware constraints per context bucket; export through "
-            "models/gemma4/export.py rather than coreai_models.export.ios."
+    def export_hardware_constraints(
+        cls, max_context_length: int
+    ) -> dict[str, dict[str, HardwareConstraints]]:
+        """The base constraints for a ``max_context_length`` global cache, with the
+        sliding ring's caches aligned to the ring depth instead."""
+        constraints = super().export_hardware_constraints(max_context_length)
+        sliding_cache = HardwareConstraints(
+            AllocationType.IOSurface,
+            interleave=[1, 1, cls.KV_CACHE_INTERLEAVE_FACTOR, 1, 1],
+            alignments=[1, 1, 1, 1, cls.KV_CACHE_INTERLEAVE_FACTOR * cls.SLIDING_RING_SIZE, 1],
         )
+        for name in (
+            SLIDING_KEY_CACHE_INPUT_NAME,
+            SLIDING_VALUE_CACHE_INPUT_NAME,
+            SLIDING_KEY_CACHE_OUTPUT_NAME,
+            SLIDING_VALUE_CACHE_OUTPUT_NAME,
+        ):
+            constraints[EXTEND_FUNCTION_NAME][name] = sliding_cache
+        return constraints
 
     def forward(
         self,

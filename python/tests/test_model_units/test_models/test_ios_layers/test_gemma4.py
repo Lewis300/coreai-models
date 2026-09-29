@@ -25,6 +25,8 @@ except Exception:  # pragma: no cover - requires transformers>=5.5
     Gemma4TextConfig = None
     Gemma4ForCausalLM = None
 
+from coreai_models._constants import EXTEND_FUNCTION_NAME  # noqa: E402
+from coreai_models.models.base import TraceSpec  # noqa: E402
 from coreai_models.models.ios.gemma4_text import (  # noqa: E402
     Gemma4ForCausalLMForiOS,
     _compute_kv_layout,
@@ -206,6 +208,34 @@ def _chunked_prefill_logits(ios, hf, cfg, token_ids, q_len, S, ctx):
             )
         out_logits[start : start + q_len] = out.reshape(q_len, cfg.vocab_size)
     return out_logits
+
+
+def test_export_contract_describes_one_rung():
+    """The export hooks describe one fully static (context bucket, query length) rung."""
+    cfg = _make_config()
+    cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW
+    model = _build_ios_model(cfg, dict(Gemma4ForCausalLM(cfg).state_dict()))
+    ctx, q_len, ring = 1024, 8, Gemma4ForCausalLMForiOS.SLIDING_RING_SIZE
+    spec = TraceSpec(max_context_length=4 * ctx, cache_seq_len=ctx, query_len=q_len)
+
+    refs = model.build_reference_inputs(cfg, torch.float16, spec)
+    model.validate_export_contract(refs, model.build_dynamic_shapes(cfg, spec))
+    extend = refs[EXTEND_FUNCTION_NAME]
+    assert extend["key_cache"].shape[-1] == ctx
+    assert extend["sliding_key_cache"].shape[-1] == ring
+    assert extend["causal_mask"].shape == (1, ctx, 1, q_len)
+    assert extend["sliding_causal_mask"].shape == (1, ring, 1, q_len)
+
+    factor = Gemma4ForCausalLMForiOS.KV_CACHE_INTERLEAVE_FACTOR
+    constraints = Gemma4ForCausalLMForiOS.export_hardware_constraints(ctx)[EXTEND_FUNCTION_NAME]
+    for name in ("key_cache", "value_cache"):
+        assert constraints[name].alignments[4] == factor * ctx
+    for name in ("sliding_key_cache", "sliding_value_cache"):
+        assert constraints[name].alignments[4] == factor * ring
+
+    cfg.sliding_window = Gemma4ForCausalLMForiOS.SLIDING_WINDOW // 2
+    with pytest.raises(ValueError, match="sliding_window"):
+        model.build_reference_inputs(cfg, torch.float16, spec)
 
 
 def test_kv_layout_dead_slot_compaction():

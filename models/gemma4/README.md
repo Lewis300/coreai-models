@@ -74,10 +74,10 @@ uv run export.py --model google/gemma-4-E2B-it --max-context-length 8192
 uv run export.py --model google/gemma-4-E2B-it --output-dir ./my-models/
 ```
 
-The export is a per-context blocked ladder of statically-shaped programs: each
-context bucket gets its own `extend_{ctx}` / `prompt_opt_{ctx}` entrypoints,
-further specialized by query length, because the flash block loop is unrolled
-into the graph. A flat global KV cache is paired with a fixed-depth
+The export follows the standard iOS flow (`coreai_models.export.ios`), except
+that each (context bucket, query length) pair is traced as its own fully static
+program, `extend_{ctx}_{q}` / `prompt_opt_{ctx}_{q}`: the blocked attention
+unrolls its block loop, so the graph depends on the context length. A flat global KV cache is paired with a fixed-depth
 sliding-window ring, RoPE arrives precomputed as `rope_cos`/`rope_sin` inputs,
 and the INT8 Per-Layer Embeddings table is written as a sidecar next to the
 asset.
