@@ -131,7 +131,7 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         ),
     ),
     "google/gemma-4-E2B-it": AIModelMetadataFields(
-        author="Gemma Team",
+        author="Google DeepMind",
         license="Apache-2.0",
         model_description=(
             "Gemma 4 E2B IT is a ~5B-parameter instruction-tuned on-device model from "
@@ -140,7 +140,7 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         ),
     ),
     "google/gemma-4-E4B-it": AIModelMetadataFields(
-        author="Gemma Team",
+        author="Google DeepMind",
         license="Apache-2.0",
         model_description=(
             "Gemma 4 E4B IT is a ~8B-parameter instruction-tuned on-device model from "
