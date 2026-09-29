@@ -103,7 +103,11 @@ public struct EngineFactory: Sendable {
             vocabSize: bundle.vocabSize,
             maxContextLength: bundle.maxContextLength,
             serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
+            function: bundle.language.functionMap?.name(for: "main") ?? "main",
+            slidingWindow: bundle.slidingWindow,
+            rope: bundle.rope,
+            states: bundle.states,
+            finalLogitSoftcapping: bundle.finalLogitSoftcapping
         )
         let configData = try JSONEncoder().encode(engineConfig)
         return try await createEngine(config: configData, modelURL: languageModelURL, options: options)
@@ -177,6 +181,10 @@ public struct EngineFactory: Sendable {
         let tokenizer: String
         let function: String
         let modelDefinition: ModelSource.ModelDefinition
+        let slidingWindow: Int?
+        let rope: RoPEConfig?
+        let states: [String: StateKind]?
+        let finalLogitSoftcapping: Double?
     }
 
     /// Parses config data using the unified config handler.
@@ -188,14 +196,20 @@ public struct EngineFactory: Sendable {
             maxContextLength: config.maxContextLength,
             tokenizer: config.tokenizer,
             function: config.function,
-            modelDefinition: config.resolvedModelDefinition
+            modelDefinition: config.resolvedModelDefinition,
+            slidingWindow: config.slidingWindow,
+            rope: config.rope,
+            states: config.states,
+            finalLogitSoftcapping: config.finalLogitSoftcapping
         )
     }
 
     // MARK: - Variant Resolution
 
     /// Resolves the engine variant based on override or auto-detection.
-    private static func resolveVariant(
+    // Internal rather than private so the engine-support tests can pin variant
+    // resolution without a real asset — see EngineSupportTests.
+    static func resolveVariant(
         override: String?,
         detectedStructure: ModelStructure
     ) throws -> Variant {
@@ -294,7 +308,11 @@ public struct EngineFactory: Sendable {
                 modelDefinition: config.modelDefinition
             ),
             serializedModel: [modelURL.lastPathComponent],
-            function: config.function
+            function: config.function,
+            slidingWindow: config.slidingWindow,
+            rope: config.rope,
+            states: config.states,
+            finalLogitSoftcapping: config.finalLogitSoftcapping
         )
 
         modelConfig.applyChunkingOverrides(
@@ -304,13 +322,20 @@ public struct EngineFactory: Sendable {
 
         switch variant {
         case .staticShape:
+            // One engine for every static-shape asset. Models with a sliding-window
+            // ring, precomputed RoPE rows, or externalized per-layer embeddings are
+            // handled by input/state handlers the engine wires up from the asset —
+            // see ``StaticShapeEngine``.
             CLILogger.log("Creating static-shape engine")
             return try await StaticShapeEngine(
                 configuration: modelConfig,
-                preparedModel: preparedModel
+                preparedModel: preparedModel,
+                perLayerEmbeddingsURL:
+                    options.auxiliaryAssets[EngineOptions.AssetKey.perLayerEmbeddings]
             )
 
         case .sequential:
+            warnIfRunnerSoftcapIgnored(modelConfig, engine: "sequential")
             CLILogger.log("Creating CoreAI sequential engine (clean, public API)")
             return try await CoreAISequentialEngine(
                 config: modelConfig,
@@ -319,6 +344,7 @@ public struct EngineFactory: Sendable {
             )
 
         case .pipelined:
+            warnIfRunnerSoftcapIgnored(modelConfig, engine: "pipelined")
             CLILogger.log("Creating CoreAI pipelined engine (GPU)")
             return try await CoreAIPipelinedEngine(
                 config: modelConfig,
@@ -326,6 +352,19 @@ public struct EngineFactory: Sendable {
                 options: options
             )
         }
+    }
+
+    /// Warn when a bundle asks for a runner-side final-logit soft cap on an
+    /// engine that does not apply one.
+    ///
+    /// Only the static-shape engine honors `final_logit_softcapping`; the others
+    /// run models whose graphs cap in-graph. A bundle exported with the cap left
+    /// out would decode uncapped here, which degrades quality without failing.
+    private static func warnIfRunnerSoftcapIgnored(_ config: ModelConfig, engine: String) {
+        guard config.finalLogitSoftcapping != nil else { return }
+        CLILogger.log(
+            "WARNING: final_logit_softcapping is set but the \(engine) engine expects the cap "
+                + "in-graph; the runner-side cap will not be applied.")
     }
 }
 
@@ -366,6 +405,21 @@ public struct EngineOptions: Sendable {
     /// When set, takes precedence over model metadata and engine defaults.
     public let prefillChunkThreshold: Int?
 
+    /// Non-graph artifacts the bundle ships alongside the model asset, keyed by
+    /// the role name under `assets` in `metadata.json`.
+    ///
+    /// Some weights are too large to bake into the graph and are externalized
+    /// into sidecar files — see ``AssetKey``. A role absent here is a sidecar the
+    /// bundle does not ship; engines that require one fail with that as the
+    /// reason rather than searching the bundle directory.
+    public let auxiliaryAssets: [String: URL]
+
+    /// Well-known `assets` roles for sidecar artifacts.
+    public enum AssetKey {
+        /// INT8 per-layer embeddings table (`*_ple.safetensors`).
+        public static let perLayerEmbeddings = "per_layer_embeddings"
+    }
+
     /// Creates an options value with the variant and KV cache settings you specify.
     ///
     /// - Parameters:
@@ -376,18 +430,21 @@ public struct EngineOptions: Sendable {
     ///     Defaults to `nil`.
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
+    ///   - auxiliaryAssets: Sidecar artifact URLs keyed by `assets` role. Defaults to empty.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         kvCacheSize: Int? = nil,
         prefillChunkSize: Int? = nil,
-        prefillChunkThreshold: Int? = nil
+        prefillChunkThreshold: Int? = nil,
+        auxiliaryAssets: [String: URL] = [:]
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
         self.kvCacheSize = kvCacheSize
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
+        self.auxiliaryAssets = auxiliaryAssets
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.
@@ -409,7 +466,7 @@ public struct EngineOptions: Sendable {
 
 extension EngineFactory {
     /// Determines the appropriate engine variant based on model structure.
-    private enum Variant: String, Sendable, CaseIterable {
+    enum Variant: String, Sendable, CaseIterable {
         /// Core AI sequential engine (clean public API rewrite)
         case sequential = "coreai-sequential"
 

@@ -7,6 +7,40 @@ import CoreAIShared
 import Foundation
 import Tokenizers
 
+/// Dual-RoPE parameters for models that precompute cos/sin in the runner (Gemma4
+/// large-context). The graph takes precomputed `rope_cos`/`rope_sin` rows instead
+/// of `position_ids`, so the runner builds the combined sliding+global table rows
+/// per step from these. nil for models that gather RoPE in-graph from `position_ids`.
+public struct RoPEConfig: Codable, Sendable, Equatable {
+    public let slidingHeadDim: Int
+    public let globalHeadDim: Int
+    public let slidingRopeTheta: Double
+    public let globalRopeTheta: Double
+    public let partialRotaryFactor: Double
+
+    public init(
+        slidingHeadDim: Int,
+        globalHeadDim: Int,
+        slidingRopeTheta: Double,
+        globalRopeTheta: Double,
+        partialRotaryFactor: Double
+    ) {
+        self.slidingHeadDim = slidingHeadDim
+        self.globalHeadDim = globalHeadDim
+        self.slidingRopeTheta = slidingRopeTheta
+        self.globalRopeTheta = globalRopeTheta
+        self.partialRotaryFactor = partialRotaryFactor
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case slidingHeadDim = "sliding_head_dim"
+        case globalHeadDim = "global_head_dim"
+        case slidingRopeTheta = "sliding_rope_theta"
+        case globalRopeTheta = "global_rope_theta"
+        case partialRotaryFactor = "partial_rotary_factor"
+    }
+}
+
 /// `language` block of `metadata.json` schema 0.2 — LLM-specific config.
 public struct LanguageConfig: Codable, Sendable, Equatable {
     public let tokenizer: String
@@ -35,6 +69,22 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// Optional chunk threshold override from metadata.json.
     public let prefillChunkThreshold: Int?
 
+    /// Sliding-window size for models with a sliding KV cache (Gemma4). The
+    /// runner uses it to build the windowed `sliding_causal_mask`. nil when the
+    /// model has no sliding-window attention.
+    public let slidingWindow: Int?
+
+    /// Dual-RoPE parameters (Gemma4 large-context). When present, the graph takes
+    /// precomputed `rope_cos`/`rope_sin` and the runner builds the rows from these;
+    /// nil for models that gather RoPE in-graph from `position_ids`.
+    public let rope: RoPEConfig?
+
+    /// Final-logit soft cap `c` for `c · tanh(logits / c)` (Gemma family). Present when
+    /// the export left the cap out of the graph — `tanh` is best run on the CPU rather
+    /// than in the graph — so the runner must apply it on the CPU before sampling. nil
+    /// when the model has no cap, or when the graph already applies it.
+    public let finalLogitSoftcapping: Double?
+
     public init(
         tokenizer: String,
         vocabSize: Int,
@@ -44,7 +94,10 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         vision: VisionConfig? = nil,
         states: [String: StateKind]? = nil,
         prefillChunkSize: Int? = nil,
-        prefillChunkThreshold: Int? = nil
+        prefillChunkThreshold: Int? = nil,
+        slidingWindow: Int? = nil,
+        rope: RoPEConfig? = nil,
+        finalLogitSoftcapping: Double? = nil
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
@@ -55,6 +108,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.states = states
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
+        self.slidingWindow = slidingWindow
+        self.rope = rope
+        self.finalLogitSoftcapping = finalLogitSoftcapping
     }
 
     enum CodingKeys: String, CodingKey {
@@ -67,6 +123,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case states
         case prefillChunkSize = "prefill_chunk_size"
         case prefillChunkThreshold = "prefill_chunk_threshold"
+        case slidingWindow = "sliding_window"
+        case rope
+        case finalLogitSoftcapping = "final_logit_softcapping"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -80,6 +139,9 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.states = try c.decodeIfPresent([String: StateKind].self, forKey: .states)
         self.prefillChunkSize = try c.decodeIfPresent(Int.self, forKey: .prefillChunkSize)
         self.prefillChunkThreshold = try c.decodeIfPresent(Int.self, forKey: .prefillChunkThreshold)
+        self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
+        self.rope = try c.decodeIfPresent(RoPEConfig.self, forKey: .rope)
+        self.finalLogitSoftcapping = try c.decodeIfPresent(Double.self, forKey: .finalLogitSoftcapping)
     }
 
     // MARK: - Additional Stop Tokens

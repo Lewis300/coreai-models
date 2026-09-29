@@ -61,6 +61,34 @@ public struct LanguageBundle: Sendable {
     public var vocabSize: Int { language.vocabSize }
     public var maxContextLength: Int { language.maxContextLength }
 
+    /// Sliding-window size (Gemma4); nil for models without sliding attention.
+    public var slidingWindow: Int? { language.slidingWindow }
+
+    /// Dual-RoPE parameters (Gemma4 large-context); nil when RoPE is gathered
+    /// in-graph from `position_ids`.
+    public var rope: RoPEConfig? { language.rope }
+
+    /// Explicit state classification, when the bundle declares one.
+    public var states: [String: StateKind]? { language.states }
+
+    /// Sidecar artifacts the engine may need, keyed by their role.
+    ///
+    /// Only roles the bundle actually declares are present, so an engine can
+    /// distinguish "not shipped" from "shipped but missing". Each sidecar type
+    /// resolves itself — the bundle asks, rather than knowing where any particular
+    /// artifact lives.
+    public var auxiliaryAssets: [String: URL] {
+        var resolved: [String: URL] = [:]
+        if let url = PerLayerEmbeddings.resolveURL(in: modelBundle) {
+            resolved[EngineOptions.AssetKey.perLayerEmbeddings] = url
+        }
+        return resolved
+    }
+
+    /// Final-logit soft cap the runner must apply on the CPU; nil when the model has
+    /// no cap or the graph applies it itself.
+    public var finalLogitSoftcapping: Double? { language.finalLogitSoftcapping }
+
     /// Raw metadata bytes for passing to engine config parsers.
     public var rawMetadata: Data { modelBundle.raw }
 

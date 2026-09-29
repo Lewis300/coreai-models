@@ -75,7 +75,8 @@ public struct CoreAIRunner {
             variant: engineVariant,
             kvCacheStrategy: kvCacheStrategy,
             prefillChunkSize: resolvedChunkSize,
-            prefillChunkThreshold: resolvedThreshold
+            prefillChunkThreshold: resolvedThreshold,
+            auxiliaryAssets: bundle.auxiliaryAssets
         )
 
         return try await EngineFactory.createEngine(
@@ -100,7 +101,11 @@ public struct CoreAIRunner {
                 modelDefinition: .pyTorch
             ),
             serializedModel: [modelAsset],
-            function: functionName
+            function: functionName,
+            slidingWindow: bundle.slidingWindow,
+            rope: bundle.rope,
+            states: bundle.states,
+            finalLogitSoftcapping: bundle.finalLogitSoftcapping
         )
     }
 }

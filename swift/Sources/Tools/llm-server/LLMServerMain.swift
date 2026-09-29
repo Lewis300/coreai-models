@@ -138,7 +138,8 @@ struct LLMServer: AsyncParsableCommand {
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
-            prefillChunkThreshold: resolvedChunkThreshold
+            prefillChunkThreshold: resolvedChunkThreshold,
+            auxiliaryAssets: bundle.auxiliaryAssets
         )
 
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
@@ -159,7 +160,11 @@ struct LLMServer: AsyncParsableCommand {
             vocabSize: bundle.vocabSize,
             maxContextLength: bundle.maxContextLength,
             serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
+            function: bundle.language.functionMap?.name(for: "main") ?? "main",
+            slidingWindow: bundle.slidingWindow,
+            rope: bundle.rope,
+            states: bundle.states,
+            finalLogitSoftcapping: bundle.finalLogitSoftcapping
         )
         let configData = try JSONEncoder().encode(engineConfig)
         let engine = try await EngineFactory.createEngine(

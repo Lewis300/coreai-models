@@ -462,7 +462,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
-            prefillChunkThreshold: resolvedChunkThreshold
+            prefillChunkThreshold: resolvedChunkThreshold,
+            auxiliaryAssets: bundle.auxiliaryAssets
         )
 
         // Parallel loading: engine compilation + tokenizer are independent.

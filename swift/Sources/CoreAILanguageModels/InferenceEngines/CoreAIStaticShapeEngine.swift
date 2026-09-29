@@ -9,6 +9,27 @@ import Foundation
 import Synchronization
 
 /// Static-shape inference engine using Core AI models.
+///
+/// A static-shape asset is a ladder of statically-shaped programs named
+/// `extend_<ctx>_<qlen>` / `prompt_opt_<ctx>_<qlen>`. This engine picks a rung
+/// per step, fills that rung's inputs, binds the asset's persistent states, and
+/// runs it.
+///
+/// Everything model-specific is delegated rather than branched on:
+///
+/// - **Inputs** come from ``StaticInputHandler``s chosen at init from what the
+///   graph declares plus the bundle config — the standard
+///   ``StaticBucketInputFiller`` for position/mask/step, and optionally
+///   ``DualRoPEInputHandler``, ``SlidingWindowInputHandler``, and per-layer
+///   embeddings. ``StaticInputCoverage`` verifies at load time that the handlers
+///   between them produce every input the graph declares.
+/// - **States** come from a ``StaticStateSet``, which classifies each state as
+///   fixed or per-bucket by inspecting the asset and right-sizes the per-bucket
+///   ones.
+///
+/// So a model with a sliding-window ring cache, precomputed dual-RoPE rows and
+/// externalized per-layer embeddings needs no engine of its own — only the
+/// handlers, which the factory wires up from the asset.
 public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     public typealias ConfigType = ModelConfig
 
@@ -19,6 +40,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private static let logitsOutputName = "out_logits"
     private static let keyCacheName = "key_cache"
     private static let valueCacheName = "value_cache"
+    private static let embeddingTableName = "embedding_table"
+    private static let tokenIDsInputName = "in_new_token_ids"
+    private static let gatheredOutputName = "out_transformer_input"
 
     // MARK: Function name parsing
 
@@ -27,6 +51,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let queryLength: Int
     }
 
+    /// Parses the `<ctx>_<qlen>` suffix shared by `extend_*` and `prompt_opt_*`.
     private static func parseFunctionDimensions(_ name: String) -> FunctionDimensions? {
         let parts = Array(name.split(separator: "_").suffix(2))
         guard parts.count == 2, let ctx = Int(parts[0]), let ql = Int(parts[1]) else { return nil }
@@ -55,7 +80,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var functions: [String: InferenceFunction]
 
     // Available function names by category.
-    // Extend functions are sorted by query length (ascending) for graph selection.
     private let extendFunctionNames: [String]
     private let gatherFunctionNames: Set<String>
 
@@ -65,12 +89,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // Largest query length across all extend functions — used as prefill threshold.
     private let maxQueryLength: Int
 
-    // Fixed size caches shared across all decoding functions.
-    private var keyCache: NDArray
-    private var valueCache: NDArray
+    // Persistent model states, classified and sized from the asset.
+    private let states: StaticStateSet
 
-    // Input handler (fills position_ids, causal_mask, step into pre-allocated buffers)
-    private let inputFiller: StaticBucketInputFiller
+    // Per-step inputs. Handlers fill pre-allocated buffers in place.
+    private let inputHandlers: [any StaticInputHandler]
     private var inputBuffers: InputBuffers
 
     // Number of tokens already processed in the current sequence.
@@ -92,7 +115,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Initialization
 
-    public init(configuration: ModelConfig, preparedModel: PreparedModel) async throws {
+    public init(
+        configuration: ModelConfig,
+        preparedModel: PreparedModel,
+        perLayerEmbeddingsURL: URL? = nil
+    ) async throws {
         self.config = configuration
         self.model = preparedModel.model
         self.functions = [:]
@@ -100,7 +127,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let allNames = model.functionNames
         CLILogger.log("Model loaded: \(allNames.count) functions: \(allNames.sorted())")
 
-        // Categorize functions
         self.extendFunctionNames =
             allNames
             .filter { $0.hasPrefix("extend") || $0.hasPrefix("prompt") }
@@ -110,106 +136,186 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         CLILogger.log(
             "Parsed \(extendFunctionNames.count) decoder functions, \(gatherFunctionNames.count) gather functions")
 
-        // Compute max query length from function names for prefill threshold
-        self.maxQueryLength =
-            extendFunctionNames.compactMap { Self.parseFunctionDimensions($0)?.queryLength }
-            .max() ?? 64
-
-        // Grab largest context length extend function to use the descriptors for allocating largest context length
-        // key/value caches.
-        var largestContextExtend: (name: String, descriptor: InferenceFunctionDescriptor)?
+        // Index every rung of the ladder by its (query length, context) pair, and
+        // every context bucket by one representative descriptor. Both `extend_*`
+        // and `prompt_opt_*` at the same pair declare identical input shapes, so
+        // either may stand in; states come from `extend_*` only.
+        var functionsByKey: [(key: StaticBucketKey, descriptor: InferenceFunctionDescriptor)] = []
+        var descriptorsByContext: [Int: InferenceFunctionDescriptor] = [:]
         for name in extendFunctionNames {
-            let desc = try Self.requireDescriptor(model: model, functionName: name)
-            if Self.contextLength(descriptor: desc, config: configuration) == configuration.maxContextLength {
-                largestContextExtend = (name, desc)
-                break
+            guard let dims = Self.parseFunctionDimensions(name),
+                let descriptor = model.functionDescriptor(for: name)
+            else { continue }
+            functionsByKey.append(
+                (
+                    StaticBucketKey(batchSize: dims.queryLength, contextBucket: dims.contextLength),
+                    descriptor
+                ))
+            if name.hasPrefix("extend"), descriptorsByContext[dims.contextLength] == nil {
+                descriptorsByContext[dims.contextLength] = descriptor
             }
         }
-        guard let (largestExtendName, largestExtendDescriptor) = largestContextExtend else {
+
+        self.maxQueryLength = functionsByKey.map(\.key.batchSize).max() ?? 64
+
+        // Reference rung: the largest context bucket. Used to enumerate states, to
+        // size fixed ones, and to decide which optional handlers this asset needs.
+        guard let largestContext = descriptorsByContext.keys.max(),
+            let referenceDescriptor = descriptorsByContext[largestContext]
+        else {
             throw InferenceRuntimeError.invalidState(
-                "Failed to find an extend function with the max context length of \(configuration.maxContextLength)")
+                "No `extend_<ctx>_<qlen>` functions found — cannot drive a static-shape asset")
+        }
+        if largestContext != configuration.maxContextLength {
+            CLILogger.log(
+                "⚠️ Largest context bucket is \(largestContext) but config declares "
+                    + "max_context_length \(configuration.maxContextLength)")
         }
 
-        // Validate output/state contract against the max-context function
-        try Self.validateIOContract(descriptor: largestExtendDescriptor, functionName: largestExtendName)
+        try Self.validateIOContract(descriptor: referenceDescriptor, contextBucket: largestContext)
+        Self.logCacheLayoutIfRequested(model: model, functionNames: extendFunctionNames)
 
-        // Load embeddings
         self.embeddingTable = try await Self.loadEmbeddingTable(from: model)
 
-        // Allocate KV cache IOSurfaces sized to the max-context descriptor
-        if case .ndArray(let keyCacheDescriptor) = largestExtendDescriptor.stateDescriptor(of: Self.keyCacheName),
-            case .ndArray(let valueCacheDescriptor) = largestExtendDescriptor.stateDescriptor(of: Self.valueCacheName)
-        {
-            self.keyCache = NDArray(descriptor: keyCacheDescriptor)
-            self.valueCache = NDArray(descriptor: valueCacheDescriptor)
+        // States: classified fixed vs per-bucket from the asset itself.
+        self.states = try StaticStateFactory.makeStateSet(
+            descriptorsByContext: descriptorsByContext,
+            referenceDescriptor: referenceDescriptor,
+            stateKinds: configuration.states)
+
+        // Inputs: the standard filler, plus whichever optional handlers the graph asks for.
+        var handlers: [any StaticInputHandler] = []
+
+        let positionIdsName = Self.resolveInputName(
+            from: referenceDescriptor.inputNames, candidates: InputLayout.knownPositionIdNames)
+        let causalMaskName =
+            referenceDescriptor.inputNames.contains("causal_mask") ? "causal_mask" : nil
+        let stepName = Self.resolveInputName(
+            from: referenceDescriptor.inputNames, candidates: Self.knownStepNames)
+        handlers.append(
+            StaticBucketInputFiller(
+                positionIdsName: positionIdsName,
+                causalMaskName: causalMaskName,
+                stepName: stepName,
+                positionIds: positionIdsName.map {
+                    BucketedInputDescriptors.collect($0, from: functionsByKey)
+                } ?? .init([:]),
+                causalMask: causalMaskName.map {
+                    BucketedInputDescriptors.collect($0, from: functionsByKey)
+                } ?? .init([:]),
+                step: stepName.map {
+                    BucketedInputDescriptors.collect($0, from: functionsByKey)
+                } ?? .init([:])
+            ))
+
+        if referenceDescriptor.inputNames.contains(DualRoPEInputHandler.cosInputName) {
+            guard let rope = configuration.rope else {
+                throw InferenceRuntimeError.invalidState(
+                    "Graph declares '\(DualRoPEInputHandler.cosInputName)' but the bundle config "
+                        + "has no `rope` block to build the table from")
+            }
+            CLILogger.log("Input handler: precomputed dual-RoPE rows")
+            handlers.append(
+                DualRoPEInputHandler(
+                    rope: rope,
+                    cosDescriptors: .collect(DualRoPEInputHandler.cosInputName, from: functionsByKey),
+                    sinDescriptors: .collect(DualRoPEInputHandler.sinInputName, from: functionsByKey)))
+        }
+
+        let slidingMask = BucketedInputDescriptors.collect(
+            SlidingWindowInputHandler.maskInputName, from: functionsByKey)
+        let slidingStep = BucketedInputDescriptors.collect(
+            SlidingWindowInputHandler.stepInputName, from: functionsByKey)
+        if !slidingMask.isEmpty || !slidingStep.isEmpty {
+            guard let window = configuration.slidingWindow else {
+                throw InferenceRuntimeError.invalidState(
+                    "Graph declares sliding-window inputs but the bundle config has no "
+                        + "`sliding_window`")
+            }
+            let ringDepth = Self.slidingRingDepth(descriptor: referenceDescriptor)
+            CLILogger.log("Input handler: sliding window \(window), ring depth \(ringDepth)")
+            handlers.append(
+                SlidingWindowInputHandler(
+                    window: window, ringDepth: ringDepth,
+                    maskDescriptors: slidingMask, stepDescriptors: slidingStep))
+        }
+
+        if referenceDescriptor.inputNames.contains(PerLayerEmbeddingsInputHandler.inputName) {
+            guard let url = perLayerEmbeddingsURL else {
+                throw InferenceRuntimeError.invalidState(
+                    "Graph declares '\(PerLayerEmbeddingsInputHandler.inputName)' but no per-layer "
+                        + "embeddings artifact was supplied. The bundle must declare it as "
+                        + "`assets.\(EngineOptions.AssetKey.perLayerEmbeddings)` in metadata.json, "
+                        + "and the caller must pass `bundle.auxiliaryAssets` through "
+                        + "`EngineOptions(auxiliaryAssets:)` — an empty map here usually means the "
+                        + "latter was omitted.")
+            }
+            let table = try PerLayerEmbeddings(contentsOf: url)
             CLILogger.log(
-                "KV cache allocated: key \(keyCacheDescriptor.minimumByteCount) bytes, value \(valueCacheDescriptor.minimumByteCount) bytes (IOSurface)"
-            )
-        } else {
-            throw InferenceRuntimeError.invalidState(
-                "No KV cache state descriptors found — cannot allocate cache buffers")
+                "Input handler: per-layer embeddings (vocab=\(table.vocabSize), "
+                    + "rowWidth=\(table.rowWidth)) from \(url.lastPathComponent)")
+            handlers.append(
+                PerLayerEmbeddingsInputHandler(
+                    table: table,
+                    descriptors: .collect(
+                        PerLayerEmbeddingsInputHandler.inputName, from: functionsByKey)))
         }
 
-        // Discover input names from the largest-context function (position_ids via InputLayout)
-        let positionIdsName = try InputLayout.resolveRequired(
-            from: largestExtendDescriptor.inputNames,
-            candidates: InputLayout.knownPositionIdNames,
-            label: "position_ids"
-        )
-        let maskName: String? =
-            largestExtendDescriptor.inputNames.contains("causal_mask")
-            ? "causal_mask" : nil
-        let stepInputName = Self.resolveInputName(
-            from: largestExtendDescriptor.inputNames, candidates: Self.knownStepNames
-        )
-
-        // Build per-bucket descriptors from ALL extend/prompt functions
-        var bucketDescs: [StaticBucketInputFiller.BucketKey: StaticBucketInputFiller.BucketDescriptors] = [:]
-        for name in extendFunctionNames {
-            let desc = try Self.requireDescriptor(model: model, functionName: name)
-            let ql = Self.queryLength(descriptor: desc, functionName: name)
-            guard let dims = Self.parseFunctionDimensions(name) else { continue }
-            let key = StaticBucketInputFiller.BucketKey(batchSize: ql, contextBucket: dims.contextLength)
-
-            guard case .ndArray(let posDesc) = desc.inputDescriptor(of: positionIdsName) else { continue }
-            let mDesc: NDArrayDescriptor? = maskName.flatMap {
-                if case .ndArray(let d) = desc.inputDescriptor(of: $0) { return d }
-                return nil
-            }
-            let sDesc: NDArrayDescriptor? = stepInputName.flatMap {
-                if case .ndArray(let d) = desc.inputDescriptor(of: $0) { return d }
-                return nil
-            }
-            bucketDescs[key] = .init(positionIds: posDesc, causalMask: mDesc, step: sDesc)
+        // Fail at load time if anything the graph declares has no handler, rather
+        // than feeding it an unwritten buffer and producing NaN at runtime.
+        var engineSupplied: Set<String> = [Self.embeddingTableName]
+        if let transformerInput = Self.resolveInputName(
+            from: referenceDescriptor.inputNames, candidates: Self.knownTransformerInputNames)
+        {
+            engineSupplied.insert(transformerInput)
         }
+        try StaticInputCoverage.verify(
+            handlers: handlers, descriptor: referenceDescriptor, ignoring: engineSupplied)
 
-        self.inputFiller = StaticBucketInputFiller(
-            positionIdsName: positionIdsName,
-            causalMaskName: maskName,
-            stepName: stepInputName,
-            bucketDescriptors: bucketDescs
-        )
+        self.inputHandlers = handlers
         var buffers = InputBuffers()
-        inputFiller.registerBuffers(into: &buffers)
+        for handler in handlers { handler.registerBuffers(into: &buffers) }
         self.inputBuffers = buffers
 
         CLILogger.log("Engine initialized")
     }
 
-    public convenience init(configuration: ModelConfig, modelURL: URL) async throws {
+    public convenience init(
+        configuration: ModelConfig, modelURL: URL, perLayerEmbeddingsURL: URL? = nil
+    ) async throws {
         let preparedModel = try await PreparedModel.prepare(at: modelURL)
-        try await self.init(configuration: configuration, preparedModel: preparedModel)
+        try await self.init(
+            configuration: configuration,
+            preparedModel: preparedModel,
+            perLayerEmbeddingsURL: perLayerEmbeddingsURL)
     }
 
     // MARK: - Initialization Helpers
 
-    private static func requireDescriptor(
-        model: AIModel, functionName: String
-    ) throws -> InferenceFunctionDescriptor {
-        guard let desc = model.functionDescriptor(for: functionName) else {
-            throw InferenceRuntimeError.invalidState("Cannot find descriptor for '\(functionName)'")
+    /// Ring depth `S` for a sliding-window cache: the sequence dimension of the
+    /// sliding key cache. 0 when the asset has no sliding cache.
+    private static func slidingRingDepth(descriptor: InferenceFunctionDescriptor) -> Int {
+        guard case .ndArray(let d) = descriptor.stateDescriptor(of: "sliding_key_cache") else {
+            return 0
         }
-        return desc
+        return d.shape.last ?? 0
+    }
+
+    /// Dumps each bucket's state layout (shape / strides / interleave / bytes).
+    /// Gated by `COREAI_CACHE_LAYOUT_DEBUG`; off by default.
+    private static func logCacheLayoutIfRequested(model: AIModel, functionNames: [String]) {
+        guard ProcessInfo.processInfo.environment["COREAI_CACHE_LAYOUT_DEBUG"] != nil else { return }
+        for name in functionNames {
+            guard let descriptor = model.functionDescriptor(for: name) else { continue }
+            for stateName in descriptor.stateNames {
+                guard case .ndArray(let d) = descriptor.stateDescriptor(of: stateName) else { continue }
+                let interleave =
+                    d.interleaveLayout.map { "(dim \($0.dimension), factor \($0.factor))" } ?? "nil"
+                CLILogger.log(
+                    "CACHE_LAYOUT \(name) \(stateName): shape=\(d.shape) "
+                        + "strides=\(d.preferredStrides) interleave=\(interleave) bytes=\(d.minimumByteCount)")
+            }
+        }
     }
 
     private static func requireFunction(
@@ -222,24 +328,24 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     }
 
     private static func validateIOContract(
-        descriptor: InferenceFunctionDescriptor, functionName: String
+        descriptor: InferenceFunctionDescriptor, contextBucket: Int
     ) throws {
         guard descriptor.outputNames.contains(logitsOutputName) else {
             throw InferenceRuntimeError.invalidState(
-                "Function '\(functionName)' missing required output '\(logitsOutputName)'. "
+                "The ctx \(contextBucket) function is missing required output '\(logitsOutputName)'. "
                     + "Available outputs: \(descriptor.outputNames)")
         }
         if descriptor.stateNames.count == 1 {
             throw InferenceRuntimeError.invalidState(
-                "Function '\(functionName)' has exactly 1 state (\(descriptor.stateNames)) "
-                    + "— expected 0 (internal to model) or 2 (\(keyCacheName), \(valueCacheName))")
+                "The ctx \(contextBucket) function has exactly 1 state (\(descriptor.stateNames)) "
+                    + "— expected 0 (internal to model) or at least 2 (\(keyCacheName), \(valueCacheName))")
         }
         if descriptor.stateNames.count >= 2 {
             guard descriptor.stateNames.contains(keyCacheName),
                 descriptor.stateNames.contains(valueCacheName)
             else {
                 throw InferenceRuntimeError.invalidState(
-                    "Function '\(functionName)' has states \(descriptor.stateNames) "
+                    "The ctx \(contextBucket) function has states \(descriptor.stateNames) "
                         + "but missing required '\(keyCacheName)' and/or '\(valueCacheName)'")
             }
         }
@@ -251,15 +357,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             throw InferenceRuntimeError.invalidState("Cannot load 'load_embeddings'")
         }
 
-        guard case .ndArray(let embeddingDesc) = embeddingFunction.descriptor.outputDescriptor(of: "embedding_table")
+        guard case .ndArray(let embeddingDesc) = embeddingFunction.descriptor.outputDescriptor(of: embeddingTableName)
         else {
             throw InferenceRuntimeError.invalidState(
-                "load_embeddings has no 'embedding_table' ndArray output descriptor")
+                "load_embeddings has no '\(embeddingTableName)' ndArray output descriptor")
         }
         var embeddingArray = NDArray(descriptor: embeddingDesc)
 
         var outputViews = InferenceFunction.MutableViews()
-        outputViews.insert(&embeddingArray, for: "embedding_table")
+        outputViews.insert(&embeddingArray, for: embeddingTableName)
 
         _ = try await embeddingFunction.run(
             inputs: [:],
@@ -289,49 +395,30 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         return desc
     }
 
-    /// Returns the query length for a given function by reading the
-    /// `transformer_input` descriptor's sequence dimension.
+    /// Query length for a function: the sequence dimension of its
+    /// `transformer_input`, falling back to the `_<qlen>` name suffix.
     private func queryLength(of functionName: String) throws -> Int {
         let desc = try functionDescriptor(for: functionName)
-        return Self.queryLength(descriptor: desc, functionName: functionName)
-    }
-
-    private static func queryLength(descriptor: InferenceFunctionDescriptor, functionName: String) -> Int {
-        if let txName = resolveInputName(from: descriptor.inputNames, candidates: knownTransformerInputNames),
-            case .ndArray(let nd) = descriptor.inputDescriptor(of: txName), nd.shape.count >= 2
+        if let txName = Self.resolveInputName(
+            from: desc.inputNames, candidates: Self.knownTransformerInputNames),
+            case .ndArray(let nd) = desc.inputDescriptor(of: txName), nd.shape.count >= 2
         {
             return nd.shape[1]
         }
-        if let dims = parseFunctionDimensions(functionName) { return dims.queryLength }
+        if let dims = Self.parseFunctionDimensions(functionName) { return dims.queryLength }
         return 1
     }
 
-    /// Returns the context length for a given function by reading the
-    /// key_cache state descriptor.
+    /// Context bucket for a function, from its `<ctx>` name component. The name is
+    /// authoritative: it is what selects the rung, and a state's shape need not
+    /// have the context as its largest dimension (a merged dual-head-dim cache has
+    /// more channels than context at the small buckets).
     private func contextLength(of functionName: String) throws -> Int {
-        let desc = try functionDescriptor(for: functionName)
-        return Self.contextLength(descriptor: desc, config: config)
-    }
-
-    private static func contextLength(
-        model: AIModel, functionName: String, config: ModelConfig
-    ) throws -> Int {
-        guard let desc = model.functionDescriptor(for: functionName) else {
-            return config.maxContextLength
+        guard let dims = Self.parseFunctionDimensions(functionName) else {
+            throw InferenceRuntimeError.invalidState(
+                "Cannot parse a context bucket from function name '\(functionName)'")
         }
-        return contextLength(descriptor: desc, config: config)
-    }
-
-    private static func contextLength(
-        descriptor: InferenceFunctionDescriptor, config: ModelConfig
-    ) -> Int {
-        if case .ndArray(let keyDesc) = descriptor.stateDescriptor(of: keyCacheName) {
-            if keyDesc.shape.contains(-1) {
-                return config.maxContextLength
-            }
-            return keyDesc.shape.max() ?? config.maxContextLength
-        }
-        return config.maxContextLength
+        return dims.contextLength
     }
 
     // MARK: - Graph Selection
@@ -339,6 +426,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private func forwardGraph(numInputTokens: Int, currentPosition: Int, isPrefill: Bool) throws -> String {
         var pairs: [(contextLength: Int, queryLength: Int)] = []
         for name in extendFunctionNames {
+            // Only `prompt_opt_*` rungs exist for prefill-sized query lengths; when
+            // decoding, restrict to `extend_*` so selection can't name a rung the
+            // asset doesn't ship.
+            if !isPrefill && !name.hasPrefix("extend") { continue }
             guard let dims = Self.parseFunctionDimensions(name) else { continue }
             pairs.append((dims.contextLength, dims.queryLength))
         }
@@ -428,6 +519,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let usePrefill = remaining > maxQueryLength
             let graphName = try forwardGraph(
                 numInputTokens: remaining, currentPosition: currentPosition, isPrefill: usePrefill)
+            let contextBucket = try contextLength(of: graphName)
+
+            // Lay out per-bucket states for this rung before binding. Bucketed
+            // states carry the written prefix across a re-layout; fixed ones are
+            // a no-op.
+            try states.prepare(
+                contextBucket: contextBucket, writtenTokenCount: processedTokenCount)
 
             let batchSize = try queryLength(of: graphName)
             let batchStartToken = (currentPosition / batchSize) * batchSize
@@ -443,7 +541,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 batchTokens: inputTokens[batchStartToken...batchEndToken],
                 batchSize: batchSize,
                 alignedStep: batchStartToken,
-                tokensInBatch: tokensInBatch
+                contextBucket: contextBucket
             )
             prepareSpan.end()
 
@@ -453,32 +551,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let fn = try loadFunction(named: graphName)
             let desc = try functionDescriptor(for: graphName)
 
-            guard case .ndArray(let keyCacheDescriptor) = desc.stateDescriptor(of: Self.keyCacheName),
-                case .ndArray(let valueCacheDescriptor) = desc.stateDescriptor(of: Self.valueCacheName)
-            else {
-                throw InferenceRuntimeError.invalidState("Missing KV cache state descriptors for '\(graphName)'")
-            }
-
-            // Create MutableRawView using this function's descriptor for shape metadata.
-            // No copy is needed on graph switch because all extend functions share the
-            // same KV cache shape, strides, and interleaveLayout
-            let keyCacheView = keyCache.mutableRawView().slice(at: keyCacheDescriptor.shape.map { 0..<$0 })
-            let valueCacheView = valueCache.mutableRawView().slice(at: valueCacheDescriptor.shape.map { 0..<$0 })
-
-            var states = InferenceFunction.MutableViews()
-            states.insert(keyCacheView, for: Self.keyCacheName)
-            states.insert(valueCacheView, for: Self.valueCacheName)
-            var outputs = try await fn.run(
-                inputs: inputs,
-                states: consume states,
-                outputViews: InferenceFunction.MutableViews()
-            )
+            var outputs = try await runStaticStep(
+                function: fn, descriptor: desc, inputs: inputs, states: states)
 
             let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
             logitsSpan.end()
 
+            Self.logNonFiniteIfRequested(
+                logitsArray, graphName: graphName, step: batchStartToken, isPrefill: usePrefill)
+
             // Extract logits from the last token position.
             if !usePrefill, let logitsArray {
+                let copySpan = InstrumentsProfiler.beginLogitsCopy()
                 let logitsView = logitsArray.view(as: LogitsScalarType.self)
                 guard let logits = logitsView.contiguousElements else {
                     throw InferenceRuntimeError.invalidState(
@@ -488,10 +572,19 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 for i in 0..<config.vocabSize {
                     logitBuffer[i] = logits[offset + i]
                 }
+                copySpan.end()
             }
 
             currentPosition = batchEndToken + 1
             processedTokenCount = currentPosition
+        }
+
+        // Final-logit soft cap. The iOS export leaves `c · tanh(logits / c)` out of the
+        // graph (tanh is best run on the CPU rather than in the graph), so apply it here
+        // — before both the returned logits and the sampler, so parity dumps and the
+        // sampled token see the same capped values the reference implementation produces.
+        if let cap = config.finalLogitSoftcapping {
+            LogitSoftcap.apply(cap: Float(cap), to: &logitBuffer)
         }
 
         let actualLogits = returnsLogits ? logitBuffer : nil
@@ -505,29 +598,48 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Inference Helpers
 
+    /// Scans a step's logits for NaN/Inf. Gated by `COREAI_LOGITS_DEBUG` — used to
+    /// pinpoint the step and rung where a multi-block attention path first blows up.
+    private static func logNonFiniteIfRequested(
+        _ logitsArray: NDArray?, graphName: String, step: Int, isPrefill: Bool
+    ) {
+        guard ProcessInfo.processInfo.environment["COREAI_LOGITS_DEBUG"] != nil,
+            let logitsArray,
+            let elements = logitsArray.view(as: LogitsScalarType.self).contiguousElements
+        else { return }
+        var bad = 0
+        for i in 0..<elements.count {
+            let value = Float(elements[i])
+            if value.isNaN || value.isInfinite { bad += 1 }
+        }
+        CLILogger.log(
+            "LOGITS_DEBUG graph=\(graphName) step=\(step) prefill=\(isPrefill) "
+                + "nan/inf=\(bad)/\(elements.count)")
+    }
+
     private func buildInputs<Tokens: Collection<Int32>>(
         graphName: String,
         batchTokens: Tokens,
         batchSize: Int,
         alignedStep: Int,
-        tokensInBatch: Int
+        contextBucket: Int
     ) async throws -> [String: NDArray] {
         let desc = try functionDescriptor(for: graphName)
-        let contextLength = Self.parseFunctionDimensions(graphName)?.contextLength ?? 0
 
-        // Fill position_ids, causal_mask, step via the handler
         let context = InputContext.static(
             tokens: ArraySlice(batchTokens),
             alignedStep: alignedStep,
             batchSize: batchSize,
-            slidingWindow: nil,
-            contextBucket: contextLength)
-        try inputFiller.fill(context, into: &inputBuffers)
+            slidingWindow: config.slidingWindow,
+            contextBucket: contextBucket)
+        for handler in inputHandlers {
+            try handler.fill(context, into: &inputBuffers)
+        }
         var inputs = inputBuffers.borrowedInputs()
 
         // Pass-through constant embedding table
-        if desc.inputNames.contains("embedding_table") {
-            inputs["embedding_table"] = embeddingTable
+        if desc.inputNames.contains(Self.embeddingTableName) {
+            inputs[Self.embeddingTableName] = embeddingTable
         }
 
         // Gather embeddings for this batch's tokens
@@ -537,7 +649,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState(
                     "No gather function '\(gatherName)' for batch size \(batchSize)")
             }
-            guard let gathered = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize) else {
+            let gatherSpan = InstrumentsProfiler.beginGatherEmbeddings()
+            let gathered = try await runGather(tokenIDs: Array(batchTokens), batchSize: batchSize)
+            gatherSpan.end()
+            guard let gathered else {
                 throw InferenceRuntimeError.invalidState("Gather '\(gatherName)' returned no output")
             }
             inputs[txName] = gathered
@@ -553,12 +668,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let fn = try loadFunction(named: name)
         let desc = try functionDescriptor(for: name)
 
-        // Token IDs input
-        let tokenInputName = "in_new_token_ids"
-        guard let tokenDesc = desc.inputDescriptor(of: tokenInputName),
+        guard let tokenDesc = desc.inputDescriptor(of: Self.tokenIDsInputName),
             case .ndArray(let tokenNDDesc) = tokenDesc
         else {
-            throw InferenceRuntimeError.invalidState("No descriptor for '\(tokenInputName)'")
+            throw InferenceRuntimeError.invalidState("No descriptor for '\(Self.tokenIDsInputName)'")
         }
 
         var tokenArray = NDArray(descriptor: tokenNDDesc)
@@ -566,6 +679,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         guard var tokenSpan = tokenView.contiguousElements else {
             throw InferenceRuntimeError.invalidState("tokenArray has non-contiguous layout")
         }
+        // Zero unused (padding) query slots first: a partial final batch leaves
+        // slots [tokensInBatch..<batchSize] otherwise uninitialized, so they would
+        // gather a garbage token id → garbage query embedding. Padding with token 0
+        // keeps the discarded columns finite (garbage could feed NaN into shared
+        // reductions).
+        for i in 0..<tokenSpan.count { tokenSpan[i] = 0 }
         if tokenNDDesc.shape.count == 2 {
             for i in 0..<min(batchSize, tokenIDs.count) {
                 tokenSpan[i] = tokenIDs[i]
@@ -574,16 +693,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             tokenSpan[0] = tokenIDs[0]
         }
 
-        var inputs: [String: NDArray] = [tokenInputName: tokenArray]
-        inputs["embedding_table"] = embeddingTable
+        var inputs: [String: NDArray] = [Self.tokenIDsInputName: tokenArray]
+        inputs[Self.embeddingTableName] = embeddingTable
 
         var outputs = try await fn.run(
             inputs: inputs,
             outputViews: InferenceFunction.MutableViews()
         )
 
-        let expectedOutput = "out_transformer_input"
-        return outputs.remove(expectedOutput)?.ndArray
+        return outputs.remove(Self.gatheredOutputName)?.ndArray
             ?? outputs.remove(desc.outputNames.first ?? "")?.ndArray
     }
 
@@ -608,6 +726,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         if tokenIndex == 0 {
             processedTokenCount = 0
             history.clear()
+            // Restarting a session reuses the same storage when the bucket is
+            // unchanged, since prepare() early-returns. Zero it so the
+            // zero-on-alloc invariant the state handlers rely on — chunked-flash
+            // reads every key position, including ones past the write cursor —
+            // holds for the new session too.
+            states.reset()
         } else {
             processedTokenCount = tokenIndex
             history.truncate(to: tokenIndex)
