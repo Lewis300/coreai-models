@@ -44,8 +44,6 @@ public struct BucketedInputDescriptors: Sendable {
     /// Every bucket's descriptor, in no particular order.
     public var descriptors: Dictionary<StaticBucketKey, NDArrayDescriptor>.Values { byKey.values }
 
-    public func descriptor(for key: StaticBucketKey) -> NDArrayDescriptor? { byKey[key] }
-
     /// Look up the bucket's descriptor, or throw naming what was available.
     public func require(_ key: StaticBucketKey, input name: String) throws -> NDArrayDescriptor {
         guard let descriptor = byKey[key] else {
@@ -82,7 +80,7 @@ public struct BucketedInputDescriptors: Sendable {
 
 // MARK: - Load-time Coverage Check
 
-public enum StaticInputCoverage {
+enum StaticInputCoverage {
     /// Verify that the engine's handlers together produce every input the model
     /// declares. Called at init so an unhandled input fails loudly at load time
     /// rather than silently feeding an unwritten buffer into the graph.
@@ -93,7 +91,7 @@ public enum StaticInputCoverage {
     ///   - ignoring: Inputs the engine supplies itself (constant pass-throughs
     ///     such as `embedding_table`, or outputs of another graph such as
     ///     `transformer_input`).
-    public static func verify(
+    static func verify(
         handlers: [any StaticInputHandler],
         descriptor: InferenceFunctionDescriptor,
         ignoring: Set<String> = []

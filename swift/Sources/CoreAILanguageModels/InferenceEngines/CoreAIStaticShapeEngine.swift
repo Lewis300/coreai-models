@@ -15,21 +15,8 @@ import Synchronization
 /// per step, fills that rung's inputs, binds the asset's persistent states, and
 /// runs it.
 ///
-/// Everything model-specific is delegated rather than branched on:
-///
-/// - **Inputs** come from ``StaticInputHandler``s chosen at init from what the
-///   graph declares plus the bundle config — the standard
-///   ``StaticBucketInputFiller`` for position/mask/step, and optionally
-///   ``DualRoPEInputHandler``, ``SlidingWindowInputHandler``, and per-layer
-///   embeddings. ``StaticInputCoverage`` verifies at load time that the handlers
-///   between them produce every input the graph declares.
-/// - **States** come from a ``StaticStateSet``, which classifies each state as
-///   fixed or per-bucket by inspecting the asset and right-sizes the per-bucket
-///   ones.
-///
-/// So a model with a sliding-window ring cache, precomputed dual-RoPE rows and
-/// externalized per-layer embeddings needs no engine of its own — only the
-/// handlers, which the factory wires up from the asset.
+/// Inputs come from ``StaticInputHandler``s chosen at init from what the graph
+/// declares, and states from a ``StaticStateSet`` classified from the asset.
 public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     public typealias ConfigType = ModelConfig
 
@@ -173,7 +160,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         try Self.validateIOContract(descriptor: referenceDescriptor, contextBucket: largestContext)
-        Self.logCacheLayoutIfRequested(model: model, functionNames: extendFunctionNames)
 
         self.embeddingTable = try await Self.loadEmbeddingTable(from: model)
 
@@ -299,23 +285,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             return 0
         }
         return d.shape.last ?? 0
-    }
-
-    /// Dumps each bucket's state layout (shape / strides / interleave / bytes).
-    /// Gated by `COREAI_CACHE_LAYOUT_DEBUG`; off by default.
-    private static func logCacheLayoutIfRequested(model: AIModel, functionNames: [String]) {
-        guard ProcessInfo.processInfo.environment["COREAI_CACHE_LAYOUT_DEBUG"] != nil else { return }
-        for name in functionNames {
-            guard let descriptor = model.functionDescriptor(for: name) else { continue }
-            for stateName in descriptor.stateNames {
-                guard case .ndArray(let d) = descriptor.stateDescriptor(of: stateName) else { continue }
-                let interleave =
-                    d.interleaveLayout.map { "(dim \($0.dimension), factor \($0.factor))" } ?? "nil"
-                CLILogger.log(
-                    "CACHE_LAYOUT \(name) \(stateName): shape=\(d.shape) "
-                        + "strides=\(d.preferredStrides) interleave=\(interleave) bytes=\(d.minimumByteCount)")
-            }
-        }
     }
 
     private static func requireFunction(
@@ -521,9 +490,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 numInputTokens: remaining, currentPosition: currentPosition, isPrefill: usePrefill)
             let contextBucket = try contextLength(of: graphName)
 
-            // Lay out per-bucket states for this rung before binding. Bucketed
-            // states carry the written prefix across a re-layout; fixed ones are
-            // a no-op.
+            // Lay out per-bucket states for this rung before binding.
             try states.prepare(
                 contextBucket: contextBucket, writtenTokenCount: processedTokenCount)
 
@@ -556,9 +523,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
             let logitsArray = outputs.remove(Self.logitsOutputName)?.ndArray
             logitsSpan.end()
-
-            Self.logNonFiniteIfRequested(
-                logitsArray, graphName: graphName, step: batchStartToken, isPrefill: usePrefill)
 
             // Extract logits from the last token position.
             if !usePrefill, let logitsArray {
@@ -598,25 +562,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Inference Helpers
 
-    /// Scans a step's logits for NaN/Inf. Gated by `COREAI_LOGITS_DEBUG` — used to
-    /// pinpoint the step and rung where a multi-block attention path first blows up.
-    private static func logNonFiniteIfRequested(
-        _ logitsArray: NDArray?, graphName: String, step: Int, isPrefill: Bool
-    ) {
-        guard ProcessInfo.processInfo.environment["COREAI_LOGITS_DEBUG"] != nil,
-            let logitsArray,
-            let elements = logitsArray.view(as: LogitsScalarType.self).contiguousElements
-        else { return }
-        var bad = 0
-        for i in 0..<elements.count {
-            let value = Float(elements[i])
-            if value.isNaN || value.isInfinite { bad += 1 }
-        }
-        CLILogger.log(
-            "LOGITS_DEBUG graph=\(graphName) step=\(step) prefill=\(isPrefill) "
-                + "nan/inf=\(bad)/\(elements.count)")
-    }
-
     private func buildInputs<Tokens: Collection<Int32>>(
         graphName: String,
         batchTokens: Tokens,
@@ -630,7 +575,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             tokens: ArraySlice(batchTokens),
             alignedStep: alignedStep,
             batchSize: batchSize,
-            slidingWindow: config.slidingWindow,
+            slidingWindow: nil,
             contextBucket: contextBucket)
         for handler in inputHandlers {
             try handler.fill(context, into: &inputBuffers)
@@ -726,11 +671,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         if tokenIndex == 0 {
             processedTokenCount = 0
             history.clear()
-            // Restarting a session reuses the same storage when the bucket is
-            // unchanged, since prepare() early-returns. Zero it so the
-            // zero-on-alloc invariant the state handlers rely on — chunked-flash
-            // reads every key position, including ones past the write cursor —
-            // holds for the new session too.
+            // Same-bucket restarts reuse storage (prepare() early-returns), so
+            // zero it; see StaticStateStorage.reset().
             states.reset()
         } else {
             processedTokenCount = tokenIndex

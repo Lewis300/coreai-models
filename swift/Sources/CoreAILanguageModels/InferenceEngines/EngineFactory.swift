@@ -207,8 +207,7 @@ public struct EngineFactory: Sendable {
     // MARK: - Variant Resolution
 
     /// Resolves the engine variant based on override or auto-detection.
-    // Internal rather than private so the engine-support tests can pin variant
-    // resolution without a real asset — see EngineSupportTests.
+    // Internal for EngineSupportTests.
     static func resolveVariant(
         override: String?,
         detectedStructure: ModelStructure
@@ -322,10 +321,7 @@ public struct EngineFactory: Sendable {
 
         switch variant {
         case .staticShape:
-            // One engine for every static-shape asset. Models with a sliding-window
-            // ring, precomputed RoPE rows, or externalized per-layer embeddings are
-            // handled by input/state handlers the engine wires up from the asset —
-            // see ``StaticShapeEngine``.
+            // Model-specific inputs and states are handled inside the engine.
             CLILogger.log("Creating static-shape engine")
             return try await StaticShapeEngine(
                 configuration: modelConfig,
@@ -335,7 +331,6 @@ public struct EngineFactory: Sendable {
             )
 
         case .sequential:
-            warnIfRunnerSoftcapIgnored(modelConfig, engine: "sequential")
             CLILogger.log("Creating CoreAI sequential engine (clean, public API)")
             return try await CoreAISequentialEngine(
                 config: modelConfig,
@@ -344,7 +339,6 @@ public struct EngineFactory: Sendable {
             )
 
         case .pipelined:
-            warnIfRunnerSoftcapIgnored(modelConfig, engine: "pipelined")
             CLILogger.log("Creating CoreAI pipelined engine (GPU)")
             return try await CoreAIPipelinedEngine(
                 config: modelConfig,
@@ -352,19 +346,6 @@ public struct EngineFactory: Sendable {
                 options: options
             )
         }
-    }
-
-    /// Warn when a bundle asks for a runner-side final-logit soft cap on an
-    /// engine that does not apply one.
-    ///
-    /// Only the static-shape engine honors `final_logit_softcapping`; the others
-    /// run models whose graphs cap in-graph. A bundle exported with the cap left
-    /// out would decode uncapped here, which degrades quality without failing.
-    private static func warnIfRunnerSoftcapIgnored(_ config: ModelConfig, engine: String) {
-        guard config.finalLogitSoftcapping != nil else { return }
-        CLILogger.log(
-            "WARNING: final_logit_softcapping is set but the \(engine) engine expects the cap "
-                + "in-graph; the runner-side cap will not be applied.")
     }
 }
 

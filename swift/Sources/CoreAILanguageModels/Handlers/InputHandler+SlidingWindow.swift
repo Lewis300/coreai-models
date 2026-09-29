@@ -19,11 +19,11 @@ import CoreAIShared
 ///   `window` keys and indexed into the ring by absolute position.
 /// - `sliding_in_step` — the ring write offset, `alignedStep % S`, computed here
 ///   so the graph needs no in-graph remainder op.
-public struct SlidingWindowInputHandler: StaticInputHandler {
-    public static let maskInputName = "sliding_causal_mask"
-    public static let stepInputName = "sliding_in_step"
+struct SlidingWindowInputHandler: StaticInputHandler {
+    static let maskInputName = "sliding_causal_mask"
+    static let stepInputName = "sliding_in_step"
 
-    public let inputNames: [String]
+    let inputNames: [String]
 
     private let maskDescriptors: BucketedInputDescriptors
     private let stepDescriptors: BucketedInputDescriptors
@@ -33,7 +33,7 @@ public struct SlidingWindowInputHandler: StaticInputHandler {
     /// Ring depth `S`, from the sliding cache's sequence dimension.
     private let ringDepth: Int
 
-    public init(
+    init(
         window: Int,
         ringDepth: Int,
         maskDescriptors: BucketedInputDescriptors,
@@ -66,12 +66,12 @@ public struct SlidingWindowInputHandler: StaticInputHandler {
         self.inputNames = names
     }
 
-    public func registerBuffers(into buffers: inout InputBuffers) {
+    func registerBuffers(into buffers: inout InputBuffers) {
         maskDescriptors.registerBuffers(name: Self.maskInputName, into: &buffers)
         stepDescriptors.registerBuffers(name: Self.stepInputName, into: &buffers)
     }
 
-    public func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
+    func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
         let key = StaticBucketKey(batchSize: context.batchSize, contextBucket: context.contextBucket)
 
         if !maskDescriptors.isEmpty {

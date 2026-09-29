@@ -9,12 +9,10 @@ import Foundation
 /// Loads an externalized INT8 Per-Layer Embeddings (PLE) table and gathers
 /// per-token rows to feed the `ple_embeddings` graph input.
 ///
-/// Gemma4 externalizes its per-layer embedding table (one INT8 row of
-/// `numLayers * perLayerDim` values per vocabulary token) into a separate
-/// `*_ple.safetensors` artifact instead of baking the multi-GB table into the
-/// model graph. At inference we mmap the file and copy the rows for the current
-/// batch's tokens into the `ple_embeddings` input; the graph dequantizes them
-/// in-place with the scale/zero-point baked in at export time.
+/// The table (one INT8 row of `numLayers * perLayerDim` values per vocabulary
+/// token) is multiple gigabytes, so the export writes it to a sidecar rather than
+/// into the graph. It is mmapped here; the graph dequantizes the gathered rows
+/// with the scale and zero point baked in at export time.
 ///
 /// ## Safetensors layout
 /// `[8-byte little-endian header length][JSON header][raw tensor bytes]`. The
@@ -32,14 +30,8 @@ struct PerLayerEmbeddings: Sendable {
 
     private static let tensorKey = "embed_tokens_per_layer"
 
-    /// Locates this sidecar in `bundle`, or nil when the bundle doesn't ship one.
-    ///
-    /// Resolution lives here rather than on the bundle so that knowing how a PLE
-    /// table is found stays with the type that knows how to read one. Bundles
-    /// declare it under the standard `assets` role map — the same map
-    /// ``ModelBundle/verify()`` checks — so there is one path, and a bundle that
-    /// omits the role is reported as not shipping the table rather than searched
-    /// for by filename.
+    /// Locates this sidecar through the bundle's `assets` role map, or nil when
+    /// the bundle doesn't ship one.
     static func resolveURL(in bundle: ModelBundle) -> URL? {
         bundle.modelURL(for: EngineOptions.AssetKey.perLayerEmbeddings)
     }

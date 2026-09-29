@@ -71,12 +71,8 @@ public struct LanguageBundle: Sendable {
     /// Explicit state classification, when the bundle declares one.
     public var states: [String: StateKind]? { language.states }
 
-    /// Sidecar artifacts the engine may need, keyed by their role.
-    ///
-    /// Only roles the bundle actually declares are present, so an engine can
-    /// distinguish "not shipped" from "shipped but missing". Each sidecar type
-    /// resolves itself — the bundle asks, rather than knowing where any particular
-    /// artifact lives.
+    /// Sidecar artifacts the engine may need, keyed by `assets` role. Only roles
+    /// the bundle declares are present.
     public var auxiliaryAssets: [String: URL] {
         var resolved: [String: URL] = [:]
         if let url = PerLayerEmbeddings.resolveURL(in: modelBundle) {

@@ -93,9 +93,7 @@ struct BucketedStaticStatePrefixTests {
 
 /// Pins the rule that decides whether a state gets one shared buffer or one per
 /// context bucket, using the real footprints of the two assets that sit on either
-/// side of it. Classifying on declared shape instead of footprint broke every
-/// max-aligned model, so these are regression tests with specific numbers rather
-/// than illustrative ones.
+/// side of it.
 @Suite("StaticStateFactory footprint classification")
 struct StaticStateClassificationTests {
     typealias Layout = StaticStateFactory.StorageLayout

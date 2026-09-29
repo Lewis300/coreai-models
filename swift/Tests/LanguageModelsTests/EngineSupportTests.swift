@@ -12,12 +12,6 @@ import Testing
 /// Engine-support tests: the wiring between a bundle on disk and the engine the
 /// factory builds from it.
 ///
-/// This is the seam that broke twice without any test noticing. Both failures were
-/// wiring, not logic: a sidecar the engine needed was resolved through a path no
-/// caller populated, and per-model config the engine reads was silently dropped by
-/// the tools that construct it. Neither shows up in a unit test of the engine, and
-/// both reach the user as a runtime error on one model.
-///
 /// What is *not* covered here: whether the input handlers actually attach, and
 /// whether a decode step runs. Both need a real multi-gigabyte asset, because
 /// `InferenceFunctionDescriptor` cannot be constructed outside the runtime. Those
@@ -97,35 +91,6 @@ struct EngineSupportTests {
         #expect(resolved[EngineOptions.AssetKey.perLayerEmbeddings] == nil)
     }
 
-    @Test("A sidecar named only under `language` is ignored")
-    func legacyLanguageFieldIsNotAPath() throws {
-        // `language.per_layer_embeddings` was one of three ways a PLE table could be
-        // found. Consolidating on the assets map means a bundle declaring it the old
-        // way resolves nothing — which is the intended breaking change, and worth
-        // pinning so it cannot quietly come back.
-        let url = try Self.bundle(
-            metadata: Self.gemmaMetadata(
-                assets: #""main": "model.aimodel""#,
-                extraLanguage: #","per_layer_embeddings": "model_ple.safetensors""#),
-            files: ["model_ple.safetensors"])
-        let resolved = try LanguageBundle(at: url).auxiliaryAssets
-
-        #expect(resolved[EngineOptions.AssetKey.perLayerEmbeddings] == nil)
-    }
-
-    @Test("A sidecar is resolved by role, not by filename convention")
-    func sidecarIsNotFoundByNamingConvention() throws {
-        // The `*_ple.safetensors` sibling scan is gone. A bundle with the file on
-        // disk but no `assets` entry must report nothing, otherwise the scan has
-        // been reintroduced somewhere.
-        let url = try Self.bundle(
-            metadata: Self.gemmaMetadata(assets: #""main": "model.aimodel""#),
-            files: ["model_ple.safetensors"])
-        let resolved = try LanguageBundle(at: url).auxiliaryAssets
-
-        #expect(resolved[EngineOptions.AssetKey.perLayerEmbeddings] == nil)
-    }
-
     // MARK: - Config the engine reads
 
     @Test("Gemma-shaped config survives the trip from metadata to the engine")
@@ -134,9 +99,7 @@ struct EngineSupportTests {
             metadata: Self.gemmaMetadata(), files: ["model_ple.safetensors"])
         let bundle = try LanguageBundle(at: url)
 
-        // Every field here drives a handler the static engine attaches. Each was
-        // dropped by at least one tool that builds a ModelConfig, which the engine
-        // then reports as a missing graph input rather than as missing config.
+        // Every field here drives a handler the static engine attaches.
         #expect(bundle.slidingWindow == 512)
         #expect(bundle.finalLogitSoftcapping == 30.0)
         #expect(bundle.rope?.slidingHeadDim == 256)

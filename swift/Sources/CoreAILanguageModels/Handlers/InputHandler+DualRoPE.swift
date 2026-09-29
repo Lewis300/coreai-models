@@ -23,11 +23,11 @@ import Foundation
 /// The combined table is the concatenation `sliding ‖ global`, so `width =
 /// slidingHeadDim + globalHeadDim`. Per-dim frequencies are position-independent
 /// and precomputed once at init; each step only does `width` sincos per token.
-public struct DualRoPEInputHandler: StaticInputHandler {
-    public static let cosInputName = "rope_cos"
-    public static let sinInputName = "rope_sin"
+struct DualRoPEInputHandler: StaticInputHandler {
+    static let cosInputName = "rope_cos"
+    static let sinInputName = "rope_sin"
 
-    public let inputNames: [String] = [cosInputName, sinInputName]
+    let inputNames: [String] = [cosInputName, sinInputName]
 
     private let cosDescriptors: BucketedInputDescriptors
     private let sinDescriptors: BucketedInputDescriptors
@@ -35,7 +35,7 @@ public struct DualRoPEInputHandler: StaticInputHandler {
     /// Per-dim angular frequency, indexed by position in the combined table.
     private let theta: [Double]
 
-    public init(
+    init(
         rope: RoPEConfig,
         cosDescriptors: BucketedInputDescriptors,
         sinDescriptors: BucketedInputDescriptors
@@ -53,7 +53,7 @@ public struct DualRoPEInputHandler: StaticInputHandler {
     /// - Global sub-range: partial rotary — only the first
     ///   `floor(partialRotaryFactor · globalHeadDim / 2)` of the
     ///   `globalHeadDim / 2` frequencies rotate; the rest are 0 (NoPE), repeated twice.
-    public static func buildTheta(_ rope: RoPEConfig) -> [Double] {
+    static func buildTheta(_ rope: RoPEConfig) -> [Double] {
         let slidingHeadDim = rope.slidingHeadDim
         let globalHeadDim = rope.globalHeadDim
         var theta = [Double](repeating: 0, count: slidingHeadDim + globalHeadDim)
@@ -75,17 +75,12 @@ public struct DualRoPEInputHandler: StaticInputHandler {
         return theta
     }
 
-    public func registerBuffers(into buffers: inout InputBuffers) {
+    func registerBuffers(into buffers: inout InputBuffers) {
         cosDescriptors.registerBuffers(name: Self.cosInputName, into: &buffers)
         sinDescriptors.registerBuffers(name: Self.sinInputName, into: &buffers)
     }
 
-    public func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
-        guard !theta.isEmpty else {
-            throw InferenceRuntimeError.invalidState(
-                "Graph takes '\(Self.cosInputName)'/'\(Self.sinInputName)' but the model config "
-                    + "has no rope parameters")
-        }
+    func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
         let key = StaticBucketKey(batchSize: context.batchSize, contextBucket: context.contextBucket)
         let span = InstrumentsProfiler.beginRopeBuild()
 

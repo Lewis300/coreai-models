@@ -8,14 +8,8 @@
 import CoreAI
 import CoreAIShared
 
-/// Gathers INT8 Per-Layer Embedding rows into the `ple_embeddings` graph input.
-///
-/// Models with per-layer embeddings carry one INT8 row of
-/// `numLayers · perLayerDim` values per vocabulary token. That table is multiple
-/// gigabytes, so it is externalized into a sidecar artifact instead of baked into
-/// the graph (see ``PerLayerEmbeddings``); each step the runner copies the rows
-/// for the current batch's tokens into the input and the graph dequantizes them
-/// in place with the scale and zero-point baked in at export time.
+/// Gathers INT8 Per-Layer Embedding rows from the ``PerLayerEmbeddings`` sidecar
+/// into the `ple_embeddings` graph input.
 struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
     static let inputName = "ple_embeddings"
 

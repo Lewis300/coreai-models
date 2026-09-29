@@ -80,9 +80,8 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     /// `position_ids`. nil for models that gather RoPE in-graph.
     public var rope: RoPEConfig?
 
-    /// Explicit state classification from the bundle. Overrides the static-shape
-    /// engine's layout-variance heuristic (see ``StaticStateFactory``) and the
-    /// dynamic engines' ``StateHandlerFactory`` heuristic. nil = infer.
+    /// Explicit state classification from the bundle, which the static-shape
+    /// engine checks against the asset (see ``StaticStateFactory``). nil = infer.
     public var states: [String: StateKind]?
 
     /// Final-logit soft cap `c` for `c · tanh(logits / c)` (Gemma family), applied by the

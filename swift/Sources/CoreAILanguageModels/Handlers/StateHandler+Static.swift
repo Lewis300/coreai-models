@@ -9,64 +9,15 @@ import CoreAI
 import CoreAIShared
 import Foundation
 
-// MARK: - Protocol
-
-/// Persistent model state carried across steps by a static-shape engine.
-///
-/// A static-shape asset is a *ladder* of per-context-bucket programs, and each
-/// bucket's program declares its own state shapes. That makes the static case
-/// different from the dynamic one that ``SyncStateHandler`` serves:
-///
-/// - Binding is per-function. The engine passes the running function's
-///   descriptor so the handler can slice its backing storage down to the shape
-///   that bucket declares.
-/// - Storage may have to be re-laid-out when the running bucket changes. A
-///   state whose shape scales with the context bucket is compiled with per-ctx
-///   sequence strides, so a buffer laid out for one bucket cannot simply be
-///   sliced for another.
-///
-/// Handlers are classes so they own their `NDArray`s at refcount 1 and
-/// `bind(into:for:)` can call `mutableRawView()` without triggering COW.
-public protocol StaticStateHandler: AnyObject {
-    /// Names of the states this handler manages.
-    var stateNames: [String] { get }
-
-    /// Lay out backing storage for `contextBucket`, preserving the first
-    /// `writtenTokenCount` sequence positions.
-    ///
-    /// Called before every step with the bucket the engine is about to run.
-    /// Returns `true` when storage was actually re-laid-out.
-    @discardableResult
-    func prepare(contextBucket: Int, writtenTokenCount: Int) throws -> Bool
-
-    /// Insert this handler's states into `views`, sliced to the shapes
-    /// `descriptor` declares. States the function doesn't declare are skipped.
-    @_lifetime(views: borrow self)
-    func bind(
-        into views: inout InferenceFunction.MutableViews,
-        for descriptor: InferenceFunctionDescriptor
-    )
-
-    /// Zero all backing storage and rewind to the initial layout.
-    func reset()
-}
-
 // MARK: - Shared storage
 
-/// The storage every static state handler owns, plus the two operations that do
-/// not vary between them: binding the arrays into a running function's views, and
-/// zeroing them.
+/// Storage shared by ``FixedStaticState`` and ``BucketedStaticState``: binding
+/// into a running function's views, and zeroing.
 ///
-/// A class, and the sole owner of its `NDArray`s, so ``bind(into:for:)`` calls
-/// `mutableRawView()` at refcount 1 and does not trigger COW. That ownership is
-/// why this is a base class rather than a free function over the dictionary:
-/// passing `[String: NDArray]` by value would bump the refcount and copy a
-/// multi-hundred-megabyte KV cache on every step.
-///
-/// Subclasses differ only in how storage is created and re-laid-out — see
-/// ``FixedStaticState`` and ``BucketedStaticState``.
-public class StaticStateStorage {
-    public let stateNames: [String]
+/// A class that solely owns its `NDArray`s, so ``bind(into:for:)`` takes
+/// `mutableRawView()` at refcount 1 without copying the cache.
+class StaticStateStorage {
+    let stateNames: [String]
 
     /// Backing storage per state. `var` so `bind` can take a mutable raw view.
     var arrays: [String: NDArray]
@@ -83,7 +34,7 @@ public class StaticStateStorage {
     /// allocated at the maximum context binds as the leading `ctx` positions of
     /// itself, with the strides the program was compiled against.
     @_lifetime(views: borrow self)
-    public func bind(
+    func bind(
         into views: inout InferenceFunction.MutableViews,
         for descriptor: InferenceFunctionDescriptor
     ) {
@@ -104,7 +55,7 @@ public class StaticStateStorage {
     /// positions past the write cursor, with an additive mask. Garbage there feeds
     /// `q @ k` and can overflow fp16 to `Inf`, which adding `-40000` cannot
     /// suppress, yielding NaN logits.
-    public func reset() {
+    func reset() {
         for name in stateNames { zeroFillNDArray(&arrays[name]!) }
     }
 }
@@ -123,13 +74,8 @@ public class StaticStateStorage {
 /// strides and declares only the first `ctx` sequence positions. ``bind(into:for:)``
 /// slices to whatever the running function declares, so that case needs no
 /// re-layout — the storage underneath is already the one the program indexes.
-///
-/// Zeroing matters: chunked-flash attention reads *every* key position each step
-/// — including positions past the write cursor — with an additive mask. Garbage
-/// there feeds `q @ k` and can overflow fp16 to `Inf`, which adding `-40000`
-/// cannot suppress, yielding NaN logits.
-public final class FixedStaticState: StaticStateStorage, StaticStateHandler {
-    public init(states: [(name: String, descriptor: NDArrayDescriptor)]) {
+final class FixedStaticState: StaticStateStorage {
+    init(states: [(name: String, descriptor: NDArrayDescriptor)]) {
         var arrays: [String: NDArray] = [:]
         for (name, descriptor) in states {
             var array = NDArray(descriptor: descriptor)
@@ -141,39 +87,24 @@ public final class FixedStaticState: StaticStateStorage, StaticStateHandler {
         }
         super.init(stateNames: states.map(\.name), arrays: arrays)
     }
-
-    /// Nothing to do: one buffer serves every bucket, and `bind` slices it.
-    @discardableResult
-    public func prepare(contextBucket: Int, writtenTokenCount: Int) throws -> Bool { false }
 }
 
 // MARK: - Bucketed
 
 /// Static state whose backing buffer scales with the context bucket.
 ///
-/// Right-sizes: allocates at the session's current bucket rather than the model
-/// maximum, and re-lays-out the written prefix when decode crosses into a larger
-/// bucket. On a ladder like 4096 / 32768 / 131072 that is the difference between
-/// paying for the 131072 cache from the first token and paying for it only once
-/// the conversation actually gets there.
-///
-/// Re-layout is required, not merely an optimization: each bucket's program is
-/// compiled with its own sequence stride (`ctx · interleave`), so a buffer laid
-/// out for one bucket is not a valid slice of another.
-///
-/// ``forwardGraph`` selects the smallest bucket greater than the current
-/// position, so within a session the bucket is monotonic non-decreasing and this
-/// only ever grows. After a reset the first step shrinks it back with nothing to
-/// copy.
-public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
+/// Allocates at the session's current bucket rather than the model maximum, and
+/// re-lays-out the written prefix when the running bucket changes. Each bucket's
+/// program is compiled with its own sequence stride (`ctx · interleave`), so a
+/// buffer laid out for one bucket is not a valid slice of another.
+final class BucketedStaticState: StaticStateStorage {
     /// Context bucket → per-state descriptor for that bucket.
     private let descriptorsByContext: [Int: [String: NDArrayDescriptor]]
-    private let smallestContext: Int
 
     /// The bucket the backing storage is currently laid out for.
-    public private(set) var currentContextBucket: Int
+    private(set) var currentContextBucket: Int
 
-    public enum LayoutError: Error, CustomStringConvertible {
+    enum LayoutError: Error, CustomStringConvertible {
         case noBuckets
         case missingDescriptor(state: String, context: Int)
         case sequenceDimensionNotLast(state: String, context: Int, shape: [Int])
@@ -182,7 +113,7 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
         case unsupportedScalarType(state: String, type: String)
         case inconsistentAcrossBuckets(state: String, context: Int)
 
-        public var description: String {
+        var description: String {
             switch self {
             case .noBuckets:
                 return "BucketedStaticState needs at least one context bucket"
@@ -217,7 +148,7 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
     ///   written-prefix re-layout. Callers must not fall back to allocating at
     ///   the maximum bucket — for a state whose stride scales with ctx, that
     ///   binds a buffer the program will index incorrectly.
-    public init(stateNames: [String], descriptorsByContext: [Int: [String: NDArrayDescriptor]]) throws {
+    init(stateNames: [String], descriptorsByContext: [Int: [String: NDArrayDescriptor]]) throws {
         guard let smallest = descriptorsByContext.keys.min() else { throw LayoutError.noBuckets }
 
         for (context, byName) in descriptorsByContext {
@@ -237,7 +168,6 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
         }
 
         self.descriptorsByContext = descriptorsByContext
-        self.smallestContext = smallest
         self.currentContextBucket = smallest
 
         var arrays: [String: NDArray] = [:]
@@ -288,17 +218,17 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
         }
     }
 
-    // MARK: StaticStateHandler
+    // MARK: Re-layout
 
-    @discardableResult
-    public func prepare(contextBucket: Int, writtenTokenCount: Int) throws -> Bool {
-        guard contextBucket != currentContextBucket else { return false }
+    /// Lay out backing storage for `contextBucket`, preserving the first
+    /// `writtenTokenCount` sequence positions.
+    func prepare(contextBucket: Int, writtenTokenCount: Int) throws {
+        guard contextBucket != currentContextBucket else { return }
         guard let byName = descriptorsByContext[contextBucket] else {
             throw LayoutError.missingDescriptor(state: stateNames.first ?? "", context: contextBucket)
         }
 
-        // Clamp to both layouts: growing is the normal path, but a shrink (after
-        // a reset that left a cursor behind) must not read or write past either end.
+        // Clamp to both layouts so a shrink never reads or writes past either end.
         let copyLength = min(writtenTokenCount, currentContextBucket, contextBucket)
 
         var totalBytes = 0
@@ -317,7 +247,6 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
             "Static state re-laid-out: ctx \(currentContextBucket) → \(contextBucket) "
                 + "(copied \(copyLength) positions, \(totalBytes) bytes across \(stateNames.count) states)")
         currentContextBucket = contextBucket
-        return true
     }
 
     // MARK: Prefix re-layout
@@ -372,35 +301,26 @@ public final class BucketedStaticState: StaticStateStorage, StaticStateHandler {
 
 /// The static states of one asset, split by lifecycle.
 ///
-/// Two concrete slots rather than `[any StaticStateHandler]` because binding is
-/// lifetime-dependent: views inserted from a `for` loop escape the loop
-/// variable's scope, so the handlers have to be named. Classification produces
-/// at most these two groups, so nothing is lost. ``SyncStateHandlerSet`` splits
-/// the dynamic engines' states the same way and for the same reason.
-public struct StaticStateSet {
+/// Two named slots rather than an array: views inserted from a `for` loop would
+/// escape the loop variable's scope.
+struct StaticStateSet {
     /// States whose backing buffer scales with the context bucket, right-sized per session.
-    public let bucketed: BucketedStaticState?
+    let bucketed: BucketedStaticState?
     /// States with one buffer across every bucket, allocated at the maximum.
-    public let fixed: FixedStaticState?
+    let fixed: FixedStaticState?
 
-    public init(bucketed: BucketedStaticState?, fixed: FixedStaticState?) {
+    init(bucketed: BucketedStaticState?, fixed: FixedStaticState?) {
         self.bucketed = bucketed
         self.fixed = fixed
     }
 
-    public var isEmpty: Bool { bucketed == nil && fixed == nil }
-
-    public var stateNames: [String] {
-        (bucketed?.stateNames ?? []) + (fixed?.stateNames ?? [])
-    }
-
-    /// Lay out every handler for the bucket about to run.
-    public func prepare(contextBucket: Int, writtenTokenCount: Int) throws {
+    /// Lay out the bucketed states for the bucket about to run. Fixed states
+    /// need nothing: one buffer serves every bucket, and `bind` slices it.
+    func prepare(contextBucket: Int, writtenTokenCount: Int) throws {
         try bucketed?.prepare(contextBucket: contextBucket, writtenTokenCount: writtenTokenCount)
-        try fixed?.prepare(contextBucket: contextBucket, writtenTokenCount: writtenTokenCount)
     }
 
-    public func reset() {
+    func reset() {
         bucketed?.reset()
         fixed?.reset()
     }
@@ -410,41 +330,26 @@ public struct StaticStateSet {
 
 /// Builds the ``StaticStateSet`` for a static-shape asset.
 ///
-/// Classification is derived from the asset itself: a state whose *backing
-/// buffer* is identical across every context bucket is fixed; a state whose
-/// buffer varies with the bucket is bucketed and gets right-sized storage. That
-/// gives the right answer with no metadata — models whose buckets all share one
-/// cache buffer keep their single max-context allocation, while a per-bucket
-/// ladder is right-sized automatically.
+/// A state whose backing buffer (byte count and strides) is identical across
+/// every context bucket is fixed; one whose buffer varies is bucketed. The
+/// declared shape doesn't decide: a model compiled against one max-context cache
+/// declares a shrinking shape per bucket over the same allocation.
 ///
-/// The buffer, not the declared shape, is what decides. A model compiled against
-/// one max-context cache declares a *shrinking shape* per bucket (`[…, 256]`,
-/// `[…, 512]`, … up to `[…, 4096]`) over unchanging max-context strides and byte
-/// count: every bucket views the same allocation, so it is fixed and binding just
-/// slices it. Classifying that on shape alone would call it bucketed and try to
-/// re-lay-out a buffer that never changes.
-///
-/// `metadata.json`'s `language.states` block biases the heuristic when a model
-/// needs it: `sliding_cache` / `fixed` force fixed. `kv_cache` asserts bucketed
-/// rather than forcing it — whether per-bucket storage is representable at all is
-/// a physical property of the asset, so declaring it on a state whose buffer does
-/// not vary is an export bug and throws at load rather than being honored. Left
-/// to force, a stale or copy-pasted entry would reintroduce exactly the
-/// misclassification the footprint rule exists to prevent.
-public enum StaticStateFactory {
+/// `language.states` in `metadata.json` may declare a state's kind, but the
+/// declaration must agree with the asset or loading throws.
+enum StaticStateFactory {
     /// - Parameters:
     ///   - descriptorsByContext: Context bucket → a representative function
     ///     descriptor for that bucket (any query length; states don't vary with it).
     ///   - referenceDescriptor: The largest-context descriptor, used to enumerate
     ///     state names and to size fixed states.
     ///   - stateKinds: Optional explicit classification from bundle metadata.
-    public static func makeStateSet(
+    static func makeStateSet(
         descriptorsByContext: [Int: InferenceFunctionDescriptor],
         referenceDescriptor: InferenceFunctionDescriptor,
         stateKinds: [String: StateKind]? = nil
     ) throws -> StaticStateSet {
         let names = referenceDescriptor.stateNames
-        guard !names.isEmpty else { return StaticStateSet(bucketed: nil, fixed: nil) }
 
         var bucketedNames: [String] = []
         var fixedStates: [(name: String, descriptor: NDArrayDescriptor)] = []
@@ -545,12 +450,8 @@ public enum StaticStateFactory {
         var strides: [Int]
     }
 
-    /// The classification rule, over plain footprints.
-    ///
-    /// Split out from ``storageVariesByContext(name:descriptorsByContext:)``
-    /// because `InferenceFunctionDescriptor` cannot be constructed in a test —
-    /// which is why this rule went uncovered and regressed. Taking footprints
-    /// keeps it pinnable without a model.
+    /// The classification rule, over plain footprints so it is testable
+    /// without a model (`InferenceFunctionDescriptor` can't be built in a test).
     static func footprintVaries(_ layouts: [StorageLayout]) -> Bool {
         guard let first = layouts.first else { return false }
         return layouts.contains { $0 != first }
