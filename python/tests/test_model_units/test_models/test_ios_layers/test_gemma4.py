@@ -13,7 +13,6 @@ single HF forward (which applies sliding-window attention internally). The key
 case is a prompt longer than both W and S so the ring wraps.
 """
 
-import os
 import tempfile
 
 import pytest
@@ -38,7 +37,6 @@ from coreai_models.models.ios.gemma4_text import (  # noqa: E402
 )
 from coreai_models.primitives.ios.quantization import quantize_per_tensor  # noqa: E402
 from coreai_models.primitives.ios.rope import RoPECache  # noqa: E402
-from tests._runner_infra._deps import _hf_hub_reachable  # noqa: E402
 
 DTYPE = torch.float32
 NEG = float("-inf")
@@ -185,6 +183,21 @@ def _sliding_mask(S, q_len, aligned_step, window):
         for pos in range(max(0, p - window + 1), p + 1):
             m[0, pos % S, 0, i] = 0.0
     return m
+
+
+def _combined_rope(cfg, max_ctx: int, dtype: torch.dtype) -> Gemma4CombinedRoPE:
+    """The dual (sliding + global) RoPE table the runner precomputes and feeds in
+    as ``rope_cos``/``rope_sin`` rows."""
+    return Gemma4CombinedRoPE(
+        sliding_head_dim=cfg.head_dim,
+        global_head_dim=cfg.global_head_dim,
+        max_cache_size=max_ctx,
+        sliding_base=cfg.rope_parameters["sliding_attention"]["rope_theta"],
+        global_base=cfg.rope_parameters["full_attention"]["rope_theta"],
+        partial_rotary_factor=cfg.rope_parameters["full_attention"].get(
+            "partial_rotary_factor", 0.25
+        ),
+    ).to(dtype)
 
 
 def _chunked_prefill_logits(ios, hf, cfg, token_ids, q_len, S, ctx):
@@ -397,182 +410,3 @@ def test_final_logit_softcap_left_to_runner():
     # The cap is monotonic, so it cannot move an argmax — which is why greedy sampling
     # is unaffected by *where* it runs, and only the logit values need the runner's pass.
     assert (ios_logits.argmax(-1) == hf_logits.argmax(-1)).all()
-
-
-# ---------------------------------------------------------------------------
-# Full E2B end-to-end: real weights, HF reference vs our iOS torch model.
-#
-# The tests above run the iOS forward against a tiny synthetic config. This one
-# loads the *real* ``google/gemma-4-E2B-it`` through ``from_hf`` (with fp
-# embeddings, so the compare isn't muddied by INT8 embedding noise) and mimics the
-# Swift runner's chunked prefill — precomputed dual RoPE rows, the flat global
-# cache + sliding ring, and the fp PLE sidecar — then compares per-position logits
-# to a single HuggingFace forward. It is heavy (downloads and loads a ~2B model
-# twice), so it only runs with RUN_GEMMA4_E2B_PARITY=1, plus network, weights and
-# transformers>=5.5.
-# ---------------------------------------------------------------------------
-
-E2B_MODEL_ID = "google/gemma-4-E2B-it"
-
-# Decode (``extend``) query width the export ladder specializes for; also sizes
-# the sliding ring. Matches ``models/gemma4/export.py``.
-_E2B_MAX_QUERY_LEN = 64
-
-
-def _combined_rope(cfg, max_ctx: int, dtype: torch.dtype) -> Gemma4CombinedRoPE:
-    """The dual (sliding + global) RoPE table the runner precomputes and feeds in
-    as ``rope_cos``/``rope_sin`` rows."""
-    return Gemma4CombinedRoPE(
-        sliding_head_dim=cfg.head_dim,
-        global_head_dim=cfg.global_head_dim,
-        max_cache_size=max_ctx,
-        sliding_base=cfg.rope_parameters["sliding_attention"]["rope_theta"],
-        global_base=cfg.rope_parameters["full_attention"]["rope_theta"],
-        partial_rotary_factor=cfg.rope_parameters["full_attention"].get(
-            "partial_rotary_factor", 0.25
-        ),
-    ).to(dtype)
-
-
-def _e2b_prefill_logits(model, rope, cfg, token_ids, q_len, S, ctx, dtype):
-    """Chunked prefill of the real iOS model against persistent caches.
-
-    Returns per-position logits ``(seq, vocab)`` in fp32. Mirrors the Swift runner:
-    flat global cache with a single
-    absolute write offset, a fixed-depth sliding ring, and the fp PLE input built as
-    ``ple_weight[token] * sqrt(ple_dim)``.
-    """
-    n_kv = cfg.num_key_value_heads
-    n_g = model.extend.model.n_global_storing
-    n_s = model.extend.model.n_sliding_storing
-    ple_dim = cfg.hidden_size_per_layer_input
-    ple_total = cfg.num_hidden_layers * ple_dim
-    ple_scale = float(ple_dim) ** 0.5
-    window = cfg.sliding_window
-    seq = len(token_ids)
-
-    key_cache = torch.zeros(n_g, 1, n_kv * cfg.global_head_dim, 1, ctx, dtype=dtype)
-    value_cache = key_cache.clone()
-    skey_cache = torch.zeros(n_s, 1, n_kv * cfg.head_dim, 1, S, dtype=dtype)
-    svalue_cache = skey_cache.clone()
-
-    out_logits = torch.zeros(seq, cfg.vocab_size, dtype=torch.float32)
-    for start in range(0, seq, q_len):
-        chunk = token_ids[start : start + q_len]
-        n_real = len(chunk)
-        if n_real < q_len:  # pad the final partial chunk; padded cols are never read
-            chunk = chunk + [0] * (q_len - n_real)
-        ids = torch.tensor(chunk, dtype=torch.int32).reshape(1, q_len)
-        pos = torch.arange(start, start + q_len, dtype=torch.int32).reshape(1, q_len)
-        rope_cos, rope_sin = rope.gather_cos_sin(pos)
-        in_step = torch.tensor([start], dtype=torch.int32)
-        sliding_in_step = torch.tensor([start % S], dtype=torch.int32)
-        ple_rows = model._ple_weight[torch.tensor(chunk)].to(dtype) * ple_scale
-        ple = ple_rows.reshape(1, q_len, 1, ple_total)
-        with torch.no_grad():
-            out = model(
-                ids,
-                rope_cos,
-                rope_sin,
-                in_step,
-                sliding_in_step,
-                _global_mask(ctx, q_len, start).to(dtype),
-                _sliding_mask(S, q_len, start, window).to(dtype),
-                key_cache,
-                value_cache,
-                skey_cache,
-                svalue_cache,
-                ple,
-            )
-        chunk_logits = out.reshape(q_len, cfg.vocab_size).float()
-        out_logits[start : start + n_real] = chunk_logits[:n_real]
-    return out_logits
-
-
-@pytest.mark.slow
-@pytest.mark.flaky(reruns=0)
-def test_e2b_full_parity_hf_vs_torch():
-    """Real E2B: our iOS torch model's chunked-prefill logits match a HF forward."""
-    if os.environ.get("RUN_GEMMA4_E2B_PARITY") != "1":
-        pytest.skip("set RUN_GEMMA4_E2B_PARITY=1 to download and compare the real E2B")
-    if Gemma4ForCausalLM is None:
-        pytest.skip("gemma4 requires transformers>=5.5")
-    if not _hf_hub_reachable(E2B_MODEL_ID):
-        pytest.skip(f"HuggingFace Hub unreachable for {E2B_MODEL_ID!r}")
-    try:
-        from transformers import AutoConfig, AutoTokenizer
-        from transformers.models.gemma4.modeling_gemma4 import (
-            Gemma4ForConditionalGeneration,
-        )
-    except ImportError as exc:  # pragma: no cover
-        pytest.skip(f"transformers gemma4 symbols unavailable: {exc}")
-
-    dtype = torch.float32  # tightest parity; the shipped path is fp16 + palettized
-    q_len = 8
-    max_ctx = 1024  # smallest shipping bucket; one flash block (< block_size)
-
-    # A short, unambiguous prompt keeps the HF full-attention reference cheap and
-    # the greedy next token deterministic. No chat template so HF and iOS see
-    # identical ids.
-    try:
-        tok = AutoTokenizer.from_pretrained(E2B_MODEL_ID)
-        model = Gemma4ForCausalLMForiOS.from_hf(
-            E2B_MODEL_ID,
-            max_context_length=max_ctx,
-            target_dtype=dtype,
-            disable_embedding_quantization=True,  # fp embeddings -> clean HF parity
-        ).eval()
-    except OSError as exc:  # pragma: no cover - gated/download failures
-        pytest.skip(f"could not load E2B weights: {exc}")
-
-    cfg = model.config
-    token_ids = tok("The capital of France is", return_tensors="pt")["input_ids"][0].tolist()
-    assert len(token_ids) <= max_ctx
-
-    S = sliding_ring_size(cfg.sliding_window, _E2B_MAX_QUERY_LEN)
-    rope = _combined_rope(cfg, max_ctx, dtype)
-    ios_logits = _e2b_prefill_logits(model, rope, cfg, token_ids, q_len, S, max_ctx, dtype)
-    del model  # free the iOS model before loading the HF reference (peak = one model)
-
-    # Match HF's math to what the iOS model actually computes. The iOS decoder doesn't
-    # apply ``final_logit_softcapping`` (it moved to the Swift runner, since ``tanh`` is
-    # best run on the CPU rather than in the graph), so stand in for the runner by
-    # applying the cap to *our* logits below.
-    hf_cfg = AutoConfig.from_pretrained(E2B_MODEL_ID)
-
-    # The cap the Swift runner reads out of bundle metadata and applies on the CPU.
-    final_cap = getattr(cfg, "final_logit_softcapping", None)
-    if final_cap:
-        ios_logits = torch.tanh(ios_logits / final_cap) * final_cap
-
-    hf = Gemma4ForConditionalGeneration.from_pretrained(
-        E2B_MODEL_ID, config=hf_cfg, dtype=dtype
-    ).eval()
-    with torch.no_grad():
-        hf_logits = (
-            hf(
-                input_ids=torch.tensor(token_ids).reshape(1, -1),
-                position_ids=torch.arange(len(token_ids)).reshape(1, -1),
-            )
-            .logits[0]
-            .float()
-        )
-    del hf
-
-    assert ios_logits.shape == hf_logits.shape
-    max_abs = (ios_logits - hf_logits).abs().max().item()
-    agreement = (ios_logits.argmax(-1) == hf_logits.argmax(-1)).float().mean().item()
-
-    # The decode-relevant token (greedy next token) must match exactly.
-    assert ios_logits[-1].argmax() == hf_logits[-1].argmax(), (
-        f"last-token argmax diverged (max_abs={max_abs:.3f}, agreement={agreement:.3f})"
-    )
-    # Per-position top-1 agreement across the whole prompt.
-    assert agreement >= 0.9, (
-        f"per-position top-1 agreement {agreement:.3f} too low (max_abs={max_abs:.3f})"
-    )
-    # Numerical closeness, with the final cap applied above and fp embeddings
-    # (``disable_embedding_quantization``), so the only spread vs HF is fp32
-    # op ordering through the deep stack + the flash online-softmax recurrence. Looser
-    # than the tiny-config's 1e-3 because a real 2B model accumulates more.
-    torch.testing.assert_close(ios_logits, hf_logits, atol=1e-2, rtol=1e-2)
