@@ -176,7 +176,7 @@ struct EngineSupportTests {
 
     @Test("Static-shape on a dynamic asset is rejected")
     func staticShapeOnDynamicRejected() {
-        #expect(throws: (any Error).self) {
+        #expect(throws: InferenceRuntimeError.self) {
             try EngineFactory.resolveVariant(
                 override: "static-shape", detectedStructure: .dynamic)
         }
@@ -184,7 +184,7 @@ struct EngineSupportTests {
 
     @Test("A pipelined override on a static ladder is rejected")
     func pipelinedOnStaticRejected() {
-        #expect(throws: (any Error).self) {
+        #expect(throws: InferenceRuntimeError.self) {
             try EngineFactory.resolveVariant(
                 override: "coreai-pipelined", detectedStructure: .chunkedStatic(batchSize: 8))
         }
@@ -192,7 +192,7 @@ struct EngineSupportTests {
 
     @Test("An unknown variant name is rejected")
     func unknownVariantRejected() {
-        #expect(throws: (any Error).self) {
+        #expect(throws: InferenceRuntimeError.self) {
             try EngineFactory.resolveVariant(
                 override: "not-an-engine", detectedStructure: .dynamic)
         }

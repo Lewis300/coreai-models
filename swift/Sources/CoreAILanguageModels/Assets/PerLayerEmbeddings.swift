@@ -51,7 +51,9 @@ struct PerLayerEmbeddings: Sendable {
     }
 
     init(contentsOf url: URL) throws {
-        let mapped = try Data(contentsOf: url, options: .mappedIfSafe)
+        // Always map: `.mappedIfSafe` silently reads the multi-GB file into memory when
+        // it judges mapping unsafe.
+        let mapped = try Data(contentsOf: url, options: .alwaysMapped)
         guard mapped.count >= 8 else { throw PLEError.tooSmall }
 
         // First 8 bytes: little-endian uint64 JSON header length.
@@ -59,8 +61,9 @@ struct PerLayerEmbeddings: Sendable {
         for i in 0..<8 {
             len |= UInt64(mapped[mapped.startIndex + i]) << (8 * i)
         }
-        let headerLength = Int(len)
-        guard mapped.count >= 8 + headerLength else { throw PLEError.tooSmall }
+        guard let headerLength = Int(exactly: len), headerLength <= mapped.count - 8 else {
+            throw PLEError.tooSmall
+        }
 
         let headerData = mapped.subdata(in: (mapped.startIndex + 8)..<(mapped.startIndex + 8 + headerLength))
         guard
@@ -70,8 +73,9 @@ struct PerLayerEmbeddings: Sendable {
             throw PLEError.missingTensor
         }
         guard
-            let shape = tensorDict["shape"] as? [Int], shape.count == 2,
-            let offsets = tensorDict["data_offsets"] as? [Int], offsets.count == 2
+            let shape = tensorDict["shape"] as? [Int], shape.count == 2, shape.allSatisfy({ $0 > 0 }),
+            let offsets = tensorDict["data_offsets"] as? [Int], offsets.count == 2,
+            (0...mapped.count).contains(offsets[0])
         else {
             throw PLEError.badHeader("missing/invalid shape or data_offsets for \(Self.tensorKey)")
         }
@@ -89,9 +93,9 @@ struct PerLayerEmbeddings: Sendable {
 
         // The tensor data must actually fit in the mapped file — otherwise a
         // valid token id could index past the mmap (SIGBUS) during gather.
-        let expectedBytes = vocabSize * rowWidth  // INT8 => 1 byte/element
-        guard offsets[1] - offsets[0] == expectedBytes,
-            dataStart + expectedBytes <= mapped.count
+        let (expectedBytes, overflow) = vocabSize.multipliedReportingOverflow(by: rowWidth)  // INT8
+        guard !overflow, offsets[1] - offsets[0] == expectedBytes,
+            expectedBytes <= mapped.count - dataStart
         else {
             throw PLEError.badHeader(
                 "PLE tensor data out of bounds: shape \(shape), offsets \(offsets), "

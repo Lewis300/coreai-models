@@ -40,6 +40,11 @@ struct DualRoPEInputHandler: StaticInputHandler {
         cosDescriptors: BucketedInputDescriptors,
         sinDescriptors: BucketedInputDescriptors
     ) throws {
+        for headDim in [rope.slidingHeadDim, rope.globalHeadDim] where headDim <= 0 || headDim % 2 != 0 {
+            throw InferenceRuntimeError.invalidState(
+                "RoPE head dims must be positive and even, got \(rope.slidingHeadDim) / "
+                    + "\(rope.globalHeadDim)")
+        }
         let theta = Self.buildTheta(rope)
         // The combined table is `sliding ‖ global`, so the graph's row width must
         // equal the theta count exactly. A wider row would keep stale pooled-buffer
@@ -94,13 +99,17 @@ struct DualRoPEInputHandler: StaticInputHandler {
     func fill(_ context: InputContext, into buffers: inout InputBuffers) throws {
         let key = StaticBucketKey(batchSize: context.batchSize, contextBucket: context.contextBucket)
         let span = InstrumentsProfiler.beginRopeBuild()
-
-        try fillTable(
-            name: Self.cosInputName, descriptors: cosDescriptors, key: key,
-            context: context, into: &buffers, transform: cos)
-        try fillTable(
-            name: Self.sinInputName, descriptors: sinDescriptors, key: key,
-            context: context, into: &buffers, transform: sin)
+        do {
+            try fillTable(
+                name: Self.cosInputName, descriptors: cosDescriptors, key: key,
+                context: context, into: &buffers, transform: cos)
+            try fillTable(
+                name: Self.sinInputName, descriptors: sinDescriptors, key: key,
+                context: context, into: &buffers, transform: sin)
+        } catch {
+            span.end()
+            throw error
+        }
         span.end()
     }
 
@@ -118,7 +127,7 @@ struct DualRoPEInputHandler: StaticInputHandler {
         let alignedStep = context.alignedStep
         let theta = self.theta
         try buffers.withMutableBuffer(name) { array in
-            array.mutableView(as: LogitsScalarType.self)
+            array.mutableView(as: Float16.self)
                 .withUnsafeMutablePointer { ptr, shape, strides in
                     // shape: (1, q_len, width)
                     for i in 0..<batchSize {
@@ -126,7 +135,7 @@ struct DualRoPEInputHandler: StaticInputHandler {
                         let rowBase = i &* strides[1]
                         for d in 0..<theta.count {
                             let value = transform(position * theta[d])
-                            ptr[rowBase &+ d &* strides[2]] = LogitsScalarType(value)
+                            ptr[rowBase &+ d &* strides[2]] = Float16(value)
                         }
                     }
                 }

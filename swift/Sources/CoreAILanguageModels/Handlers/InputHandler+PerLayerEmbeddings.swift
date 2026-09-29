@@ -44,23 +44,27 @@ struct PerLayerEmbeddingsInputHandler: StaticInputHandler {
         let table = self.table
 
         let span = InstrumentsProfiler.beginPLEGather()
-
-        try buffers.withMutableBuffer(Self.inputName) { array in
-            let view = array.mutableView(as: Int8.self)
-            // The flat row-major gather assumes a contiguous buffer. The
-            // ple_embeddings input is exported without interleave so it is, but
-            // verify rather than silently write to wrong offsets.
-            guard view.isContiguous else {
-                throw InferenceRuntimeError.invalidState(
-                    "ple_embeddings array has non-contiguous layout")
+        do {
+            try buffers.withMutableBuffer(Self.inputName) { array in
+                let view = array.mutableView(as: Int8.self)
+                // The flat row-major gather assumes a contiguous buffer. The
+                // ple_embeddings input is exported without interleave so it is, but
+                // verify rather than silently write to wrong offsets.
+                guard view.isContiguous else {
+                    throw InferenceRuntimeError.invalidState(
+                        "ple_embeddings array has non-contiguous layout")
+                }
+                view.withUnsafeMutablePointer { ptr, _, _ in
+                    // Zero first: a partial final batch leaves the padding slots
+                    // holding the previous step's rows otherwise.
+                    ptr.update(repeating: 0, count: elementCount)
+                    let buffer = UnsafeMutableBufferPointer(start: ptr, count: elementCount)
+                    table.gather(tokenIDs: tokenIDs, batchSize: batchSize, into: buffer)
+                }
             }
-            view.withUnsafeMutablePointer { ptr, _, _ in
-                // Zero first: a partial final batch leaves the padding slots
-                // holding the previous step's rows otherwise.
-                ptr.update(repeating: 0, count: elementCount)
-                let buffer = UnsafeMutableBufferPointer(start: ptr, count: elementCount)
-                table.gather(tokenIDs: tokenIDs, batchSize: batchSize, into: buffer)
-            }
+        } catch {
+            span.end()
+            throw error
         }
         span.end()
     }

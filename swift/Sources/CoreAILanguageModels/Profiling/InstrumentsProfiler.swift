@@ -51,7 +51,7 @@ public enum SignpostCategory: String, Sendable {
     // Engine layer sub-spans of PrepareStep / the logits readout — fine-grained
     // attribution of per-token runner-side (non-graph) work.
     case gatherEmbeddings = "GatherEmbeddings"  // separate embedding-gather graph dispatch
-    case maskBuild = "MaskBuild"  // causal + sliding mask fill
+    case maskBuild = "MaskBuild"  // sliding-window mask fill
     case ropeBuild = "RopeBuild"  // runner-side RoPE cos/sin precompute (Gemma4)
     case pleGather = "PLEGather"  // INT8 per-layer-embedding gather
     case logitsCopy = "LogitsCopy"  // full-vocab logits copy out of the graph output
@@ -671,7 +671,7 @@ public struct InstrumentsProfiler {
         ProfileSpan(category: .gatherEmbeddings, log: Self.log, metadata: [:])
     }
 
-    /// Causal + sliding mask construction for the step.
+    /// Sliding-window mask construction for the step.
     public static func beginMaskBuild() -> ProfileSpan {
         ProfileSpan(category: .maskBuild, log: Self.log, metadata: [:])
     }

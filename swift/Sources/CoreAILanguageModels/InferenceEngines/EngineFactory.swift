@@ -96,6 +96,17 @@ public struct EngineFactory: Sendable {
                 bundle: bundle, languageModelURL: languageModelURL, options: options)
         }
 
+        // The bundle knows its own sidecars; assets passed explicitly still win.
+        let options = EngineOptions(
+            variant: options.variant,
+            kvCacheStrategy: options.kvCacheStrategy,
+            kvCacheSize: options.kvCacheSize,
+            prefillChunkSize: options.prefillChunkSize,
+            prefillChunkThreshold: options.prefillChunkThreshold,
+            auxiliaryAssets: bundle.auxiliaryAssets.merging(options.auxiliaryAssets) { _, explicit in
+                explicit
+            })
+
         // Standard single-asset LLM: build the config and delegate to the asset/URL path.
         let engineConfig = ModelConfig(
             name: bundle.name,

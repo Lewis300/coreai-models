@@ -39,6 +39,9 @@ struct SlidingWindowInputHandler: StaticInputHandler {
         maskDescriptors: BucketedInputDescriptors,
         stepDescriptors: BucketedInputDescriptors
     ) throws {
+        guard window > 0 else {
+            throw InferenceRuntimeError.invalidState("sliding_window must be positive, got \(window)")
+        }
         guard ringDepth > 0 else {
             throw InferenceRuntimeError.invalidState(
                 "Graph declares sliding-window inputs but no `sliding_key_cache` state to size the ring")
@@ -76,39 +79,25 @@ struct SlidingWindowInputHandler: StaticInputHandler {
 
         if !maskDescriptors.isEmpty {
             let span = InstrumentsProfiler.beginMaskBuild()
-            let descriptor = try maskDescriptors.require(key, input: Self.maskInputName)
-            buffers.ensureCapacity(name: Self.maskInputName, descriptor: descriptor)
             let tokensInBatch = context.tokens.count
             let alignedStep = context.alignedStep
             let window = self.window
             let ringDepth = self.ringDepth
-            try buffers.withMutableBuffer(Self.maskInputName) { array in
-                // Mask shape is `(1, S, 1, q_len)`: one row per ring slot. Start
-                // fully masked with the fp16-safe `-inf` sentinel, then unmask, for
-                // each query at position `p = alignedStep + query`, exactly the
-                // in-window causal keys — positions `[max(0, p - window + 1), p]` —
-                // at their ring slots. Because the exporter sizes
-                // `S >= window + q_len - 1`, those `window` positions map to
-                // distinct slots (no collisions) and keys written by later queries
-                // in the same chunk stay masked.
-                array.mutableView(as: LogitsScalarType.self)
-                    .withUnsafeMutablePointer { ptr, shape, strides in
-                        for slot in 0..<ringDepth {
-                            for query in 0..<shape[3] {
-                                let offset = slot &* strides[1] &+ query &* strides[3]
-                                ptr[offset] = causalMaskSentinel
-                            }
+            do {
+                let descriptor = try maskDescriptors.require(key, input: Self.maskInputName)
+                buffers.ensureCapacity(name: Self.maskInputName, descriptor: descriptor)
+                try buffers.withMutableBuffer(Self.maskInputName) { array in
+                    array.mutableView(as: Float16.self)
+                        .withUnsafeMutablePointer { ptr, shape, strides in
+                            Self.fillMask(
+                                ptr, slotStride: strides[1], queryStride: strides[3],
+                                queryColumns: shape[3], ringDepth: ringDepth, window: window,
+                                alignedStep: alignedStep, tokensInBatch: tokensInBatch)
                         }
-                        for query in 0..<tokensInBatch {
-                            let queryPosition = alignedStep + query
-                            let lowerPosition = max(0, queryPosition &- window &+ 1)
-                            for position in lowerPosition...queryPosition {
-                                let slot = position % ringDepth
-                                let offset = slot &* strides[1] &+ query &* strides[3]
-                                ptr[offset] = 0
-                            }
-                        }
-                    }
+                }
+            } catch {
+                span.end()
+                throw error
             }
             span.end()
         }
@@ -119,6 +108,31 @@ struct SlidingWindowInputHandler: StaticInputHandler {
             let offset = context.alignedStep % ringDepth
             try buffers.withMutableBuffer(Self.stepInputName) { array in
                 fillNDArray(&array, as: Int32.self, count: 1) { _ in Int32(offset) }
+            }
+        }
+    }
+
+    /// Fills a `(1, S, 1, q_len)` ring mask. Starts fully masked with the fp16-safe
+    /// `-inf` sentinel, then unmasks, for each query at position `p = alignedStep +
+    /// query`, exactly the in-window causal keys — positions `[max(0, p - window + 1),
+    /// p]` — at their ring slots. Because the exporter sizes `S >= window + q_len - 1`,
+    /// those `window` positions map to distinct slots (no collisions) and keys written by
+    /// later queries in the same chunk stay masked.
+    static func fillMask(
+        _ ptr: UnsafeMutablePointer<Float16>,
+        slotStride: Int, queryStride: Int, queryColumns: Int,
+        ringDepth: Int, window: Int, alignedStep: Int, tokensInBatch: Int
+    ) {
+        for slot in 0..<ringDepth {
+            for query in 0..<queryColumns {
+                ptr[slot &* slotStride &+ query &* queryStride] = causalMaskSentinel
+            }
+        }
+        for query in 0..<tokensInBatch {
+            let queryPosition = alignedStep + query
+            let lowerPosition = max(0, queryPosition &- window &+ 1)
+            for position in lowerPosition...queryPosition {
+                ptr[(position % ringDepth) &* slotStride &+ query &* queryStride] = 0
             }
         }
     }

@@ -39,13 +39,13 @@ public struct BucketedInputDescriptors: Sendable {
         self.byKey = byKey
     }
 
-    public var isEmpty: Bool { byKey.isEmpty }
+    var isEmpty: Bool { byKey.isEmpty }
 
     /// Every bucket's descriptor, in no particular order.
-    public var descriptors: Dictionary<StaticBucketKey, NDArrayDescriptor>.Values { byKey.values }
+    var descriptors: Dictionary<StaticBucketKey, NDArrayDescriptor>.Values { byKey.values }
 
     /// Look up the bucket's descriptor, or throw naming what was available.
-    public func require(_ key: StaticBucketKey, input name: String) throws -> NDArrayDescriptor {
+    func require(_ key: StaticBucketKey, input name: String) throws -> NDArrayDescriptor {
         guard let descriptor = byKey[key] else {
             throw InferenceRuntimeError.invalidState(
                 "No pre-allocated '\(name)' buffer for (batch=\(key.batchSize), "
@@ -55,7 +55,7 @@ public struct BucketedInputDescriptors: Sendable {
     }
 
     /// Pre-allocate a buffer for every bucket's shape.
-    public func registerBuffers(name: String, into buffers: inout InputBuffers) {
+    func registerBuffers(name: String, into buffers: inout InputBuffers) {
         for (_, descriptor) in byKey {
             buffers.preAllocate(name: name, descriptor: descriptor)
         }
@@ -63,7 +63,7 @@ public struct BucketedInputDescriptors: Sendable {
 
     /// Collect one input's descriptor from each bucket's function descriptor.
     /// Buckets whose function doesn't declare the input are omitted.
-    public static func collect(
+    static func collect(
         _ inputName: String,
         from functions: [(key: StaticBucketKey, descriptor: InferenceFunctionDescriptor)]
     ) -> BucketedInputDescriptors {

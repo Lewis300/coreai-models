@@ -26,6 +26,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     private static let logitsOutputName = "out_logits"
     private static let keyCacheName = "key_cache"
+    private static let slidingKeyCacheName = "sliding_key_cache"
     private static let valueCacheName = "value_cache"
     private static let embeddingTableName = "embedding_table"
     private static let tokenIDsInputName = "in_new_token_ids"
@@ -85,6 +86,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // Reused by LogitSoftcap so decode doesn't allocate a vocab-sized buffer per token.
     private var softcapScratch: [Float] = []
+
+    // Sliding-window ring (depth, window), when the asset has one; limits how far the
+    // written prefix can be rewound.
+    private let slidingRing: (depth: Int, window: Int)?
 
     // Number of tokens already processed in the current sequence.
     public private(set) var processedTokenCount: Int = 0
@@ -227,6 +232,9 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 try SlidingWindowInputHandler(
                     window: window, ringDepth: ringDepth,
                     maskDescriptors: slidingMask, stepDescriptors: slidingStep))
+            slidingRing = (ringDepth, window)
+        } else {
+            slidingRing = nil
         }
 
         if referenceDescriptor.inputNames.contains(PerLayerEmbeddingsInputHandler.inputName) {
@@ -234,12 +242,17 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState(
                     "Graph declares '\(PerLayerEmbeddingsInputHandler.inputName)' but no per-layer "
                         + "embeddings artifact was supplied. The bundle must declare it as "
-                        + "`assets.\(EngineOptions.AssetKey.perLayerEmbeddings)` in metadata.json, "
-                        + "and the caller must pass `bundle.auxiliaryAssets` through "
-                        + "`EngineOptions(auxiliaryAssets:)` — an empty map here usually means the "
-                        + "latter was omitted.")
+                        + "`assets.\(EngineOptions.AssetKey.perLayerEmbeddings)` in metadata.json; "
+                        + "EngineFactory.createEngine(bundle:) passes it through.")
             }
             let table = try PerLayerEmbeddings(contentsOf: url)
+            // Token ids outside the table are skipped and gather zero rows, so a table
+            // smaller than the vocabulary would degrade output silently.
+            guard table.vocabSize >= configuration.vocabSize else {
+                throw InferenceRuntimeError.invalidState(
+                    "Per-layer embeddings table has \(table.vocabSize) rows, but the model's "
+                        + "vocabulary is \(configuration.vocabSize)")
+            }
             CLILogger.log(
                 "Input handler: per-layer embeddings (vocab=\(table.vocabSize), "
                     + "rowWidth=\(table.rowWidth)) from \(url.lastPathComponent)")
@@ -258,8 +271,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         {
             engineSupplied.insert(transformerInput)
         }
-        try StaticInputCoverage.verify(
-            handlers: handlers, descriptor: referenceDescriptor, ignoring: engineSupplied)
+        for (_, descriptor) in functionsByKey {
+            try StaticInputCoverage.verify(
+                handlers: handlers, descriptor: descriptor, ignoring: engineSupplied)
+        }
 
         self.inputHandlers = handlers
         var buffers = InputBuffers()
@@ -284,10 +299,30 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     /// Ring depth `S` for a sliding-window cache: the sequence dimension of the
     /// sliding key cache. 0 when the asset has no sliding cache.
     private static func slidingRingDepth(descriptor: InferenceFunctionDescriptor) -> Int {
-        guard case .ndArray(let d) = descriptor.stateDescriptor(of: "sliding_key_cache") else {
+        guard case .ndArray(let d) = descriptor.stateDescriptor(of: Self.slidingKeyCacheName) else {
             return 0
         }
         return d.shape.last ?? 0
+    }
+
+    /// Whether the written prefix can be rewound to `target` positions.
+    ///
+    /// A flat cache always can. A sliding-window ring holds each position `p` at slot
+    /// `p % ringDepth`, so positions written after the rewind point overwrite the
+    /// slots of earlier ones; the next query at `target` still needs the `window - 1`
+    /// keys before it, which survive only while at most `ringDepth - window + 1`
+    /// positions have been written past it.
+    static func ringAllowsRewind(
+        processed: Int, to target: Int, ringDepth: Int, window: Int
+    ) -> Bool {
+        target == 0 || processed - target <= ringDepth - window + 1
+    }
+
+    private func canRewind(to target: Int) -> Bool {
+        guard let slidingRing else { return true }
+        return Self.ringAllowsRewind(
+            processed: processedTokenCount, to: target,
+            ringDepth: slidingRing.depth, window: slidingRing.window)
     }
 
     private static func requireFunction(
@@ -451,8 +486,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 processedTokenCount = 0
                 history.clear()
             } else if processedTokenCount >= input.count {
-                // Extension — rewind for seeding
-                let resetTo = Swift.max(0, commonPrefix - 1)
+                // Extension — rewind for seeding, or replay from the start when a
+                // sliding-window ring no longer holds the keys the rewind needs.
+                let rewindTo = Swift.max(0, commonPrefix - 1)
+                let resetTo = canRewind(to: rewindTo) ? rewindTo : 0
                 processedTokenCount = resetTo
                 history.truncate(to: resetTo)
             }
@@ -529,12 +566,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
             // Extract logits from the last token position.
             if !usePrefill, let logitsArray {
-                let copySpan = InstrumentsProfiler.beginLogitsCopy()
                 let logitsView = logitsArray.view(as: LogitsScalarType.self)
                 guard let logits = logitsView.contiguousElements else {
                     throw InferenceRuntimeError.invalidState(
                         "Logits array has non-contiguous (interleaved) layout — cannot extract values safely")
                 }
+                let copySpan = InstrumentsProfiler.beginLogitsCopy()
                 let offset = (tokensInBatch - 1) * config.vocabSize
                 for i in 0..<config.vocabSize {
                     logitBuffer[i] = logits[offset + i]
@@ -669,6 +706,12 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         _activeToken.withLock {
             $0?.cancel()
             $0 = nil
+        }
+        guard canRewind(to: tokenIndex) else {
+            throw InferenceRuntimeError.invalidState(
+                "reset(to: \(tokenIndex)) needs keys the sliding-window ring has overwritten "
+                    + "(\(processedTokenCount) tokens processed). Use reset(to: 0) and replay "
+                    + "the prefix.")
         }
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
         if tokenIndex == 0 {
