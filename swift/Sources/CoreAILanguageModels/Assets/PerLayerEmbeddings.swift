@@ -11,104 +11,61 @@ import Foundation
 ///
 /// The table (one INT8 row of `numLayers * perLayerDim` values per vocabulary
 /// token) is multiple gigabytes, so the export writes it to a sidecar rather than
-/// into the graph. It is mmapped here; the graph dequantizes the gathered rows
-/// with the scale and zero point baked in at export time.
-///
-/// ## Safetensors layout
-/// `[8-byte little-endian header length][JSON header][raw tensor bytes]`. The
-/// `embed_tokens_per_layer` entry is a 2-D INT8 tensor of shape
-/// `[vocabSize, rowWidth]`.
+/// into the graph: a single-tensor safetensors file holding `embed_tokens_per_layer`,
+/// shaped `[vocabSize, rowWidth]`. It is mapped, not read; the graph dequantizes the
+/// gathered rows with the scale and zero point baked in at export time.
 struct PerLayerEmbeddings: Sendable {
-    /// The mmapped file contents (header + raw INT8 rows).
-    private let data: Data
-    /// Byte offset where the INT8 tensor data begins.
-    private let dataStart: Int
+    private let tensor: SafeTensorsReader
     /// Number of vocabulary rows.
     let vocabSize: Int
     /// INT8 elements per token row (`numLayers * perLayerDim`).
     let rowWidth: Int
 
-    private static let tensorKey = "embed_tokens_per_layer"
+    private static let tensorName = "embed_tokens_per_layer"
 
     enum PLEError: Error, CustomStringConvertible {
-        case tooSmall
-        case badHeader(String)
-        case missingTensor
+        case invalidTable(String)
 
         var description: String {
             switch self {
-            case .tooSmall: return "PLE file is too small to contain a safetensors header"
-            case .badHeader(let m): return "PLE safetensors header invalid: \(m)"
-            case .missingTensor: return "PLE file missing '\(PerLayerEmbeddings.tensorKey)' tensor"
+            case .invalidTable(let message): return "PLE table invalid: \(message)"
             }
         }
     }
 
     init(contentsOf url: URL) throws {
-        // Always map: `.mappedIfSafe` silently reads the multi-GB file into memory when
-        // it judges mapping unsafe.
-        let mapped = try Data(contentsOf: url, options: .alwaysMapped)
-        guard mapped.count >= 8 else { throw PLEError.tooSmall }
-
-        // First 8 bytes: little-endian uint64 JSON header length.
-        var len: UInt64 = 0
-        for i in 0..<8 {
-            len |= UInt64(mapped[mapped.startIndex + i]) << (8 * i)
+        let tensor = try SafeTensorsReader(url: url, singleTensor: Self.tensorName)
+        guard tensor.dtype == "I8" else {
+            throw PLEError.invalidTable("expected INT8 (I8) data, got \(tensor.dtype)")
         }
-        guard let headerLength = Int(exactly: len), headerLength <= mapped.count - 8 else {
-            throw PLEError.tooSmall
+        guard tensor.shape.count == 2 else {
+            throw PLEError.invalidTable("expected a 2-D table, got shape \(tensor.shape)")
         }
-
-        let headerData = mapped.subdata(in: (mapped.startIndex + 8)..<(mapped.startIndex + 8 + headerLength))
-        guard
-            let json = try JSONSerialization.jsonObject(with: headerData) as? [String: Any],
-            let tensorDict = json[Self.tensorKey] as? [String: Any]
-        else {
-            throw PLEError.missingTensor
+        // Every row must lie inside the mapping, or a valid token id could index past
+        // it (SIGBUS) during gather.
+        let (elements, overflow) = tensor.shape[0].multipliedReportingOverflow(by: tensor.shape[1])
+        guard !overflow, elements == tensor.byteCount else {
+            throw PLEError.invalidTable(
+                "shape \(tensor.shape) does not match \(tensor.byteCount) bytes of INT8 data")
         }
-        guard
-            let shape = tensorDict["shape"] as? [Int], shape.count == 2, shape.allSatisfy({ $0 > 0 }),
-            let offsets = tensorDict["data_offsets"] as? [Int], offsets.count == 2,
-            (0...mapped.count).contains(offsets[0])
-        else {
-            throw PLEError.badHeader("missing/invalid shape or data_offsets for \(Self.tensorKey)")
-        }
-        // The bounds check below sizes the tensor at 1 byte/element, which holds
-        // for INT8 alone. State the requirement here so a re-quantized export
-        // fails on its dtype rather than on a byte count that looks arbitrary.
-        guard tensorDict["dtype"] as? String == "I8" else {
-            throw PLEError.badHeader("expected INT8 (I8) data for \(Self.tensorKey)")
-        }
-
-        self.data = mapped
-        self.vocabSize = shape[0]
-        self.rowWidth = shape[1]
-        self.dataStart = 8 + headerLength + offsets[0]
-
-        // The tensor data must actually fit in the mapped file — otherwise a
-        // valid token id could index past the mmap (SIGBUS) during gather.
-        let (expectedBytes, overflow) = vocabSize.multipliedReportingOverflow(by: rowWidth)  // INT8
-        guard !overflow, offsets[1] - offsets[0] == expectedBytes,
-            expectedBytes <= mapped.count - dataStart
-        else {
-            throw PLEError.badHeader(
-                "PLE tensor data out of bounds: shape \(shape), offsets \(offsets), "
-                    + "file \(mapped.count) bytes")
-        }
+        self.tensor = tensor
+        self.vocabSize = tensor.shape[0]
+        self.rowWidth = tensor.shape[1]
     }
 
     /// Copies the PLE rows for `tokenIDs` into `dest`, a buffer holding
     /// `batchSize * rowWidth` INT8 values laid out row-major (token-major).
     ///
-    /// Tokens beyond `tokenIDs.count` (padding up to `batchSize`) are left as
-    /// whatever `dest` already contains (callers pass a zeroed buffer).
+    /// Rows for token ids outside the table, and for padding slots beyond
+    /// `tokenIDs.count`, are left as whatever `dest` already contains (callers pass a
+    /// zeroed buffer).
     func gather(
         tokenIDs: some Collection<Int32>, batchSize: Int, into dest: UnsafeMutableBufferPointer<Int8>
     ) {
         precondition(dest.count >= batchSize * rowWidth, "PLE destination buffer too small")
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+        tensor.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress else { return }
-            let src = base.advanced(by: dataStart).assumingMemoryBound(to: Int8.self)
+            let src = base.advanced(by: tensor.dataStart).assumingMemoryBound(to: Int8.self)
             for (i, tokenID) in tokenIDs.prefix(batchSize).enumerated() {
                 let token = Int(tokenID)
                 guard token >= 0, token < vocabSize else { continue }

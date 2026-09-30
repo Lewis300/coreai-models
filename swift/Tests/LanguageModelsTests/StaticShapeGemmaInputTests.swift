@@ -166,10 +166,37 @@ struct PerLayerEmbeddingsParsingTests {
         #expect(rows == [6, 7, 8, 0, 1, 2])
     }
 
+    @Test("Token ids outside the table leave their rows untouched")
+    func skipsOutOfRangeTokens() throws {
+        let url = try writeTable()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let table = try PerLayerEmbeddings(contentsOf: url)
+
+        var rows = [Int8](repeating: -7, count: 3 * 3)
+        rows.withUnsafeMutableBufferPointer { buffer in
+            table.gather(tokenIDs: [-1, 5, 2] as [Int32], batchSize: 3, into: buffer)
+        }
+        #expect(rows == [-7, -7, -7, -7, -7, -7, 6, 7, 8])
+    }
+
+    @Test("Padding slots past the tokens are left for the caller to zero")
+    func leavesPaddingSlotsUntouched() throws {
+        let url = try writeTable()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let table = try PerLayerEmbeddings(contentsOf: url)
+
+        var rows = [Int8](repeating: -7, count: 2 * 3)
+        rows.withUnsafeMutableBufferPointer { buffer in
+            table.gather(tokenIDs: [1] as [Int32], batchSize: 2, into: buffer)
+        }
+        #expect(rows == [3, 4, 5, -7, -7, -7])
+    }
+
     @Test(
         "Malformed tables are rejected",
         arguments: [
-            "truncated data", "wrong dtype", "negative offset", "oversized header",
+            "truncated data", "wrong dtype", "negative offset", "overflowing end offset",
+            "oversized header", "shape mismatch",
         ])
     func rejectsMalformed(kind: String) throws {
         let url: URL
@@ -177,6 +204,8 @@ struct PerLayerEmbeddingsParsingTests {
         case "truncated data": url = try writeTable(dataBytes: 5)
         case "wrong dtype": url = try writeTable(dtype: "F16")
         case "negative offset": url = try writeTable(offsets: [-4, 8])
+        case "overflowing end offset": url = try writeTable(offsets: [4, Int.min])
+        case "shape mismatch": url = try writeTable(offsets: [0, 6])
         default: url = try writeTable(headerLength: UInt64.max)
         }
         defer { try? FileManager.default.removeItem(at: url) }
