@@ -115,7 +115,7 @@ let response = try await session.respond(to: "What is quantum computing?")
 print(response)
 ```
 
-### Using the built-in Command Line Tool
+### On your Mac using built-in Command Line Tool
 
 ```bash
 swift run -c release llm-runner --model path/to/exported_model_folder --prompt "Hello"
