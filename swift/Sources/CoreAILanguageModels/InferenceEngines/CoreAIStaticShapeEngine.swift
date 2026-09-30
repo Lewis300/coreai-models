@@ -90,9 +90,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private let inputHandlers: [any StaticInputHandler]
     private var inputBuffers: InputBuffers
 
-    // Reused by LogitSoftcap so decode doesn't allocate a vocab-sized buffer per token.
-    private var softcapScratch: [Float] = []
-
     // Number of tokens already processed in the current sequence.
     public private(set) var processedTokenCount: Int = 0
 
@@ -551,16 +548,18 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         // Final-logit soft cap. The iOS export leaves `c · tanh(logits / c)` out of the
         // graph (tanh is best run on the CPU rather than in the graph), so apply it here
-        // — before both the returned logits and the sampler, so parity dumps and the
-        // sampled token see the same capped values the reference implementation produces.
-        if let cap = config.overrides?.finalLogitSoftcapping {
-            LogitSoftcap.apply(cap: Float(cap), to: &logitBuffer, scratch: &softcapScratch)
+        // — to the returned logits, and through the sampling pipeline before the sampler, so
+        // parity dumps and the sampled token see the same capped values the reference
+        // implementation produces.
+        let softcap = config.overrides?.finalLogitSoftcapping
+        var actualLogits = returnsLogits ? logitBuffer : nil
+        if let softcap, actualLogits != nil {
+            LogitSoftcapProcessor.apply(to: &actualLogits!, cap: Float(softcap))
         }
-
-        let actualLogits = returnsLogits ? logitBuffer : nil
         let sampleSpan = InstrumentsProfiler.beginSample(strategy: "cpu-fallback")
         let nextToken = samplingConfig.fallbackSampler(
-            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...], step: step)
+            from: &logitBuffer, tokenHistory: inputTokens[generationStartOffset...], step: step,
+            logitSoftcap: softcap)
         sampleSpan.end()
         CLILogger.log("Token: \(nextToken), processed: \(processedTokenCount)")
         return (logits: actualLogits, token: nextToken)

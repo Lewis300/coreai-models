@@ -16,7 +16,7 @@ import Foundation
 /// Applying it runner-side keeps sampling *and* any `--save-logits` / `--print-logits`
 /// output on the same capped values the reference implementation produces, so parity
 /// comparisons stay meaningful.
-enum LogitSoftcap {
+public struct LogitSoftcapProcessor {
     /// Applies `cap · tanh(logits / cap)` to `logits` in place.
     ///
     /// The arithmetic runs in `Float` even when ``LogitsScalarType`` is `Float16`:
@@ -25,38 +25,23 @@ enum LogitSoftcap {
     /// ``LogitsScalarType`` on the way out — which is where any remaining divergence
     /// from the reference fp32 implementation comes from.
     ///
-    /// No-ops for a non-positive `cap` or an empty buffer.
-    static func apply(cap: Float, to logits: inout [LogitsScalarType]) {
-        var scratch: [Float] = []
-        apply(cap: cap, to: &logits, scratch: &scratch)
-    }
-
-    /// ``apply(cap:to:)`` with a caller-owned `scratch`, reused across calls so a
-    /// decode loop doesn't allocate a vocab-sized buffer every token.
-    static func apply(cap: Float, to logits: inout [LogitsScalarType], scratch: inout [Float]) {
+    /// - Parameters:
+    ///   - logits: Mutable logits array (vocab-sized). Modified in-place.
+    ///   - cap: The soft cap `c`. Non-positive values are a no-op.
+    public static func apply(to logits: inout [LogitsScalarType], cap: Float) {
         guard cap > 0, !logits.isEmpty else { return }
 
-        let count = logits.count
+        // vForce's tanh wants Float32, so widen (and pre-divide), transform in place,
+        // then narrow back. The buffer is ~1 MB at Gemma's vocab size — negligible next
+        // to the forward pass that produced these logits.
         let inverseCap = 1 / cap
-
-        // vForce's tanh wants Float32, so widen (and pre-divide) into scratch, transform
-        // in place, then narrow back. The scratch allocation is ~1 MB at Gemma's vocab
-        // size — negligible next to the forward pass that produced these logits.
-        if scratch.count != count {
-            scratch = [Float](repeating: 0, count: count)
+        var scaled = logits.map { Float($0) * inverseCap }
+        var elementCount = Int32(scaled.count)
+        scaled.withUnsafeMutableBufferPointer { buffer in
+            vvtanhf(buffer.baseAddress!, buffer.baseAddress!, &elementCount)
         }
-        for i in 0..<count {
-            scratch[i] = Float(logits[i]) * inverseCap
-        }
-
-        var elementCount = Int32(count)
-        scratch.withUnsafeMutableBufferPointer { buffer in
-            guard let base = buffer.baseAddress else { return }
-            vvtanhf(base, base, &elementCount)
-        }
-
-        for i in 0..<count {
-            logits[i] = LogitsScalarType(scratch[i] * cap)
+        for i in logits.indices {
+            logits[i] = LogitsScalarType(scaled[i] * cap)
         }
     }
 }
