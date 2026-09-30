@@ -26,7 +26,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     private static let logitsOutputName = "out_logits"
     private static let keyCacheName = "key_cache"
-    private static let slidingKeyCacheName = "sliding_key_cache"
     private static let valueCacheName = "value_cache"
     private static let embeddingTableName = "embedding_table"
     private static let tokenIDsInputName = "in_new_token_ids"
@@ -71,6 +70,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private let extendFunctionNames: [String]
     private let gatherFunctionNames: Set<String>
 
+    // The ladder's rungs by role: `extend_*` decodes, `prompt_opt_*` prefills. An asset
+    // need not ship both at the same query lengths.
+    private static let decodeFunctionPrefix = "extend"
+    private static let prefillFunctionPrefix = "prompt_opt"
+    private let decodeRungs: [FunctionDimensions]
+    private let prefillRungs: [FunctionDimensions]
+
     // Embedding table loaded once at init.
     private let embeddingTable: NDArray
 
@@ -86,10 +92,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // Reused by LogitSoftcap so decode doesn't allocate a vocab-sized buffer per token.
     private var softcapScratch: [Float] = []
-
-    // Sliding-window ring (depth, window), when the asset has one; limits how far the
-    // written prefix can be rewound.
-    private let slidingRing: (depth: Int, window: Int)?
 
     // Number of tokens already processed in the current sequence.
     public private(set) var processedTokenCount: Int = 0
@@ -127,6 +129,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             .filter { $0.hasPrefix("extend") || $0.hasPrefix("prompt") }
             .sorted()
         self.gatherFunctionNames = Set(allNames.filter { $0.hasPrefix("gather_embeddings") })
+        self.decodeRungs = extendFunctionNames.filter { $0.hasPrefix(Self.decodeFunctionPrefix + "_") }
+            .compactMap(Self.parseFunctionDimensions)
+        self.prefillRungs = extendFunctionNames.filter { $0.hasPrefix(Self.prefillFunctionPrefix + "_") }
+            .compactMap(Self.parseFunctionDimensions)
 
         CLILogger.log(
             "Parsed \(extendFunctionNames.count) decoder functions, \(gatherFunctionNames.count) gather functions")
@@ -174,7 +180,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // States: classified fixed vs per-bucket from the asset itself.
         self.states = try StaticStateFactory.makeStateSet(
             descriptorsByContext: descriptorsByContext,
-            referenceDescriptor: referenceDescriptor)
+            referenceDescriptor: referenceDescriptor,
+            slidingWindow: configuration.overrides?.slidingWindow)
 
         // Inputs: the standard filler, plus whichever optional handlers the graph asks for.
         var handlers: [any StaticInputHandler] = []
@@ -225,15 +232,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     "Graph declares sliding-window inputs but the bundle config has no "
                         + "`overrides.sliding_window`")
             }
-            let ringDepth = Self.slidingRingDepth(descriptor: referenceDescriptor)
+            // 0 when the asset has no sliding key cache, which the handler rejects.
+            let ringDepth = states.slidingRing?.depth ?? 0
             CLILogger.log("Input handler: sliding window \(window), ring depth \(ringDepth)")
             handlers.append(
                 try SlidingWindowInputHandler(
                     window: window, ringDepth: ringDepth,
                     maskDescriptors: slidingMask, stepDescriptors: slidingStep))
-            slidingRing = (ringDepth, window)
-        } else {
-            slidingRing = nil
         }
 
         if referenceDescriptor.inputNames.contains(PerLayerEmbeddingsInputHandler.inputName) {
@@ -295,33 +300,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Initialization Helpers
 
-    /// Ring depth `S` for a sliding-window cache: the sequence dimension of the
-    /// sliding key cache. 0 when the asset has no sliding cache.
-    private static func slidingRingDepth(descriptor: InferenceFunctionDescriptor) -> Int {
-        guard case .ndArray(let d) = descriptor.stateDescriptor(of: Self.slidingKeyCacheName) else {
-            return 0
-        }
-        return d.shape.last ?? 0
-    }
-
-    /// Whether the written prefix can be rewound to `target` positions.
-    ///
-    /// A flat cache always can. A sliding-window ring holds each position `p` at slot
-    /// `p % ringDepth`, so positions written after the rewind point overwrite the
-    /// slots of earlier ones; the next query at `target` still needs the `window - 1`
-    /// keys before it, which survive only while at most `ringDepth - window + 1`
-    /// positions have been written past it.
-    static func ringAllowsRewind(
-        processed: Int, to target: Int, ringDepth: Int, window: Int
-    ) -> Bool {
-        target == 0 || processed - target <= ringDepth - window + 1
-    }
-
     private func canRewind(to target: Int) -> Bool {
-        guard let slidingRing else { return true }
-        return Self.ringAllowsRewind(
-            processed: processedTokenCount, to: target,
-            ringDepth: slidingRing.depth, window: slidingRing.window)
+        states.canTruncate(processed: processedTokenCount, to: target)
     }
 
     private static func requireFunction(
@@ -430,38 +410,25 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     // MARK: - Graph Selection
 
     private func forwardGraph(numInputTokens: Int, currentPosition: Int, isPrefill: Bool) throws -> String {
-        var pairs: [(contextLength: Int, queryLength: Int)] = []
-        for name in extendFunctionNames {
-            // Only `prompt_opt_*` rungs exist for prefill-sized query lengths; when
-            // decoding, restrict to `extend_*` so selection can't name a rung the
-            // asset doesn't ship.
-            if !isPrefill && !name.hasPrefix("extend") { continue }
-            guard let dims = Self.parseFunctionDimensions(name) else { continue }
-            pairs.append((dims.contextLength, dims.queryLength))
-        }
-
-        let sorted = pairs.sorted { $0.queryLength < $1.queryLength }
-        guard let maxPair = sorted.last else {
+        let (prefix, rungs) =
+            isPrefill
+            ? (Self.prefillFunctionPrefix, prefillRungs) : (Self.decodeFunctionPrefix, decodeRungs)
+        guard let widest = rungs.map(\.queryLength).max() else {
             throw InferenceRuntimeError.invalidState(
-                "No extend functions found in static-shape engine")
+                "No \(prefix)_<ctx>_<qlen> functions found in static-shape engine")
         }
-        let selectedSeq =
-            sorted.first(where: { $0.queryLength >= numInputTokens })?.queryLength
-            ?? maxPair.queryLength
-        let candidates = pairs.filter { $0.queryLength == selectedSeq }
+        let selectedSeq = rungs.map(\.queryLength).filter { $0 >= numInputTokens }.min() ?? widest
 
         guard
             let selected =
-                candidates
-                .sorted(by: { $0.contextLength < $1.contextLength })
-                .first(where: { $0.contextLength > currentPosition })
+                rungs
+                .filter({ $0.queryLength == selectedSeq && $0.contextLength > currentPosition })
+                .min(by: { $0.contextLength < $1.contextLength })
         else {
             throw InferenceRuntimeError.invalidState(
-                "No graph with cache_len > \(currentPosition) and seq_len = \(selectedSeq)")
+                "No \(prefix) graph with cache_len > \(currentPosition) and seq_len = \(selectedSeq)")
         }
-        return isPrefill
-            ? "prompt_opt_\(selected.contextLength)_\(selected.queryLength)"
-            : "extend_\(selected.contextLength)_\(selected.queryLength)"
+        return "\(prefix)_\(selected.contextLength)_\(selected.queryLength)"
     }
 
     // MARK: - Generate (primary API)

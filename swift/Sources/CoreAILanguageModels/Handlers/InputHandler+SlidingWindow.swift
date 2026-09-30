@@ -123,9 +123,15 @@ struct SlidingWindowInputHandler: StaticInputHandler {
         slotStride: Int, queryStride: Int, queryColumns: Int,
         ringDepth: Int, window: Int, alignedStep: Int, tokensInBatch: Int
     ) {
-        for slot in 0..<ringDepth {
-            for query in 0..<queryColumns {
-                ptr[slot &* slotStride &+ query &* queryStride] = causalMaskSentinel
+        if queryStride == 1 && slotStride == queryColumns {
+            // Contiguous: one vectorized fill over the whole mask.
+            UnsafeMutableBufferPointer(start: ptr, count: ringDepth &* queryColumns)
+                .update(repeating: causalMaskSentinel)
+        } else {
+            for slot in 0..<ringDepth {
+                for query in 0..<queryColumns {
+                    ptr[slot &* slotStride &+ query &* queryStride] = causalMaskSentinel
+                }
             }
         }
         for query in 0..<tokensInBatch {

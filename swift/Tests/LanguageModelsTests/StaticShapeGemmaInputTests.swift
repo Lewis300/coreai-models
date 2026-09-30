@@ -14,32 +14,27 @@ import Testing
 @Suite("Sliding-window ring rewind")
 struct SlidingRingRewindTests {
     // Gemma 4's ring: window 512, depth 576.
-    let ringDepth = 576
-    let window = 512
+    let ring = SlidingRing(depth: 576, window: 512)
 
     @Test("A rewind survives while at most ringDepth - window + 1 positions were written past it")
     func boundary() {
-        let limit = ringDepth - window + 1
+        let limit = ring.depth - ring.window + 1
         #expect(
-            StaticShapeEngine.ringAllowsRewind(
-                processed: 1000, to: 1000 - limit, ringDepth: ringDepth, window: window))
+            ring.allowsRewind(processed: 1000, to: 1000 - limit))
         #expect(
-            !StaticShapeEngine.ringAllowsRewind(
-                processed: 1000, to: 1000 - limit - 1, ringDepth: ringDepth, window: window))
+            !ring.allowsRewind(processed: 1000, to: 1000 - limit - 1))
     }
 
     @Test("Rewinding one token, the chat-extension case, is always fine")
     func oneToken() {
         #expect(
-            StaticShapeEngine.ringAllowsRewind(
-                processed: 50_000, to: 49_999, ringDepth: ringDepth, window: window))
+            ring.allowsRewind(processed: 50_000, to: 49_999))
     }
 
     @Test("A full reset is always allowed")
     func fullReset() {
         #expect(
-            StaticShapeEngine.ringAllowsRewind(
-                processed: 50_000, to: 0, ringDepth: ringDepth, window: window))
+            ring.allowsRewind(processed: 50_000, to: 0))
     }
 }
 
@@ -81,6 +76,28 @@ struct SlidingWindowMaskTests {
                     mask[slot][query] == expected,
                     "step \(alignedStep) query \(query) slot \(slot)")
             }
+        }
+    }
+
+    @Test("A strided mask layout matches the contiguous one")
+    func stridedMatchesContiguous() {
+        let ringDepth = 12
+        let window = 8
+        let qLen = 4
+        let slotStride = qLen + 3
+        let expected = fill(
+            ringDepth: ringDepth, window: window, qLen: qLen, alignedStep: 9, tokensInBatch: 3)
+
+        // Padding elements between slots must stay untouched.
+        var strided = [Float16](repeating: 1, count: ringDepth * slotStride)
+        strided.withUnsafeMutableBufferPointer { buffer in
+            SlidingWindowInputHandler.fillMask(
+                buffer.baseAddress!, slotStride: slotStride, queryStride: 1, queryColumns: qLen,
+                ringDepth: ringDepth, window: window, alignedStep: 9, tokensInBatch: 3)
+        }
+        for slot in 0..<ringDepth {
+            #expect(Array(strided[(slot * slotStride)..<(slot * slotStride + qLen)]) == expected[slot])
+            #expect(strided[(slot * slotStride + qLen)..<((slot + 1) * slotStride)].allSatisfy { $0 == 1 })
         }
     }
 

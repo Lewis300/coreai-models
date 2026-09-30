@@ -297,6 +297,29 @@ final class BucketedStaticState: StaticStateStorage {
     }
 }
 
+// MARK: - Sliding-window ring
+
+/// Geometry of a sliding-window ring cache, which bounds how far the written
+/// prefix can be rewound.
+struct SlidingRing: Equatable {
+    /// Ring depth `S`: the sequence extent of the sliding key cache.
+    let depth: Int
+    let window: Int
+
+    /// Name of the state whose sequence extent is the ring depth.
+    static let keyCacheName = "sliding_key_cache"
+
+    /// Whether the written prefix can be rewound from `processed` to `target` positions.
+    ///
+    /// The ring holds each position `p` at slot `p % depth`, so positions written
+    /// after the rewind point overwrite the slots of earlier ones; the next query at
+    /// `target` still needs the `window - 1` keys before it, which survive only while
+    /// at most `depth - window + 1` positions have been written past it.
+    func allowsRewind(processed: Int, to target: Int) -> Bool {
+        target == 0 || processed - target <= depth - window + 1
+    }
+}
+
 // MARK: - Handler set
 
 /// The static states of one asset, split by lifecycle.
@@ -308,6 +331,15 @@ struct StaticStateSet {
     let bucketed: BucketedStaticState?
     /// States with one buffer across every bucket, allocated at the maximum.
     let fixed: FixedStaticState?
+    /// The sliding-window ring among the fixed states, when the asset has one.
+    let slidingRing: SlidingRing?
+
+    /// Whether the states can be truncated from `processed` back to `target`
+    /// positions. Flat caches always can; a sliding-window ring only while it still
+    /// holds the keys the next query needs.
+    func canTruncate(processed: Int, to target: Int) -> Bool {
+        slidingRing?.allowsRewind(processed: processed, to: target) ?? true
+    }
 
     /// Lay out the bucketed states for the bucket about to run. Fixed states
     /// need nothing: one buffer serves every bucket, and `bind` slices it.
@@ -335,9 +367,12 @@ enum StaticStateFactory {
     ///     descriptor for that bucket (any query length; states don't vary with it).
     ///   - referenceDescriptor: The largest-context descriptor, used to enumerate
     ///     state names and to size fixed states.
+    ///   - slidingWindow: The model's sliding-attention window, if it has one. With a
+    ///     ``SlidingRing/keyCacheName`` state it describes the set's sliding ring.
     static func makeStateSet(
         descriptorsByContext: [Int: InferenceFunctionDescriptor],
-        referenceDescriptor: InferenceFunctionDescriptor
+        referenceDescriptor: InferenceFunctionDescriptor,
+        slidingWindow: Int?
     ) throws -> StaticStateSet {
         let names = referenceDescriptor.stateNames
 
@@ -382,7 +417,15 @@ enum StaticStateFactory {
             fixed = FixedStaticState(states: fixedStates)
         }
 
-        return StaticStateSet(bucketed: bucketed, fixed: fixed)
+        var slidingRing: SlidingRing?
+        if let slidingWindow,
+            case .ndArray(let ring) = referenceDescriptor.stateDescriptor(of: SlidingRing.keyCacheName),
+            let depth = ring.shape.last
+        {
+            slidingRing = SlidingRing(depth: depth, window: slidingWindow)
+        }
+
+        return StaticStateSet(bucketed: bucketed, fixed: fixed, slidingRing: slidingRing)
     }
 
     /// Whether a state needs its own buffer per context bucket.
