@@ -146,6 +146,31 @@ struct BucketedStaticStatePrefixTests {
     }
 }
 
+// MARK: - Reset
+
+@Suite("StaticStateStorage reset")
+struct StaticStateStorageResetTests {
+    @Test("Reset zeroes every state, so a restart can't see the previous sequence")
+    func resetClearsPreviousSequence() {
+        // Stand-ins for a leftover conversation: a global cache and a sliding ring,
+        // in two of the scalar types a static state can have.
+        var keyCache = NDArray(shape: [2, 1, 4, 1, 16], scalarType: .float16)
+        fillNDArray(&keyCache, as: Float16.self, count: 2 * 4 * 16) { Float16($0 % 50 + 1) }
+        var slidingCache = NDArray(shape: [2, 1, 4, 1, 8], scalarType: .float32)
+        fillNDArray(&slidingCache, as: Float.self, count: 2 * 4 * 8) { Float($0 + 1) }
+        let storage = StaticStateStorage(
+            stateNames: ["key_cache", "sliding_key_cache"],
+            arrays: ["key_cache": keyCache, "sliding_key_cache": slidingCache])
+
+        storage.reset()
+
+        let keys = readNDArray(storage.arrays["key_cache"]!, as: Float16.self, count: 2 * 4 * 16)
+        let ring = readNDArray(storage.arrays["sliding_key_cache"]!, as: Float.self, count: 2 * 4 * 8)
+        #expect(keys.allSatisfy { $0 == 0 })
+        #expect(ring.allSatisfy { $0 == 0 })
+    }
+}
+
 // MARK: - Fixed vs bucketed classification
 
 /// Pins the rule that decides whether a state gets one shared buffer or one per
