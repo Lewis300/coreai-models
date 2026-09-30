@@ -278,22 +278,10 @@ final class BucketedStaticState: StaticStateStorage {
         let groupCount = sourceShape.reduce(1, *) / sourceSequence / factor
         let sourceGroupStride = sourceSequence * factor
         let destinationGroupStride = destinationSequence * factor
-        let runElements = copyLength * factor
-        guard let width = byteWidth(source.scalarType) else {
-            preconditionFailure("copyPrefix: unsupported scalar type \(source.scalarType)")
-        }
-
-        // Raw byte copy: a typed view traps when the scalar type differs from the
-        // view's (e.g. bf16 through Float16), and the bytes are copied verbatim anyway.
-        source.rawView().withUnsafeBytes { sourceBytes, _, _ in
-            destination.mutableRawView().withUnsafeMutableBytes { destinationBytes, _, _ in
-                for group in 0..<groupCount {
-                    (destinationBytes + group * destinationGroupStride * width).copyMemory(
-                        from: sourceBytes + group * sourceGroupStride * width,
-                        byteCount: runElements * width)
-                }
-            }
-        }
+        copyBlockPrefixes(
+            from: source, to: &destination, blockCount: groupCount,
+            sourceBlockStride: sourceGroupStride, destinationBlockStride: destinationGroupStride,
+            runElements: copyLength * factor)
     }
 }
 
