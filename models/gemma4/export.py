@@ -219,11 +219,12 @@ def _resolve_bundle_paths(
 # iOS: per-context blocked ladder of statically-shaped programs
 # ===========================================================================
 
-# Shipping per-function-type query lengths. Decode (``extend``) only needs q=8 (a
-# single new token); prefill (``prompt_opt``) runs at q=64, and the runner routes a
-# <=64-token initial prompt/tail through ``prompt_opt`` too, so an ``extend`` q=64
-# variant is redundant today (and dropping it halves the extend function count,
-# keeping the program under the accelerator's per-program I/O cap).
+# Shipping per-function-type query lengths. Prefill (``prompt_opt``) runs at q=64
+# and decode (``extend``) at q=8. The runner prefills in q=64 chunks while more than
+# 64 tokens remain and runs the rest, including a prompt of 64 tokens or fewer, as
+# q=8 ``extend`` steps. Shipping ``extend`` at q=8 only keeps the extend function
+# count at one per context bucket, which keeps the program under the accelerator's
+# per-program I/O cap.
 SHIPPING_EXTEND_QLENS = [8]
 SHIPPING_PROMPT_QLENS = [64]
 
