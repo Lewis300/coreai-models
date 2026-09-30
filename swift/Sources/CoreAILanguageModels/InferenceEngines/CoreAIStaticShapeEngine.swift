@@ -532,9 +532,14 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                         "Logits array has non-contiguous (interleaved) layout — cannot extract values safely")
                 }
                 let copySpan = InstrumentsProfiler.beginLogitsCopy()
-                let offset = (tokensInBatch - 1) * config.vocabSize
-                for i in 0..<config.vocabSize {
-                    logitBuffer[i] = logits[offset + i]
+                // One bulk copy of the last token's row rather than a per-element loop.
+                let vocabSize = config.vocabSize
+                let offset = (tokensInBatch - 1) * vocabSize
+                logits.withUnsafeBufferPointer { source in
+                    precondition(source.count >= offset + vocabSize, "Logits output shorter than one vocab row")
+                    logitBuffer.withUnsafeMutableBufferPointer { destination in
+                        destination.baseAddress!.update(from: source.baseAddress! + offset, count: vocabSize)
+                    }
                 }
                 copySpan.end()
             }
