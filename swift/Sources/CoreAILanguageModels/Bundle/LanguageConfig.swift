@@ -41,6 +41,52 @@ public struct RoPEConfig: Codable, Sendable, Equatable {
     }
 }
 
+/// Model-specific runtime settings, from the `language.overrides` block of
+/// `metadata.json`, for exports that leave part of the model's work to the runner.
+/// Absent for most models.
+public struct LanguageOverrides: Codable, Sendable, Equatable {
+    /// Sliding-window size for models with a sliding KV cache (Gemma4). The
+    /// runner uses it to build the windowed `sliding_causal_mask`. nil when the
+    /// model has no sliding-window attention.
+    public let slidingWindow: Int?
+
+    /// Dual-RoPE parameters (Gemma4 large-context). When present, the graph takes
+    /// precomputed `rope_cos`/`rope_sin` and the runner builds the rows from these;
+    /// nil for models that gather RoPE in-graph from `position_ids`.
+    public let rope: RoPEConfig?
+
+    /// Final-logit soft cap `c` for `c · tanh(logits / c)` (Gemma family). Present when
+    /// the export left the cap out of the graph — `tanh` is best run on the CPU rather
+    /// than in the graph — so the runner must apply it on the CPU before sampling. nil
+    /// when the model has no cap, or when the graph already applies it.
+    public let finalLogitSoftcapping: Double?
+
+    public init(slidingWindow: Int? = nil, rope: RoPEConfig? = nil, finalLogitSoftcapping: Double? = nil) {
+        self.slidingWindow = slidingWindow
+        self.rope = rope
+        self.finalLogitSoftcapping = finalLogitSoftcapping
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case slidingWindow = "sliding_window"
+        case rope
+        case finalLogitSoftcapping = "final_logit_softcapping"
+    }
+
+    public init(from decoder: Swift.Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
+        self.rope = try c.decodeIfPresent(RoPEConfig.self, forKey: .rope)
+        self.finalLogitSoftcapping = try c.decodeIfPresent(Double.self, forKey: .finalLogitSoftcapping)
+        // The runner divides by the cap.
+        if let finalLogitSoftcapping, finalLogitSoftcapping <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .finalLogitSoftcapping, in: c,
+                debugDescription: "final_logit_softcapping must be positive, got \(finalLogitSoftcapping)")
+        }
+    }
+}
+
 /// `language` block of `metadata.json` schema 0.2 — LLM-specific config.
 public struct LanguageConfig: Codable, Sendable, Equatable {
     public let tokenizer: String
@@ -69,21 +115,8 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
     /// Optional chunk threshold override from metadata.json.
     public let prefillChunkThreshold: Int?
 
-    /// Sliding-window size for models with a sliding KV cache (Gemma4). The
-    /// runner uses it to build the windowed `sliding_causal_mask`. nil when the
-    /// model has no sliding-window attention.
-    public let slidingWindow: Int?
-
-    /// Dual-RoPE parameters (Gemma4 large-context). When present, the graph takes
-    /// precomputed `rope_cos`/`rope_sin` and the runner builds the rows from these;
-    /// nil for models that gather RoPE in-graph from `position_ids`.
-    public let rope: RoPEConfig?
-
-    /// Final-logit soft cap `c` for `c · tanh(logits / c)` (Gemma family). Present when
-    /// the export left the cap out of the graph — `tanh` is best run on the CPU rather
-    /// than in the graph — so the runner must apply it on the CPU before sampling. nil
-    /// when the model has no cap, or when the graph already applies it.
-    public let finalLogitSoftcapping: Double?
+    /// Model-specific runtime settings (`overrides`); nil for most models.
+    public let overrides: LanguageOverrides?
 
     public init(
         tokenizer: String,
@@ -95,9 +128,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         states: [String: StateKind]? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        slidingWindow: Int? = nil,
-        rope: RoPEConfig? = nil,
-        finalLogitSoftcapping: Double? = nil
+        overrides: LanguageOverrides? = nil
     ) {
         self.tokenizer = tokenizer
         self.vocabSize = vocabSize
@@ -108,9 +139,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.states = states
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
-        self.slidingWindow = slidingWindow
-        self.rope = rope
-        self.finalLogitSoftcapping = finalLogitSoftcapping
+        self.overrides = overrides
     }
 
     enum CodingKeys: String, CodingKey {
@@ -123,9 +152,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         case states
         case prefillChunkSize = "prefill_chunk_size"
         case prefillChunkThreshold = "prefill_chunk_threshold"
-        case slidingWindow = "sliding_window"
-        case rope
-        case finalLogitSoftcapping = "final_logit_softcapping"
+        case overrides
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -139,9 +166,7 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
         self.states = try c.decodeIfPresent([String: StateKind].self, forKey: .states)
         self.prefillChunkSize = try c.decodeIfPresent(Int.self, forKey: .prefillChunkSize)
         self.prefillChunkThreshold = try c.decodeIfPresent(Int.self, forKey: .prefillChunkThreshold)
-        self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
-        self.rope = try c.decodeIfPresent(RoPEConfig.self, forKey: .rope)
-        self.finalLogitSoftcapping = try c.decodeIfPresent(Double.self, forKey: .finalLogitSoftcapping)
+        self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
     }
 
     // MARK: - Additional Stop Tokens

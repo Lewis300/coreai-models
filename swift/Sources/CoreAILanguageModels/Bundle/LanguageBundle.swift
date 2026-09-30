@@ -61,29 +61,19 @@ public struct LanguageBundle: Sendable {
     public var vocabSize: Int { language.vocabSize }
     public var maxContextLength: Int { language.maxContextLength }
 
-    /// Sliding-window size (Gemma4); nil for models without sliding attention.
-    public var slidingWindow: Int? { language.slidingWindow }
+    /// Model-specific runtime settings (`language.overrides`); nil for most models.
+    public var overrides: LanguageOverrides? { language.overrides }
 
-    /// Dual-RoPE parameters (Gemma4 large-context); nil when RoPE is gathered
-    /// in-graph from `position_ids`.
-    public var rope: RoPEConfig? { language.rope }
-
-    /// Explicit state classification, when the bundle declares one.
-    public var states: [String: StateKind]? { language.states }
-
-    /// Sidecar artifacts the engine may need, keyed by `assets` role. Only roles
-    /// the bundle declares are present.
-    public var auxiliaryAssets: [String: URL] {
+    /// Tensor data the engine reads alongside the model, keyed by `assets` role. Only
+    /// roles the bundle declares are present.
+    public var tensorData: [String: URL] {
         var resolved: [String: URL] = [:]
-        if let url = PerLayerEmbeddings.resolveURL(in: modelBundle) {
-            resolved[EngineOptions.AssetKey.perLayerEmbeddings] = url
+        let key = EngineOptions.TensorDataKey.perLayerEmbeddings
+        if let url = modelBundle.modelURL(for: key) {
+            resolved[key] = url
         }
         return resolved
     }
-
-    /// Final-logit soft cap the runner must apply on the CPU; nil when the model has
-    /// no cap or the graph applies it itself.
-    public var finalLogitSoftcapping: Double? { language.finalLogitSoftcapping }
 
     /// Raw metadata bytes for passing to engine config parsers.
     public var rawMetadata: Data { modelBundle.raw }

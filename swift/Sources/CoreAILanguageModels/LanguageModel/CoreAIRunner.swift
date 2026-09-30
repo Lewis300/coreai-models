@@ -76,7 +76,7 @@ public struct CoreAIRunner {
             kvCacheStrategy: kvCacheStrategy,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedThreshold,
-            auxiliaryAssets: bundle.auxiliaryAssets
+            tensorData: bundle.tensorData
         )
 
         return try await EngineFactory.createEngine(
@@ -102,10 +102,7 @@ public struct CoreAIRunner {
             ),
             serializedModel: [modelAsset],
             function: functionName,
-            slidingWindow: bundle.slidingWindow,
-            rope: bundle.rope,
-            states: bundle.states,
-            finalLogitSoftcapping: bundle.finalLogitSoftcapping
+            overrides: bundle.overrides
         )
     }
 }

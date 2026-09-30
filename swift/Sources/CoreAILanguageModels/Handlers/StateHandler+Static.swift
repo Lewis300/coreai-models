@@ -329,20 +329,15 @@ struct StaticStateSet {
 /// every context bucket is fixed; one whose buffer varies is bucketed. The
 /// declared shape doesn't decide: a model compiled against one max-context cache
 /// declares a shrinking shape per bucket over the same allocation.
-///
-/// `language.states` in `metadata.json` may declare a state's kind, but the
-/// declaration must agree with the asset or loading throws.
 enum StaticStateFactory {
     /// - Parameters:
     ///   - descriptorsByContext: Context bucket → a representative function
     ///     descriptor for that bucket (any query length; states don't vary with it).
     ///   - referenceDescriptor: The largest-context descriptor, used to enumerate
     ///     state names and to size fixed states.
-    ///   - stateKinds: Optional explicit classification from bundle metadata.
     static func makeStateSet(
         descriptorsByContext: [Int: InferenceFunctionDescriptor],
-        referenceDescriptor: InferenceFunctionDescriptor,
-        stateKinds: [String: StateKind]? = nil
+        referenceDescriptor: InferenceFunctionDescriptor
     ) throws -> StaticStateSet {
         let names = referenceDescriptor.stateNames
 
@@ -354,32 +349,8 @@ enum StaticStateFactory {
                 continue
             }
 
-            // The asset decides; metadata can only assert what it already says.
-            let varies = storageVariesByContext(name: name, descriptorsByContext: descriptorsByContext)
-            let isBucketed: Bool
-            switch stateKinds?[name] {
-            case .slidingCache, .fixed:
-                guard !varies else {
-                    throw InferenceRuntimeError.invalidState(
-                        "State '\(name)' is declared fixed-size in metadata.json but its buffer "
-                            + "differs across context buckets — a single allocation would be indexed "
-                            + "with the wrong strides by the smaller buckets. Drop the entry or "
-                            + "declare it `kv_cache`.")
-                }
-                isBucketed = false
-            case .kvCache:
-                guard varies else {
-                    throw InferenceRuntimeError.invalidState(
-                        "State '\(name)' is declared `kv_cache` in metadata.json but its buffer is "
-                            + "identical across every context bucket (\(reference.minimumByteCount) "
-                            + "bytes) — it is one max-context allocation the buckets slice, not a "
-                            + "per-bucket ladder. Drop the entry or declare it `fixed`.")
-                }
-                isBucketed = true
-            case nil:
-                isBucketed = varies
-            }
-
+            let isBucketed = storageVariesByContext(
+                name: name, descriptorsByContext: descriptorsByContext)
             if isBucketed {
                 bucketedNames.append(name)
             } else {

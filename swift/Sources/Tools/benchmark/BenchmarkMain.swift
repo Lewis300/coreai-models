@@ -98,10 +98,7 @@ struct LLMBenchmark: AsyncParsableCommand {
             maxContextLength: bundle.maxContextLength,
             serializedModel: [bundle.modelAssetPath],
             function: bundle.language.functionMap?.name(for: "main") ?? "main",
-            slidingWindow: bundle.slidingWindow,
-            rope: bundle.rope,
-            states: bundle.states,
-            finalLogitSoftcapping: bundle.finalLogitSoftcapping
+            overrides: bundle.overrides
         )
         let configData = try JSONEncoder().encode(engineConfig)
         print("\n⏳ Preparing AI asset...", terminator: "")
@@ -113,7 +110,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         let engineOptions = EngineOptions(
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
-            auxiliaryAssets: bundle.auxiliaryAssets
+            tensorData: bundle.tensorData
         )
         let prepareStart = SuspendingClock.now
         let engine = try await EngineFactory.createEngine(

@@ -71,27 +71,9 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
     var prefillChunkSizeOverride: Int?
     var prefillChunkThresholdOverride: Int?
 
-    /// Sliding-window size for models with a sliding KV cache (Gemma4). Used by
-    /// the static-shape engine to build the windowed `sliding_causal_mask`.
-    public var slidingWindow: Int?
-
-    /// Dual-RoPE parameters (Gemma4 large-context). When present, the static-shape
-    /// engine precomputes `rope_cos`/`rope_sin` per step instead of filling
-    /// `position_ids`. nil for models that gather RoPE in-graph.
-    public var rope: RoPEConfig?
-
-    /// Explicit state classification from the bundle, which the static-shape
-    /// engine checks against the asset (see ``StaticStateFactory``). nil = infer.
-    public var states: [String: StateKind]?
-
-    /// Final-logit soft cap `c` for `c · tanh(logits / c)` (Gemma family), applied by the
-    /// engine on the CPU after the forward pass — see ``LogitSoftcap``. Set when the
-    /// export omitted the cap from the graph because `tanh` is best run on the CPU
-    /// rather than in the graph. nil leaves logits untouched.
-    ///
-    /// - Note: Honored by the static-shape engine. Other engines run models whose
-    ///   graphs already cap in-graph, and ignore it.
-    public var finalLogitSoftcapping: Double?
+    /// Model-specific runtime settings from the bundle's `language.overrides`,
+    /// honored by the static-shape engine. nil for most models.
+    public var overrides: LanguageOverrides?
 
     public enum InputMode: String, Codable, Sendable {
         case random
@@ -109,10 +91,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         inputMode: InputMode? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        slidingWindow: Int? = nil,
-        rope: RoPEConfig? = nil,
-        states: [String: StateKind]? = nil,
-        finalLogitSoftcapping: Double? = nil
+        overrides: LanguageOverrides? = nil
     ) {
         self.name = name
         self.tokenizer = tokenizer
@@ -124,10 +103,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.inputMode = inputMode
         self.prefillChunkSizeOverride = prefillChunkSize
         self.prefillChunkThresholdOverride = prefillChunkThreshold
-        self.slidingWindow = slidingWindow
-        self.rope = rope
-        self.states = states
-        self.finalLogitSoftcapping = finalLogitSoftcapping
+        self.overrides = overrides
     }
 
     enum CodingKeys: String, CodingKey {
@@ -139,10 +115,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         case serializedModel = "serialized_model"
         case function
         case inputMode = "input_mode"
-        case slidingWindow = "sliding_window"
-        case rope
-        case states
-        case finalLogitSoftcapping = "final_logit_softcapping"
+        case overrides
     }
 
     public init(from decoder: Decoder) throws {
@@ -157,17 +130,7 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.inputMode = try c.decodeIfPresent(InputMode.self, forKey: .inputMode)
         self.prefillChunkSizeOverride = nil
         self.prefillChunkThresholdOverride = nil
-        self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow)
-        self.rope = try c.decodeIfPresent(RoPEConfig.self, forKey: .rope)
-        self.states = try c.decodeIfPresent([String: StateKind].self, forKey: .states)
-        self.finalLogitSoftcapping = try c.decodeIfPresent(Double.self, forKey: .finalLogitSoftcapping)
-
-        // Used as a divisor in LogitSoftcap
-        if let finalLogitSoftcapping, finalLogitSoftcapping <= 0 {
-            throw DecodingError.dataCorruptedError(
-                forKey: .finalLogitSoftcapping, in: c,
-                debugDescription: "final_logit_softcapping must be positive, got \(finalLogitSoftcapping)")
-        }
+        self.overrides = try c.decodeIfPresent(LanguageOverrides.self, forKey: .overrides)
     }
 }
 

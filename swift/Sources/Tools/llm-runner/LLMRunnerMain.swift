@@ -463,7 +463,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
             prefillChunkThreshold: resolvedChunkThreshold,
-            auxiliaryAssets: bundle.auxiliaryAssets
+            tensorData: bundle.tensorData
         )
 
         // Parallel loading: engine compilation + tokenizer are independent.

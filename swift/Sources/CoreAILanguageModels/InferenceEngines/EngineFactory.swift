@@ -103,7 +103,7 @@ public struct EngineFactory: Sendable {
             kvCacheSize: options.kvCacheSize,
             prefillChunkSize: options.prefillChunkSize,
             prefillChunkThreshold: options.prefillChunkThreshold,
-            auxiliaryAssets: bundle.auxiliaryAssets.merging(options.auxiliaryAssets) { _, explicit in
+            tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in
                 explicit
             })
 
@@ -115,10 +115,7 @@ public struct EngineFactory: Sendable {
             maxContextLength: bundle.maxContextLength,
             serializedModel: [bundle.modelAssetPath],
             function: bundle.language.functionMap?.name(for: "main") ?? "main",
-            slidingWindow: bundle.slidingWindow,
-            rope: bundle.rope,
-            states: bundle.states,
-            finalLogitSoftcapping: bundle.finalLogitSoftcapping
+            overrides: bundle.overrides
         )
         let configData = try JSONEncoder().encode(engineConfig)
         return try await createEngine(config: configData, modelURL: languageModelURL, options: options)
@@ -192,10 +189,7 @@ public struct EngineFactory: Sendable {
         let tokenizer: String
         let function: String
         let modelDefinition: ModelSource.ModelDefinition
-        let slidingWindow: Int?
-        let rope: RoPEConfig?
-        let states: [String: StateKind]?
-        let finalLogitSoftcapping: Double?
+        let overrides: LanguageOverrides?
     }
 
     /// Parses config data using the unified config handler.
@@ -208,10 +202,7 @@ public struct EngineFactory: Sendable {
             tokenizer: config.tokenizer,
             function: config.function,
             modelDefinition: config.resolvedModelDefinition,
-            slidingWindow: config.slidingWindow,
-            rope: config.rope,
-            states: config.states,
-            finalLogitSoftcapping: config.finalLogitSoftcapping
+            overrides: config.overrides
         )
     }
 
@@ -319,10 +310,7 @@ public struct EngineFactory: Sendable {
             ),
             serializedModel: [modelURL.lastPathComponent],
             function: config.function,
-            slidingWindow: config.slidingWindow,
-            rope: config.rope,
-            states: config.states,
-            finalLogitSoftcapping: config.finalLogitSoftcapping
+            overrides: config.overrides
         )
 
         modelConfig.applyChunkingOverrides(
@@ -338,7 +326,7 @@ public struct EngineFactory: Sendable {
                 configuration: modelConfig,
                 preparedModel: preparedModel,
                 perLayerEmbeddingsURL:
-                    options.auxiliaryAssets[EngineOptions.AssetKey.perLayerEmbeddings]
+                    options.tensorData[EngineOptions.TensorDataKey.perLayerEmbeddings]
             )
 
         case .sequential:
@@ -397,17 +385,13 @@ public struct EngineOptions: Sendable {
     /// When set, takes precedence over model metadata and engine defaults.
     public let prefillChunkThreshold: Int?
 
-    /// Non-graph artifacts the bundle ships alongside the model asset, keyed by
-    /// the role name under `assets` in `metadata.json`.
-    ///
-    /// Some weights are too large to bake into the graph and are externalized
-    /// into sidecar files — see ``AssetKey``. A role absent here is a sidecar the
-    /// bundle does not ship; engines that require one fail with that as the
-    /// reason rather than searching the bundle directory.
-    public let auxiliaryAssets: [String: URL]
+    /// Tensor data the bundle ships alongside the model, for weights too large to bake
+    /// into the graph, keyed by the role name under `assets` in `metadata.json` (see
+    /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
+    public let tensorData: [String: URL]
 
-    /// Well-known `assets` roles for sidecar artifacts.
-    public enum AssetKey {
+    /// Well-known `assets` roles for tensor data.
+    public enum TensorDataKey {
         /// INT8 per-layer embeddings table (`*_ple.safetensors`).
         public static let perLayerEmbeddings = "per_layer_embeddings"
     }
@@ -422,21 +406,21 @@ public struct EngineOptions: Sendable {
     ///     Defaults to `nil`.
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
-    ///   - auxiliaryAssets: Sidecar artifact URLs keyed by `assets` role. Defaults to empty.
+    ///   - tensorData: Tensor data URLs keyed by `assets` role. Defaults to empty.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         kvCacheSize: Int? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        auxiliaryAssets: [String: URL] = [:]
+        tensorData: [String: URL] = [:]
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
         self.kvCacheSize = kvCacheSize
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
-        self.auxiliaryAssets = auxiliaryAssets
+        self.tensorData = tensorData
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.

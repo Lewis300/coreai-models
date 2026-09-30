@@ -54,14 +54,16 @@ struct EngineSupportTests {
             "tokenizer": "google/gemma-4-E2B-it",
             "vocab_size": 262144,
             "max_context_length": 131072,
-            "sliding_window": 512,
-            "final_logit_softcapping": 30.0,
-            "rope": {
-              "sliding_head_dim": 256,
-              "global_head_dim": 512,
-              "sliding_rope_theta": 10000.0,
-              "global_rope_theta": 1000000.0,
-              "partial_rotary_factor": 0.25
+            "overrides": {
+              "sliding_window": 512,
+              "final_logit_softcapping": 30.0,
+              "rope": {
+                "sliding_head_dim": 256,
+                "global_head_dim": 512,
+                "sliding_rope_theta": 10000.0,
+                "global_rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25
+              }
             }\(extraLanguage)
           }
         }
@@ -74,21 +76,21 @@ struct EngineSupportTests {
     func perLayerEmbeddingsResolvesFromAssets() throws {
         let url = try Self.bundle(
             metadata: Self.gemmaMetadata(), files: ["model_ple.safetensors"])
-        let resolved = try LanguageBundle(at: url).auxiliaryAssets
+        let resolved = try LanguageBundle(at: url).tensorData
 
-        let key = EngineOptions.AssetKey.perLayerEmbeddings
+        let key = EngineOptions.TensorDataKey.perLayerEmbeddings
         #expect(resolved[key]?.lastPathComponent == "model_ple.safetensors")
     }
 
     @Test("A bundle that ships no sidecar reports none")
     func noSidecarReportsEmpty() throws {
         let url = try Self.bundle(metadata: Self.gemmaMetadata(assets: #""main": "model.aimodel""#))
-        let resolved = try LanguageBundle(at: url).auxiliaryAssets
+        let resolved = try LanguageBundle(at: url).tensorData
 
         // Absent rather than present-and-missing: the static engine distinguishes
         // the two, and reports "bundle ships no PLE table" rather than failing to
         // open a file it was told to expect.
-        #expect(resolved[EngineOptions.AssetKey.perLayerEmbeddings] == nil)
+        #expect(resolved[EngineOptions.TensorDataKey.perLayerEmbeddings] == nil)
     }
 
     // MARK: - Config the engine reads
@@ -100,14 +102,15 @@ struct EngineSupportTests {
         let bundle = try LanguageBundle(at: url)
 
         // Every field here drives a handler the static engine attaches.
-        #expect(bundle.slidingWindow == 512)
-        #expect(bundle.finalLogitSoftcapping == 30.0)
-        #expect(bundle.rope?.slidingHeadDim == 256)
-        #expect(bundle.rope?.globalHeadDim == 512)
-        #expect(bundle.rope?.partialRotaryFactor == 0.25)
+        let overrides = try #require(bundle.overrides)
+        #expect(overrides.slidingWindow == 512)
+        #expect(overrides.finalLogitSoftcapping == 30.0)
+        #expect(overrides.rope?.slidingHeadDim == 256)
+        #expect(overrides.rope?.globalHeadDim == 512)
+        #expect(overrides.rope?.partialRotaryFactor == 0.25)
     }
 
-    @Test("A model with no sliding window, RoPE block or cap leaves them nil")
+    @Test("A model with no overrides block leaves them nil")
     func plainModelCarriesNoGemmaConfig() throws {
         let url = try Self.bundle(
             metadata: """
@@ -125,23 +128,35 @@ struct EngineSupportTests {
                 """)
         let bundle = try LanguageBundle(at: url)
 
-        #expect(bundle.slidingWindow == nil)
-        #expect(bundle.rope == nil)
-        #expect(bundle.finalLogitSoftcapping == nil)
-        #expect(bundle.states == nil)
-        #expect(bundle.auxiliaryAssets.isEmpty)
+        #expect(bundle.overrides == nil)
+        #expect(bundle.tensorData.isEmpty)
     }
 
-    @Test("An explicit state classification reaches the engine")
-    func stateKindsAreCarried() throws {
-        let url = try Self.bundle(
-            metadata: Self.gemmaMetadata(
-                extraLanguage: #","states": { "sliding_key_cache": "sliding_cache" }"#),
-            files: ["model_ple.safetensors"])
-        let bundle = try LanguageBundle(at: url)
+    @Test("A non-positive soft cap is rejected", arguments: ["0.0", "-30.0"])
+    func nonPositiveSoftcapIsRejected(cap: String) {
+        let json = #"{"final_logit_softcapping": "# + cap + "}"
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(LanguageOverrides.self, from: Data(json.utf8))
+        }
+    }
 
-        // `language.states` is checked against the footprint in StaticStateFactory.
-        #expect(bundle.states?["sliding_key_cache"] == .slidingCache)
+    @Test("ModelConfig carries the overrides through encode and decode")
+    func modelConfigRoundTripsOverrides() throws {
+        // EngineFactory encodes the ModelConfig it builds and the engine decodes it, so a
+        // gap here would drop the overrides between bundle load and engine construction.
+        let overrides = LanguageOverrides(
+            slidingWindow: 512,
+            rope: RoPEConfig(
+                slidingHeadDim: 256, globalHeadDim: 512, slidingRopeTheta: 10_000,
+                globalRopeTheta: 1_000_000, partialRotaryFactor: 0.25),
+            finalLogitSoftcapping: 30.0)
+        let config = ModelConfig(
+            name: "gemma_4_e2b_it_static", tokenizer: "google/gemma-4-E2B-it", vocabSize: 262144,
+            maxContextLength: 131072, serializedModel: ["model.aimodel"], function: "main",
+            overrides: overrides)
+
+        let decoded = try ModelConfig(parsing: try JSONEncoder().encode(config))
+        #expect(decoded.overrides == overrides)
     }
 
     // MARK: - Variant resolution

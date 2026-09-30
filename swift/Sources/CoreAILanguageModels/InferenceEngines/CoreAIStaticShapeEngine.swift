@@ -174,8 +174,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // States: classified fixed vs per-bucket from the asset itself.
         self.states = try StaticStateFactory.makeStateSet(
             descriptorsByContext: descriptorsByContext,
-            referenceDescriptor: referenceDescriptor,
-            stateKinds: configuration.states)
+            referenceDescriptor: referenceDescriptor)
 
         // Inputs: the standard filler, plus whichever optional handlers the graph asks for.
         var handlers: [any StaticInputHandler] = []
@@ -203,10 +202,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             ))
 
         if referenceDescriptor.inputNames.contains(DualRoPEInputHandler.cosInputName) {
-            guard let rope = configuration.rope else {
+            guard let rope = configuration.overrides?.rope else {
                 throw InferenceRuntimeError.invalidState(
                     "Graph declares '\(DualRoPEInputHandler.cosInputName)' but the bundle config "
-                        + "has no `rope` block to build the table from")
+                        + "has no `overrides.rope` block to build the table from")
             }
             CLILogger.log("Input handler: precomputed dual-RoPE rows")
             handlers.append(
@@ -221,10 +220,10 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         let slidingStep = BucketedInputDescriptors.collect(
             SlidingWindowInputHandler.stepInputName, from: functionsByKey)
         if !slidingMask.isEmpty || !slidingStep.isEmpty {
-            guard let window = configuration.slidingWindow else {
+            guard let window = configuration.overrides?.slidingWindow else {
                 throw InferenceRuntimeError.invalidState(
                     "Graph declares sliding-window inputs but the bundle config has no "
-                        + "`sliding_window`")
+                        + "`overrides.sliding_window`")
             }
             let ringDepth = Self.slidingRingDepth(descriptor: referenceDescriptor)
             CLILogger.log("Input handler: sliding window \(window), ring depth \(ringDepth)")
@@ -242,7 +241,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                 throw InferenceRuntimeError.invalidState(
                     "Graph declares '\(PerLayerEmbeddingsInputHandler.inputName)' but no per-layer "
                         + "embeddings artifact was supplied. The bundle must declare it as "
-                        + "`assets.\(EngineOptions.AssetKey.perLayerEmbeddings)` in metadata.json; "
+                        + "`assets.\(EngineOptions.TensorDataKey.perLayerEmbeddings)` in metadata.json; "
                         + "EngineFactory.createEngine(bundle:) passes it through.")
             }
             let table = try PerLayerEmbeddings(contentsOf: url)
@@ -587,7 +586,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // graph (tanh is best run on the CPU rather than in the graph), so apply it here
         // — before both the returned logits and the sampler, so parity dumps and the
         // sampled token see the same capped values the reference implementation produces.
-        if let cap = config.finalLogitSoftcapping {
+        if let cap = config.overrides?.finalLogitSoftcapping {
             LogitSoftcap.apply(cap: Float(cap), to: &logitBuffer, scratch: &softcapScratch)
         }
 

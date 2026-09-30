@@ -30,12 +30,6 @@ struct PerLayerEmbeddings: Sendable {
 
     private static let tensorKey = "embed_tokens_per_layer"
 
-    /// Locates this sidecar through the bundle's `assets` role map, or nil when
-    /// the bundle doesn't ship one.
-    static func resolveURL(in bundle: ModelBundle) -> URL? {
-        bundle.modelURL(for: EngineOptions.AssetKey.perLayerEmbeddings)
-    }
-
     enum PLEError: Error, CustomStringConvertible {
         case tooSmall
         case badHeader(String)
