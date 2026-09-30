@@ -444,17 +444,11 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         // Implicit prefix caching: resolve input against history.
         if history.count > 0 {
             let (commonPrefix, _) = history.resolve(input: input)
-            if commonPrefix < input.count && commonPrefix < history.count {
-                // Divergence — full reset (static engine has fixed-size KV)
-                processedTokenCount = 0
-                history.clear()
-            } else if processedTokenCount >= input.count {
-                // Extension — rewind for seeding, or replay from the start when a
-                // sliding-window ring no longer holds the keys the rewind needs.
-                let rewindTo = Swift.max(0, commonPrefix - 1)
-                let resetTo = canRewind(to: rewindTo) ? rewindTo : 0
-                processedTokenCount = resetTo
-                history.truncate(to: resetTo)
+            if let position = Self.resumePosition(
+                commonPrefix: commonPrefix, inputCount: input.count, historyCount: history.count,
+                processed: processedTokenCount, canRewind: canRewind(to:))
+            {
+                rewind(to: position)
             }
             lastPrefixHitCount = commonPrefix
         }
@@ -679,17 +673,42 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
                     + "the prefix.")
         }
         let resetSpan = InstrumentsProfiler.beginReset(engine: "StaticShape")
-        if tokenIndex == 0 {
+        rewind(to: tokenIndex)
+        resetSpan.end()
+    }
+
+    /// Where a request resumes the cached sequence, or nil to continue from
+    /// `processed` as is.
+    ///
+    /// - A request that diverges from the history restarts at 0.
+    /// - One that the history already covers rewinds one token before the common
+    ///   prefix, to re-run it for the next token's logits; or restarts at 0 when a
+    ///   sliding-window ring no longer holds the keys that rewind needs.
+    static func resumePosition(
+        commonPrefix: Int, inputCount: Int, historyCount: Int, processed: Int,
+        canRewind: (Int) -> Bool
+    ) -> Int? {
+        if commonPrefix < inputCount && commonPrefix < historyCount {
+            return 0
+        }
+        guard processed >= inputCount else { return nil }
+        let target = Swift.max(0, commonPrefix - 1)
+        return canRewind(target) ? target : 0
+    }
+
+    /// Moves the cursor back to `position`. The one path every restart and rewind goes
+    /// through, so a restart always zeroes the states.
+    private func rewind(to position: Int) {
+        if position == 0 {
             processedTokenCount = 0
             history.clear()
             // Same-bucket restarts reuse storage (prepare() early-returns), so
             // zero it; see StaticStateStorage.reset().
             states.reset()
         } else {
-            processedTokenCount = tokenIndex
-            history.truncate(to: tokenIndex)
+            processedTokenCount = position
+            history.truncate(to: position)
         }
-        resetSpan.end()
     }
 
     public func warmup(queryLength: Int, sampling: SamplingConfiguration?) async throws {

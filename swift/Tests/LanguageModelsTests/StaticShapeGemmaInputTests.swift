@@ -38,6 +38,43 @@ struct SlidingRingRewindTests {
     }
 }
 
+// MARK: - Prefix resume
+
+/// Every non-nil position goes through the engine's one `rewind(to:)`, which zeroes
+/// the states on a restart at 0.
+@Suite("Static-shape prefix resume")
+struct PrefixResumeTests {
+    private func resume(
+        commonPrefix: Int, input: Int, history: Int, processed: Int, canRewind: Bool = true
+    ) -> Int? {
+        StaticShapeEngine.resumePosition(
+            commonPrefix: commonPrefix, inputCount: input, historyCount: history,
+            processed: processed, canRewind: { _ in canRewind })
+    }
+
+    @Test("A request that diverges from the history restarts at 0")
+    func divergenceRestarts() {
+        // A new conversation sharing 3 tokens with a 40-token history.
+        #expect(resume(commonPrefix: 3, input: 10, history: 40, processed: 40) == 0)
+    }
+
+    @Test("A request the history covers rewinds one token before the common prefix")
+    func coveredRequestRewinds() {
+        #expect(resume(commonPrefix: 20, input: 20, history: 40, processed: 40) == 19)
+    }
+
+    @Test("A rewind the sliding-window ring can't serve restarts at 0")
+    func ringLimitRestarts() {
+        #expect(
+            resume(commonPrefix: 20, input: 20, history: 4000, processed: 4000, canRewind: false) == 0)
+    }
+
+    @Test("A request that extends the history continues where it left off")
+    func extensionContinues() {
+        #expect(resume(commonPrefix: 40, input: 50, history: 40, processed: 40) == nil)
+    }
+}
+
 // MARK: - Sliding-window mask
 
 @Suite("Sliding-window ring mask")
