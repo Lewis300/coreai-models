@@ -317,8 +317,7 @@ public struct EngineFactory: Sendable {
             return try await StaticShapeEngine(
                 configuration: modelConfig,
                 preparedModel: preparedModel,
-                perLayerEmbeddingsURL:
-                    options.tensorData[EngineOptions.TensorDataKey.perLayerEmbeddings]
+                tensorData: options.tensorData
             )
 
         case .sequential:

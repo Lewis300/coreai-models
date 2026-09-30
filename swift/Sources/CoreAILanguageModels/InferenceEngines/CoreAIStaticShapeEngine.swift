@@ -109,10 +109,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
     // MARK: - Initialization
 
+    /// - Parameter tensorData: Tensor data the graph reads alongside the model, keyed by
+    ///   `assets` role (see ``EngineOptions/TensorDataKey``). Only the roles the graph's
+    ///   inputs need are looked up.
     public init(
         configuration: ModelConfig,
         preparedModel: PreparedModel,
-        perLayerEmbeddingsURL: URL? = nil
+        tensorData: [String: URL] = [:]
     ) async throws {
         self.config = configuration
         self.model = preparedModel.model
@@ -239,7 +242,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         }
 
         if referenceDescriptor.inputNames.contains(PerLayerEmbeddingsInputHandler.inputName) {
-            guard let url = perLayerEmbeddingsURL else {
+            guard let url = tensorData[EngineOptions.TensorDataKey.perLayerEmbeddings] else {
                 throw InferenceRuntimeError.invalidState(
                     "Graph declares '\(PerLayerEmbeddingsInputHandler.inputName)' but no per-layer "
                         + "embeddings artifact was supplied. The bundle must declare it as "
@@ -286,13 +289,13 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     }
 
     public convenience init(
-        configuration: ModelConfig, modelURL: URL, perLayerEmbeddingsURL: URL? = nil
+        configuration: ModelConfig, modelURL: URL, tensorData: [String: URL] = [:]
     ) async throws {
         let preparedModel = try await PreparedModel.prepare(at: modelURL)
         try await self.init(
             configuration: configuration,
             preparedModel: preparedModel,
-            perLayerEmbeddingsURL: perLayerEmbeddingsURL)
+            tensorData: tensorData)
     }
 
     // MARK: - Initialization Helpers
