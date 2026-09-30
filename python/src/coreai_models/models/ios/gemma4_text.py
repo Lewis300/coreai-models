@@ -21,8 +21,8 @@ Key differences from other iOS models (Qwen3, Llama):
   - Final logit soft cap (``c * tanh(logits / c)``) deliberately *not* applied here:
     ``tanh`` is best run on the CPU rather than in the graph, so the graph emits raw
     logits and the runner applies the cap on the CPU. The cap is published to the runner as
-    ``language.final_logit_softcapping`` in bundle metadata (see
-    ``models/gemma4/export.py``) and applied by Swift's ``LogitSoftcap``.
+    ``language.overrides.final_logit_softcapping`` in bundle metadata (see
+    ``models/gemma4/export.py``) and applied by Swift's ``LogitSoftcapProcessor``.
   - Two compacted KV caches: a full-context global cache and a small sliding-window
     ring cache, each holding only its type's storing layers (correct sliding-window
     attention enables large contexts)

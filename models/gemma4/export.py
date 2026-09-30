@@ -119,7 +119,7 @@ def _resolve_eos_token_ids(hf_model_id: str, text_config: Any) -> list[int]:
 
 
 def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
-    """Extra ``language`` metadata keys the iOS runner needs.
+    """Extra ``language`` metadata the iOS runner needs, grouped under ``overrides``.
 
     * ``sliding_window`` -- the runner builds the windowed mask for the sliding
       KV cache from it.
@@ -135,7 +135,7 @@ def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
     """
     try:
         rope = text_config.rope_parameters
-        extras: dict[str, Any] = {
+        overrides: dict[str, Any] = {
             "sliding_window": text_config.sliding_window,
             "rope": {
                 "sliding_head_dim": text_config.head_dim,
@@ -154,8 +154,8 @@ def _ios_metadata_extras(text_config: Any) -> dict[str, Any]:
 
     softcap = getattr(text_config, "final_logit_softcapping", None)
     if softcap:
-        extras["final_logit_softcapping"] = float(softcap)
-    return extras
+        overrides["final_logit_softcapping"] = float(softcap)
+    return {"overrides": overrides}
 
 
 def _patch_language_metadata(
@@ -567,8 +567,8 @@ async def _export_ios(args: argparse.Namespace) -> str:
             compression=compression,
             name=output_name,
         )
-        # The iOS runner needs the sliding window and the dual-RoPE table
-        # parameters from `language`; the PLE sidecar is declared in the generic
+        # The iOS runner needs the sliding window, the dual-RoPE table parameters
+        # and the soft cap from `language.overrides`; the PLE sidecar is declared in the generic
         # `assets` role map, which is the single path the runner resolves through.
         extras = _ios_metadata_extras(hf_config)
         assets = {"per_layer_embeddings": Path(ple_path).name}

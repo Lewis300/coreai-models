@@ -87,8 +87,10 @@ Embeddings table is written as a sidecar next to the asset.
 
 There is no Gemma-specific engine. The generic static-shape engine drives these
 assets, wiring up handlers from what the graph declares plus the bundle
-metadata: precomputed dual-RoPE rows (`language.rope`), the sliding-window mask
-and ring write offset (`language.sliding_window`), and the per-layer embeddings
+metadata: precomputed dual-RoPE rows (`language.overrides.rope`), the
+sliding-window mask and ring write offset (`language.overrides.sliding_window`),
+the final-logit soft cap applied before sampling
+(`language.overrides.final_logit_softcapping`), and the per-layer embeddings
 gather (`assets.per_layer_embeddings`). The global KV cache is classified as
 per-bucket automatically — its backing buffer varies across the ladder — so it is
 allocated at the running context bucket and re-laid-out as decode grows into

@@ -136,9 +136,11 @@ def test_cli_accepts_small_and_default_contexts():
 
 def test_metadata_extras_require_what_the_runner_needs():
     cfg = _make_config()
-    extras = export_g4._ios_metadata_extras(cfg)
-    assert extras["sliding_window"] == cfg.sliding_window
-    assert set(extras["rope"]) == {
+    cfg.final_logit_softcapping = 30.0
+    overrides = export_g4._ios_metadata_extras(cfg)["overrides"]
+    assert overrides["sliding_window"] == cfg.sliding_window
+    assert overrides["final_logit_softcapping"] == 30.0
+    assert set(overrides["rope"]) == {
         "sliding_head_dim",
         "global_head_dim",
         "sliding_rope_theta",
