@@ -7,7 +7,7 @@ Google's Gemma 4 models for on-device inference via Core AI (iOS).
 | Model                | Parameters | iOS |
 | -------------------- | ---------- | --- |
 | Gemma 4 E2B Instruct | 5.0B       | Yes (27.2+) |
-| Gemma 4 E4B Instruct | 8.0B       | Yes |
+| Gemma 4 E4B Instruct | 8.0B       | Yes (27.2+) |
 
 These are the Gemma 4 checkpoints sized for a phone. They export through the
 standalone [`export.py`](export.py) rather than the generic `coreai.llm.export`
