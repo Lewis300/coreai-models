@@ -154,15 +154,7 @@ struct LLMServer: AsyncParsableCommand {
 
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
 
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main",
-            overrides: bundle.overrides
-        )
+        let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
         let engine = try await EngineFactory.createEngine(
             config: configData,

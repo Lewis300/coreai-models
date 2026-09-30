@@ -108,15 +108,7 @@ public struct EngineFactory: Sendable {
             })
 
         // Standard single-asset LLM: build the config and delegate to the asset/URL path.
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main",
-            overrides: bundle.overrides
-        )
+        let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
         return try await createEngine(config: configData, modelURL: languageModelURL, options: options)
     }

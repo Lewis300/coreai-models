@@ -91,15 +91,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         // time below. This only inspects the cache; it never triggers specialization.
         let cacheHit = PreparedModel.isCached(at: modelURL)
 
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main",
-            overrides: bundle.overrides
-        )
+        let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
         print("\n⏳ Preparing AI asset...", terminator: "")
         fflush(stdout)

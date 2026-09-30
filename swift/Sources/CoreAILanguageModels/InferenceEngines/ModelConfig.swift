@@ -106,6 +106,20 @@ public struct ModelConfig: InferenceConfiguration, Codable, Sendable {
         self.overrides = overrides
     }
 
+    /// The engine config for a bundle's language model: identity and sizes from the
+    /// bundle's `language` metadata, its `main` asset and function, and its overrides.
+    public init(bundle: LanguageBundle, source: ModelSource? = nil) {
+        self.init(
+            name: bundle.name,
+            tokenizer: bundle.tokenizer,
+            vocabSize: bundle.vocabSize,
+            maxContextLength: bundle.maxContextLength,
+            source: source,
+            serializedModel: [bundle.modelAssetPath],
+            function: bundle.language.functionMap?.name(for: "main") ?? "main",
+            overrides: bundle.overrides)
+    }
+
     enum CodingKeys: String, CodingKey {
         case name
         case tokenizer
