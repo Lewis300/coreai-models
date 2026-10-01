@@ -11,6 +11,7 @@ from unittest import mock
 
 import pytest
 import torch
+from huggingface_hub import try_to_load_from_cache
 from transformers import AutoTokenizer
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -856,14 +857,23 @@ class TestQwen3_5ForCausalLMParity:
     DTYPE = torch.float32
 
     @pytest.fixture(autouse=True)
-    def _skip_if_hf_unreachable(self) -> None:
-        if not _hf_hub_reachable(self.MODEL_ID):
-            pytest.skip(f"HuggingFace Hub unreachable for {self.MODEL_ID!r}")
+    def _require_weights(self) -> None:
+        # A cached checkpoint (HF_HUB_CACHE may point at an external drive) needs no
+        # network; otherwise skip unless the Hub can supply it.
+        needed = ("config.json", "model.safetensors.index.json", "tokenizer.json")
+        self.local_files_only = all(
+            isinstance(try_to_load_from_cache(self.MODEL_ID, name), str) for name in needed
+        )
+        if not self.local_files_only and not _hf_hub_reachable(self.MODEL_ID):
+            pytest.skip(f"{self.MODEL_ID!r} is neither cached nor reachable on the Hub")
         torch.manual_seed(0)
 
     def _load_pair(self) -> tuple[Qwen3_5ForCausalLM, HFQwen3_5ForCausalLM, Qwen3_5TextConfig]:
         hf_model = HFQwen3_5ForCausalLM.from_pretrained(
-            self.MODEL_ID, dtype=self.DTYPE, attn_implementation="sdpa"
+            self.MODEL_ID,
+            local_files_only=self.local_files_only,
+            dtype=self.DTYPE,
+            attn_implementation="sdpa",
         ).eval()
 
         config = hf_model.config
@@ -905,7 +915,9 @@ class TestQwen3_5ForCausalLMParity:
         our_model, hf_model, config = self._load_pair()
         k_cache, v_cache, conv_states, recurrent_states = self._caches(config)
 
-        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_ID)
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.MODEL_ID, local_files_only=self.local_files_only
+        )
         prompt = [{"role": "user", "content": "Hello"}]
         input_ids = torch.tensor(
             tokenizer.apply_chat_template(prompt, add_generation_prompt=True).input_ids
