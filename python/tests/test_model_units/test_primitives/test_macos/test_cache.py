@@ -404,19 +404,14 @@ class TestDeltaNetCache:
     CONV_DIM = KEY_DIM * 2 + VALUE_DIM
     CONV_KERNEL = _MockDeltaNetConfig.linear_conv_kernel_dim
 
-    @pytest.mark.parametrize("conv_channels_last", [False, True])
-    def test_update_conv_state(self, conv_channels_last: bool) -> None:
+    def test_update_conv_state(self) -> None:
         config = _MockDeltaNetConfig()
         conv_states, recurrent_states = DeltaNetCache.create_cache_tensors(
-            config, conv_channels_last=conv_channels_last
+            config, n_layers=config.num_hidden_layers
         )
         cache = DeltaNetCache(conv_states, recurrent_states)
 
-        window = (
-            (1, self.CONV_KERNEL, self.CONV_DIM)
-            if conv_channels_last
-            else (1, self.CONV_DIM, self.CONV_KERNEL)
-        )
+        window = (1, self.CONV_KERNEL, self.CONV_DIM)
         assert conv_states.shape == (config.num_hidden_layers, *window)
 
         expected = []
@@ -429,7 +424,9 @@ class TestDeltaNetCache:
 
     def test_update_recurrent_state(self) -> None:
         config = _MockDeltaNetConfig()
-        conv_states, recurrent_states = DeltaNetCache.create_cache_tensors(config)
+        conv_states, recurrent_states = DeltaNetCache.create_cache_tensors(
+            config, n_layers=config.num_hidden_layers
+        )
         cache = DeltaNetCache(conv_states, recurrent_states)
 
         expected = []

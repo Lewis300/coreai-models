@@ -412,8 +412,7 @@ class DeltaNetCache:
     Two ``SSMState`` tensors, both indexed by layer:
 
     - ``conv_states``: the trailing ``conv_kernel_size`` tokens feeding the depthwise
-      causal conv, either ``(n_layers, batch, conv_dim, conv_kernel_size)`` or, with
-      ``conv_channels_last``, ``(n_layers, batch, conv_kernel_size, conv_dim)``.
+      causal conv, ``(n_layers, batch, conv_kernel_size, conv_dim)``.
     - ``recurrent_states``: ``(n_layers, batch, num_v_heads, head_k_dim, head_v_dim)``
       — the gated-delta rule's carried state.
 
@@ -430,30 +429,25 @@ class DeltaNetCache:
     def create_cache_tensors(
         cls,
         config,
+        *,
+        n_layers: int,
         dtype: torch.dtype = torch.float32,
-        n_layers: int | None = None,
-        conv_channels_last: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Create zero-initialized DeltaNet cache tensors from a model config.
 
+        The conv window is stored channels-last, ``(..., conv_kernel_size, conv_dim)``:
+        the ``(batch, seq, conv_dim)`` layout the fused input projection emits, so the
+        conv reads and writes the state with plain slices.
+
         Args:
-            config: Model config supplying the layer/head dimensions.
+            config: Model config supplying the head dimensions.
+            n_layers: Number of state rows: the count of linear-attention layers.
             dtype: State dtype.
-            n_layers: Number of state rows; defaults to ``config.num_hidden_layers``.
-                Hybrid decoders pass the count of their linear-attention layers.
-            conv_channels_last: Store the conv window as ``(..., conv_kernel_size,
-                conv_dim)``. Matches the ``(batch, seq, conv_dim)`` layout the fused
-                input projection emits, so the conv reads and writes the state with
-                plain slices. Channels-first is the default because
-                ``F.conv1d(groups=conv_dim)`` on a channels-first *stream* needs it
-                (see ``qwen3_next.GatedDeltaNet``).
 
         Returns:
             ``(conv_states, recurrent_states)`` tensors.
         """
         batch_size = 1
-        if n_layers is None:
-            n_layers = config.num_hidden_layers
         num_v_heads = config.linear_num_value_heads
         num_k_heads = config.linear_num_key_heads
         head_k_dim = config.linear_key_head_dim
@@ -463,12 +457,7 @@ class DeltaNetCache:
         conv_dim = key_dim * 2 + value_dim
         conv_kernel_size = config.linear_conv_kernel_dim
 
-        conv_shape = (
-            (n_layers, batch_size, conv_kernel_size, conv_dim)
-            if conv_channels_last
-            else (n_layers, batch_size, conv_dim, conv_kernel_size)
-        )
-        conv_states = torch.zeros(*conv_shape, dtype=dtype)
+        conv_states = torch.zeros(n_layers, batch_size, conv_kernel_size, conv_dim, dtype=dtype)
         recurrent_states = torch.zeros(
             n_layers, batch_size, num_v_heads, head_k_dim, head_v_dim, dtype=dtype
         )
