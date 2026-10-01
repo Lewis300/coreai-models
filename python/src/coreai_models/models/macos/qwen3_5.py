@@ -39,17 +39,6 @@ from coreai_models.primitives.macos.rope import initialize_rope
 from coreai_models.primitives.macos.sdpa import SDPA
 from coreai_models.primitives.macos.switch import SwitchGLU
 
-# Express the gated-delta-net depthwise conv as ``F.conv1d(groups=conv_dim)`` rather than
-# as ``conv_kernel_size`` scaled shifts of the same filter.
-#
-# ``True`` lowers the block to one ``coreai.conv2d(groups=conv_dim)`` -- the op that
-# reaches a native depthwise-conv kernel -- bracketed by the two transposes PyTorch's
-# channels-first conv forces: 17 IR ops per linear-attention layer against 84 under
-# ``False``, which calls no conv kernel at all. The two differ only in fp32 summation
-# order (~5e-7 on a layer), so this is a lowering choice, not a numerics one. Both keep
-# the conv state channels-last, so the flag toggles only the conv itself.
-USE_DEPTHWISE_CONV1D = False
-
 _LAYER_KEY_RE = re.compile(r"model\.layers\.(\d+)\.")
 
 
@@ -165,19 +154,14 @@ class GatedDeltaNet(nn.Module):
             raise ValueError(err)
         self.head_ratio = self.num_v_heads // self.num_k_heads
 
-        # Depthwise causal conv filter, laid out to match the conv form in force:
-        # ``F.conv1d`` wants HF's own (channels, 1, kernel), the shift chain wants it
-        # tap-major as (kernel, channels). `_mutate_state_dict` does the layout.
+        # Depthwise causal conv filter, tap-major as (kernel, channels) for the shift
+        # chain in `forward`. `_mutate_state_dict` converts HF's (channels, 1, kernel).
         #
         # A bare Parameter rather than an `nn.Conv1d`: the quantizer fake-quants every
         # Conv1d it finds, and this filter's axis 1 has size 1, so the 4-bit recipe's
         # block_size-32 spec cannot apply -- it warns per linear-attention layer, and
         # neither `module_name_configs` nor `module_type_configs` suppresses that.
-        self.conv_weight = nn.Parameter(
-            torch.zeros(conv_dim, 1, conv_kernel_size)
-            if USE_DEPTHWISE_CONV1D
-            else torch.zeros(conv_kernel_size, conv_dim)
-        )
+        self.conv_weight = nn.Parameter(torch.zeros(conv_kernel_size, conv_dim))
 
         # Fused input projection produces qkv | z | b | a along the output dim.
         # qkv goes through the conv; z/b/a bypass it and slice off the tail.
@@ -234,24 +218,11 @@ class GatedDeltaNet(nn.Module):
                 conv_input.narrow(1, S - 1, conv_kernel_size),
             )
 
-        # Prepending conv_kernel_size - 1 taps rather than conv_kernel_size gives exactly
-        # S outputs either way, so neither path slices a wasted column off the end.
-        if USE_DEPTHWISE_CONV1D:
-            # PyTorch's conv is channels-first only, so the stream transposes in and back
-            # out. Both sit directly on either side of the conv, the pattern a
-            # channels-last dwConv match needs to fold.
-            conv_out = nn.functional.conv1d(
-                conv_input.transpose(1, 2),
-                self.conv_weight,
-                bias=None,
-                padding=0,
-                groups=self.conv_dim,
-            ).transpose(1, 2)
-        else:
-            # The same filter as conv_kernel_size scaled shifts, channels-last throughout.
-            conv_out = conv_input.narrow(1, 0, S) * self.conv_weight[0]
-            for tap in range(1, conv_kernel_size):
-                conv_out = conv_out + conv_input.narrow(1, tap, S) * self.conv_weight[tap]
+        # The depthwise causal conv as conv_kernel_size scaled shifts, channels-last
+        # throughout. Prepending conv_kernel_size - 1 taps gives exactly S outputs.
+        conv_out = conv_input.narrow(1, 0, S) * self.conv_weight[0]
+        for tap in range(1, conv_kernel_size):
+            conv_out = conv_out + conv_input.narrow(1, tap, S) * self.conv_weight[tap]
 
         qkv_activated = nn.functional.silu(conv_out)
 
@@ -627,15 +598,12 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
                 [qkv_w, z_w, b_w, a_w], dim=0
             )
 
-        # GDN: conv1d.weight [conv_dim, 1, kernel] → conv_weight, in the layout the conv
-        # form in force wants. See `USE_DEPTHWISE_CONV1D`.
+        # GDN: conv1d.weight [conv_dim, 1, kernel] → conv_weight [kernel, conv_dim].
         for i in range(max_layer + 1):
             conv_key = f"model.layers.{i}.linear_attn.conv1d.weight"
             if conv_key not in state_dict:
                 continue
-            conv_w = state_dict.pop(conv_key)
-            if not USE_DEPTHWISE_CONV1D:
-                conv_w = conv_w.squeeze(1).transpose(0, 1).contiguous()
+            conv_w = state_dict.pop(conv_key).squeeze(1).transpose(0, 1).contiguous()
             state_dict[f"model.layers.{i}.linear_attn.conv_weight"] = conv_w
 
         # MoE: experts.gate_up_proj [N, 2*I, H] → switch_mlp.{gate,up}_proj.weight [1, N, I, H]

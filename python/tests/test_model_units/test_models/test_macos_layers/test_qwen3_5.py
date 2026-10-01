@@ -7,7 +7,6 @@
 
 import asyncio
 import copy
-from unittest import mock
 
 import pytest
 import torch
@@ -43,7 +42,6 @@ from coreai_models._constants import (
 )
 from coreai_models.export import pipeline as export_pipeline
 from coreai_models.models.base import TraceSpec
-from coreai_models.models.macos import qwen3_5
 from coreai_models.models.macos.qwen3_5 import (
     Attention,
     GatedDeltaNet,
@@ -375,30 +373,6 @@ class TestGatedDeltaNet:
         our_out = our(x)
 
         torch.testing.assert_close(our_out, hf_out, atol=atol, rtol=rtol)
-
-    def test_conv_forms_agree(self) -> None:
-        """Both ``USE_DEPTHWISE_CONV1D`` paths compute the same conv.
-
-        They differ only in fp32 summation order (~5e-7 here). If the filter layout
-        ``_mutate_state_dict`` writes fell out of sync with the conv consuming it, the
-        taps would be permuted and the outputs would differ by O(1).
-        """
-        config = _make_component_config()
-        x = torch.randn(1, 4, config.hidden_size)
-
-        outputs = []
-        for use_conv1d in (True, False):
-            with mock.patch.object(qwen3_5, "USE_DEPTHWISE_CONV1D", use_conv1d):
-                our = GatedDeltaNet(config=config, layer_idx=0)
-                hf = HFGatedDeltaNet(config=config, layer_idx=0)
-                # Seeded so both paths load the same filter, from the same HF layout.
-                torch.manual_seed(0)
-                _setup_gated_delta_net_weights(our, hf, config)
-                with torch.no_grad():
-                    outputs.append(our(x))
-
-        conv1d_out, shifts_out = outputs
-        torch.testing.assert_close(conv1d_out, shifts_out, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("heads", [(1, 1), (8, 4)])
