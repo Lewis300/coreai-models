@@ -320,6 +320,8 @@ class BaseForCausalLM(torch.nn.Module):
     # Whether `num_layers` (`--num-layers`) can truncate this model. False for hybrid
     # models, whose per-layer-type states don't follow a plain layer-count cut.
     supports_num_layers: bool = True
+    # Whether coreai-opt can quantize this model in graph mode (`execution_mode: graph`).
+    supports_graph_quantization: bool = True
 
     #: Whether the macOS exporter emits a second, LM-head-less ``prefill`` graph
     #: beside ``main``. Opt in per model: ``forward`` must honour

@@ -5,13 +5,14 @@
 
 """Tests for macOS Qwen3.5 model parity with HuggingFace."""
 
+import asyncio
 import copy
 from unittest import mock
 
 import pytest
 import torch
 from transformers import AutoTokenizer
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Attention as HFAttention,
 )
@@ -39,6 +40,7 @@ from coreai_models._constants import (
     RECURRENT_STATES_NAME,
     VALUE_CACHE_NAME,
 )
+from coreai_models.export import pipeline as export_pipeline
 from coreai_models.models.base import TraceSpec
 from coreai_models.models.macos import qwen3_5
 from coreai_models.models.macos.qwen3_5 import (
@@ -502,6 +504,64 @@ class TestTransformerBlockLinearAttention:
         our_out = our_block(x, position_ids)
 
         torch.testing.assert_close(our_out, hf_out, atol=1e-3, rtol=1e-3)
+
+
+class TestExportGuards:
+    """Unsupported export options are rejected before anything is downloaded."""
+
+    @pytest.fixture(autouse=True)
+    def _offline_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = Qwen3_5Config(text_config=_make_qwen3_5_config().to_dict())
+        monkeypatch.setattr(export_pipeline.AutoConfig, "from_pretrained", lambda *_, **__: config)
+
+        def no_download(*_args, **_kwargs):
+            raise AssertionError("the guard should fire before loading the model")
+
+        monkeypatch.setattr(Qwen3_5ForCausalLM, "from_hf_memory_efficient", no_download)
+
+    def _export(self, **options) -> None:
+        config = export_pipeline.ExportConfig(
+            hf_model_id="Qwen/Qwen3.5-0.8B", model_type_override="qwen3_5", **options
+        )
+        asyncio.run(export_pipeline._async_export_model(config))
+
+    def test_num_layers(self) -> None:
+        with pytest.raises(ValueError, match="--num-layers is not currently supported"):
+            self._export(num_layers=2)
+
+    def test_graph_quantization(self) -> None:
+        with pytest.raises(ValueError, match="Graph-mode quantization is not currently supported"):
+            self._export(quantization_mode="graph")
+
+
+class TestLoadStateDict:
+    def _model_and_state_dict(self) -> tuple[Qwen3_5ForCausalLM, dict[str, torch.Tensor]]:
+        config = _make_qwen3_5_config()
+        hf_model = HFQwen3_5ForCausalLM(config).eval()
+        model = Qwen3_5ForCausalLM(config, model_device="cpu").eval()
+        sd = dict(hf_model.state_dict())
+        model._mutate_state_dict(sd)
+        return model, sd
+
+    def test_returns_incompatible_keys_and_leaves_input_alone(self) -> None:
+        model, sd = self._model_and_state_dict()
+        stripped = {k.removeprefix("model."): v for k, v in sd.items()}
+        keys_before = list(stripped)
+
+        result = model.load_state_dict(stripped, strict=True)
+
+        assert result.missing_keys == [] and result.unexpected_keys == []
+        assert list(stripped) == keys_before
+
+    def test_non_strict_reports_foreign_keys_instead_of_raising(self) -> None:
+        model, sd = self._model_and_state_dict()
+        sd["mtp.fc.weight"] = torch.zeros(1)
+
+        result = model.load_state_dict(sd, strict=False)
+
+        assert result.unexpected_keys == ["mtp.fc.weight"]
+        with pytest.raises(ValueError, match="Unexpected key"):
+            model.load_state_dict(sd, strict=True)
 
 
 class TestExportContract:

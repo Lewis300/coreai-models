@@ -83,9 +83,13 @@ class Attention(nn.Module):
         eps = config.rms_norm_eps
         self.qk_norm = RMSNorm(head_dim, eps=eps, n_heads=n_heads + n_kv_heads)
 
+        # Partial rotary (0.25 on every checkpoint): the runtime's composite RoPE op
+        # mis-lowers it on newer OS betas, so emit the rotation with raw torch ops, as
+        # phi3.py does.
         self.rope = initialize_rope(
             dims=int(head_dim * partial_rotary_factor),
             base=resolve_rope_theta(config),
+            decomposed=partial_rotary_factor < 1.0,
         )
 
         self.sdpa = SDPA(is_causal=True)
@@ -383,6 +387,8 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
     _extra_hf_shared_keys = ["lm_head.weight"]
     # Hybrid: states are sized per layer type, so a plain layer-count cut isn't supported.
     supports_num_layers = False
+    # coreai-opt's graph-mode prepare rejects the GatedDeltaNet source partition.
+    supports_graph_quantization = False
 
     # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``. Every state this
     # model carries is written by an in-place update, so all four survive the trim that
@@ -483,19 +489,9 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
     def create_delta_cache_tensors(
         cls, config, dtype: torch.dtype = torch.float32
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build the DeltaNet states at the size this model actually uses.
-
-        Callers driving ``forward`` directly should come through here rather than
-        ``DeltaNetCache.create_cache_tensors``, whose defaults size by every layer and
-        lay the conv window out channels-first.
-        """
+        """Build the DeltaNet states, one row per linear-attention layer."""
         return DeltaNetCache.create_cache_tensors(
-            config,
-            dtype=dtype,
-            n_layers=cls.delta_cache_layer_count(config),
-            # The layout `in_proj_all` emits, so `GatedDeltaNet` touches the state with
-            # plain slices under either setting of `USE_DEPTHWISE_CONV1D`.
-            conv_channels_last=True,
+            config, n_layers=cls.delta_cache_layer_count(config), dtype=dtype
         )
 
     @override
@@ -522,17 +518,23 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
         graphs[MAIN_GRAPH_NAME]["recurrent_states"] = None
         return graphs
 
-    def _normalize_keys(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Bring HF state dict keys into this module's namespace, in-place."""
-        for k in state_dict:
-            if not k.startswith(self._EXPECTED_KEY_PREFIXES):
-                err = (
-                    f"Unexpected key in state dict: {k!r}. "
-                    f"Expected one of {self._EXPECTED_KEY_PREFIXES}."
-                )
-                raise ValueError(err)
+    def _normalize_keys(
+        self: Self, state_dict: dict[str, torch.Tensor], strict: bool = True
+    ) -> None:
+        """Bring HF state dict keys into this module's namespace, in-place.
 
+        With ``strict``, a key outside ``_EXPECTED_KEY_PREFIXES`` raises; otherwise it is
+        left as is, for ``load_state_dict`` to report as unexpected.
+        """
         for k in list(state_dict.keys()):
+            if not k.startswith(self._EXPECTED_KEY_PREFIXES):
+                if strict:
+                    err = (
+                        f"Unexpected key in state dict: {k!r}. "
+                        f"Expected one of {self._EXPECTED_KEY_PREFIXES}."
+                    )
+                    raise ValueError(err)
+                continue
             if not k.startswith(("model.", "lm_head.")):
                 state_dict[f"model.{k}"] = state_dict.pop(k)
 
@@ -541,8 +543,8 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
         self._normalize_keys(state_dict)
 
         # Fuse per-projection HF weights into the fused projections declared in
-        # __init__. Idempotent: each fusion skips if its source keys are already popped
-        # (e.g. on a second pass via `load_state_dict`).
+        # __init__. Idempotent: each fusion skips if its source keys are already popped,
+        # so an already-fused state dict passes through unchanged.
         max_layer = max(
             (int(m.group(1)) for k in state_dict if (m := _LAYER_KEY_RE.match(k))), default=-1
         )
@@ -658,8 +660,11 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
         # Every load path lands here, including the shared (layerless) slice that
         # `from_hf_memory_efficient` assigns separately -- that slice never reaches
         # `_mutate_state_dict`, so this is where its keys get re-prefixed. Idempotent,
-        # so keys already in this namespace pass through.
-        self._normalize_keys(state_dict)
-        super().load_state_dict(state_dict, strict=strict, assign=assign)
+        # so keys already in this namespace pass through. Normalizes a copy, leaving
+        # the caller's dict as it was.
+        state_dict = dict(state_dict)
+        self._normalize_keys(state_dict, strict=strict)
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        return result

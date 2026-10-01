@@ -26,7 +26,7 @@ VALUE_CACHE_NAME = "valueCache"
 SLIDING_KEY_CACHE_NAME = "slidingKeyCache"
 SLIDING_VALUE_CACHE_NAME = "slidingValueCache"
 
-# SSM state names for hybrid attention+SSM models (e.g. Qwen3.5, Qwen3-Next)
+# SSM state names for hybrid attention+SSM models (e.g. Qwen3.5)
 CONV_STATES_NAME = "convStates"
 RECURRENT_STATES_NAME = "recurrentStates"
 
