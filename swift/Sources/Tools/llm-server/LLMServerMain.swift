@@ -120,7 +120,7 @@ struct LLMServer: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        let bundle = try LanguageBundle(from: url.path)
+        let bundle = try LanguageModelBundle(from: url.path)
         try bundle.modelBundle.verifyAssetsExisting()
 
         if clearCoreAICache {
@@ -138,7 +138,8 @@ struct LLMServer: AsyncParsableCommand {
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity,
             prefillChunkSize: resolvedChunkSize,
-            prefillChunkThreshold: resolvedChunkThreshold
+            prefillChunkThreshold: resolvedChunkThreshold,
+            tensorData: bundle.tensorData
         )
 
         let modelURL = try bundle.modelBundle.requireModelURL(for: ModelBundle.ComponentKey.main)
@@ -153,14 +154,7 @@ struct LLMServer: AsyncParsableCommand {
 
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
 
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
-        )
+        let engineConfig = ModelConfig(bundle: bundle)
         let configData = try JSONEncoder().encode(engineConfig)
         let engine = try await EngineFactory.createEngine(
             config: configData,

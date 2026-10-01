@@ -13,11 +13,11 @@ import Tokenizers
 /// vocab, context, optional `function_map`) and the model asset path.
 ///
 /// Two strict-load constructors:
-/// - `LanguageBundle(at: url)` — read metadata.json, throws if not LLM
-/// - `LanguageBundle(bundle: existing)` — upgrade an inspected `ModelBundle`
+/// - `LanguageModelBundle(at: url)` — read metadata.json, throws if not LLM
+/// - `LanguageModelBundle(bundle: existing)` — upgrade an inspected `ModelBundle`
 ///
-/// For lossy peeks see `extension ModelBundle { var language: LanguageBundle? }`.
-public struct LanguageBundle: Sendable {
+/// For lossy peeks see `extension ModelBundle { var language: LanguageModelBundle? }`.
+public struct LanguageModelBundle: Sendable {
     public let modelBundle: ModelBundle
     public let modelAssetPath: String
     public let language: LanguageConfig
@@ -61,6 +61,20 @@ public struct LanguageBundle: Sendable {
     public var vocabSize: Int { language.vocabSize }
     public var maxContextLength: Int { language.maxContextLength }
 
+    /// Model-specific runtime settings (`language.overrides`); nil for most models.
+    public var overrides: LanguageOverrides? { language.overrides }
+
+    /// Tensor data the engine reads alongside the model, keyed by `assets` role. Only
+    /// roles the bundle declares are present.
+    public var tensorData: [String: URL] {
+        var resolved: [String: URL] = [:]
+        let key = EngineOptions.TensorDataKey.perLayerEmbeddings
+        if let url = modelBundle.modelURL(for: key) {
+            resolved[key] = url
+        }
+        return resolved
+    }
+
     /// Raw metadata bytes for passing to engine config parsers.
     public var rawMetadata: Data { modelBundle.raw }
 
@@ -88,7 +102,7 @@ public struct LanguageBundle: Sendable {
 
 // MARK: - 0.2 payload shape
 
-extension LanguageBundle {
+extension LanguageModelBundle {
     fileprivate struct LanguagePayload: Decodable {
         let assets: Assets
         let language: LanguageConfig?
