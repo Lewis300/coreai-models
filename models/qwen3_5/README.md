@@ -17,18 +17,18 @@ The runner uses it for the prompt when present and holds the last token back for
 
 ## Supported Models
 
-| Model             | Parameters        | macOS | iOS |
-| ----------------- | ----------------- | ----- | --- |
-| Qwen3.5 0.8B      | 0.8B              | Yes   | No  |
-| Qwen3.5 2B        | 2B                | Yes   | No  |
-| Qwen3.5 4B        | 4B                | Yes   | No  |
-| Qwen3.5 9B        | 9B                | Yes   | No  |
-| Qwen3.5 27B       | 27B               | Yes   | No  |
-| Qwen3.6 27B       | 27B               | Yes   | No  |
-| Qwen3.8 27B       | 27B               | Yes   | No  |
-| Qwen3.5 35B-A3B   | 35B (3B active)   | Yes   | No  |
-| Qwen3.6 35B-A3B   | 35B (3B active)   | Yes   | No  |
-| Qwen3.5 122B-A10B | 122B (10B active) | Yes   | No  |
+| Model             | Parameters        | macOS        | iOS |
+| ----------------- | ----------------- | ------------ | --- |
+| Qwen3.5 0.8B      | 0.8B              | Yes (27.2+)  | No  |
+| Qwen3.5 2B        | 2B                | Yes (27.2+)  | No  |
+| Qwen3.5 4B        | 4B                | Yes (27.2+)  | No  |
+| Qwen3.5 9B        | 9B                | Yes (27.2+)  | No  |
+| Qwen3.5 27B       | 27B               | Yes (27.2+)  | No  |
+| Qwen3.6 27B       | 27B               | Yes (27.2+)  | No  |
+| Qwen3.8 27B       | 27B               | Yes (27.2+)  | No  |
+| Qwen3.5 35B-A3B   | 35B (3B active)   | Yes (27.2+)  | No  |
+| Qwen3.6 35B-A3B   | 35B (3B active)   | Yes (27.2+)  | No  |
+| Qwen3.5 122B-A10B | 122B (10B active) | Yes (27.2+)  | No  |
 
 The MoE checkpoints (`-A3B`, `-A10B`) use the same model class as the dense ones.
 
