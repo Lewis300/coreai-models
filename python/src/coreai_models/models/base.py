@@ -267,7 +267,8 @@ def _build_safetensors_key_index(
                     continue
                 stripped = key.removeprefix(hf_state_dict_prefix)
 
-                if num_layers is not None and _is_layer_key_beyond(stripped, num_layers):
+                # The full key: a stripped "layers.N." lacks the "." the filter matches on.
+                if num_layers is not None and _is_layer_key_beyond(key, num_layers):
                     continue
                 match = layer_pattern.match(stripped)
                 if match:
@@ -316,6 +317,9 @@ class BaseForCausalLM(torch.nn.Module):
     # Exact safetensors keys to load as shared params regardless of
     # `hf_state_dict_prefix`, for weights sitting outside the prefixed sub-model.
     _extra_hf_shared_keys: list[str] = []
+    # Whether `num_layers` (`--num-layers`) can truncate this model. False for hybrid
+    # models, whose per-layer-type states don't follow a plain layer-count cut.
+    supports_num_layers: bool = True
 
     #: Whether the macOS exporter emits a second, LM-head-less ``prefill`` graph
     #: beside ``main``. Opt in per model: ``forward`` must honour
@@ -603,6 +607,10 @@ class BaseForCausalLM(torch.nn.Module):
         if max_context_length is not None and hasattr(hf_config, "max_position_embeddings"):
             hf_config.max_position_embeddings = max_context_length
         if num_layers is not None:
+            if not cls.supports_num_layers:
+                raise ValueError(
+                    f"num_layers is not currently supported for hybrid models ({cls.__name__})"
+                )
             if not hasattr(hf_config, "num_hidden_layers"):
                 raise ValueError(
                     f"num_layers={num_layers} was specified but hf_config has no "

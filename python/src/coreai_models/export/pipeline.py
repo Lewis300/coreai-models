@@ -174,6 +174,10 @@ async def _async_export_model(config: ExportConfig) -> str:
             )
 
     model_class = entry.macos_class if config.variant == "macOS" else entry.ios_class
+    if config.num_layers is not None and not model_class.supports_num_layers:
+        raise ValueError(
+            f"--num-layers is not currently supported for hybrid models ({model_type})."
+        )
 
     # ---- 2. Load model ----
     target_dtype = _resolve_precision(config.compute_precision)

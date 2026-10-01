@@ -381,6 +381,8 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
     # lm_head.weight sits at the checkpoint root (outside model.language_model.)
     # for models with untied word embeddings (e.g. 9B).
     _extra_hf_shared_keys = ["lm_head.weight"]
+    # Hybrid: states are sized per layer type, so a plain layer-count cut isn't supported.
+    supports_num_layers = False
 
     # Emit a second, prefill-only ``prefill`` entrypoint beside ``main``. Every state this
     # model carries is written by an in-place update, so all four survive the trim that
@@ -442,7 +444,8 @@ class Qwen3_5ForCausalLM(BaseForCausalLM):
 
     @classmethod
     def _count_layer_type(cls, config, layer_type: str) -> int:
-        return (config.layer_types or []).count(layer_type)
+        # Only the layers the model actually builds, in case num_hidden_layers was lowered.
+        return (config.layer_types or [])[: config.num_hidden_layers].count(layer_type)
 
     @classmethod
     def kv_cache_layer_count(cls, config) -> int:

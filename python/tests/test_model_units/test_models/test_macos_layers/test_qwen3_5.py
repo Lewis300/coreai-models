@@ -27,6 +27,10 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5TextRotaryEmbedding,
 )
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeForCausalLM as HFQwen3_5MoeForCausalLM,
+)
 
 from coreai_models._constants import (
     CONV_STATES_NAME,
@@ -44,6 +48,7 @@ from coreai_models.models.macos.qwen3_5 import (
     TransformerBlock,
 )
 from coreai_models.primitives.macos.mlp import MLP
+from tests._runner_infra._deps import _hf_hub_reachable
 from tests._runner_infra.testing_utils import ForCausalLMTestBase, run_compare_coreai
 
 
@@ -69,6 +74,28 @@ def _make_qwen3_5_config(
         linear_key_head_dim=16,
         linear_value_head_dim=16,
         linear_conv_kernel_dim=4,
+    )
+    config.layer_types = ["full_attention", "linear_attention"]
+    return config
+
+
+def _make_qwen3_5_moe_config() -> Qwen3_5MoeTextConfig:
+    config = Qwen3_5MoeTextConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        vocab_size=100,
+        head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        num_experts=4,
+        num_experts_per_tok=2,
     )
     config.layer_types = ["full_attention", "linear_attention"]
     return config
@@ -327,6 +354,8 @@ class TestGatedDeltaNet:
         ],
     )
     def test_hf(self, precision: torch.dtype, atol: float, rtol: float) -> None:
+        # Seeded: the low-precision tolerances sit near the noise floor for some draws.
+        torch.manual_seed(0)
         config = _make_component_config()
         batch_size, seq_len = 1, 4
         x = torch.randn(batch_size, seq_len, config.hidden_size)
@@ -572,6 +601,53 @@ class TestmacOSQwen3_5ForCausalLM:
 
         assert out.shape == (batch, seq_len, vocab)
 
+    @pytest.mark.parametrize(
+        "make_config, hf_class",
+        [
+            (_make_qwen3_5_config, HFQwen3_5ForCausalLM),
+            (_make_qwen3_5_moe_config, HFQwen3_5MoeForCausalLM),
+        ],
+        ids=["dense", "moe"],
+    )
+    def test_forward_parity(self, make_config, hf_class) -> None:
+        """Prefill then one decode step match HF on a random-init model, dense and MoE."""
+        torch.manual_seed(0)
+        config = make_config()
+        hf_model = hf_class(config).to(torch.float32).eval()
+        our_model = Qwen3_5ForCausalLM(config, model_device="cpu").to(torch.float32).eval()
+        sd = dict(hf_model.state_dict())
+        our_model._mutate_state_dict(sd)
+        our_model.load_state_dict(sd, assign=True, strict=True)
+
+        k_cache, v_cache = Qwen3_5ForCausalLM.create_kv_cache_tensors(config, dtype=torch.float32)
+        conv_states, recurrent_states = Qwen3_5ForCausalLM.create_delta_cache_tensors(
+            config, dtype=torch.float32
+        )
+        states = (k_cache, v_cache, conv_states, recurrent_states)
+        input_ids = torch.randint(0, config.vocab_size, (1, 7))
+        prompt, next_id = input_ids[:, :6], input_ids[:, 6:]
+        positions = torch.arange(7, dtype=torch.int32).unsqueeze(0)
+
+        with torch.no_grad():
+            our_prefill = our_model(prompt, positions[:, :6], *states)
+            # position_ids spans the whole sequence so far; the model reads the
+            # new token's position off its end.
+            our_decode = our_model(next_id, positions, *states)
+            hf_logits = hf_model(input_ids=input_ids, position_ids=positions.long()).logits
+
+        torch.testing.assert_close(our_prefill, hf_logits[:, :6], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(our_decode, hf_logits[:, 6:], atol=1e-4, rtol=1e-4)
+
+    def test_num_layers_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not currently supported for hybrid models"):
+            Qwen3_5ForCausalLM._get_reauthored_config(_make_qwen3_5_config(), num_layers=1)
+
+    def test_states_count_only_built_layers(self) -> None:
+        config = _make_qwen3_5_config()
+        config.layer_types = ["linear_attention", "full_attention", "full_attention"]
+        config.num_hidden_layers = 2
+        assert Qwen3_5ForCausalLM.kv_cache_layer_count(config) == 1
+
 
 class TestPrefillGraph:
     """The model-side half of the optional ``prefill`` entrypoint.
@@ -715,7 +791,15 @@ class TestQwen3_5ForCausalLMParity:
 
     MODEL_ID = "Qwen/Qwen3.5-0.8B"
     KV_CACHE_LEN = 512
-    DTYPE = torch.float16
+    # fp32 so the comparison checks the model, not low-precision noise (fp16 logits
+    # differ from HF by more than any sensible tolerance on some tokens).
+    DTYPE = torch.float32
+
+    @pytest.fixture(autouse=True)
+    def _skip_if_hf_unreachable(self) -> None:
+        if not _hf_hub_reachable(self.MODEL_ID):
+            pytest.skip(f"HuggingFace Hub unreachable for {self.MODEL_ID!r}")
+        torch.manual_seed(0)
 
     def _load_pair(self) -> tuple[Qwen3_5ForCausalLM, HFQwen3_5ForCausalLM, Qwen3_5TextConfig]:
         hf_model = HFQwen3_5ForCausalLM.from_pretrained(
@@ -753,7 +837,7 @@ class TestQwen3_5ForCausalLMParity:
             our_out = our_model(input_ids, position_ids, *self._caches(config))
             hf_out = hf_model(input_ids=input_ids, position_ids=position_ids.long())
 
-        torch.testing.assert_close(our_out, hf_out.logits, atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(our_out, hf_out.logits, atol=1e-4, rtol=1e-4)
 
     def test_forward_parity_multi_token(self) -> None:
         """Multi-token prefill followed by decode steps, both matching HF logits."""
@@ -773,7 +857,7 @@ class TestQwen3_5ForCausalLMParity:
                 input_ids, position_ids, k_cache, v_cache, conv_states, recurrent_states
             )
             hf_out = hf_model(input_ids=input_ids, position_ids=position_ids.long())
-        torch.testing.assert_close(our_out, hf_out.logits, atol=1e-1, rtol=1e-1)
+        torch.testing.assert_close(our_out, hf_out.logits, atol=1e-4, rtol=1e-4)
 
         hf_inputs = input_ids
         new_ids = torch.argmax(our_out[:, -1:, :], dim=-1).to(torch.int32)
@@ -788,7 +872,7 @@ class TestQwen3_5ForCausalLMParity:
                 )
                 hf_out = hf_model(input_ids=hf_inputs, position_ids=position_ids.long())
 
-            torch.testing.assert_close(our_out, hf_out.logits[:, -1:, :], atol=1e-1, rtol=1e-1)
+            torch.testing.assert_close(our_out, hf_out.logits[:, -1:, :], atol=1e-4, rtol=1e-4)
             new_ids = torch.argmax(our_out, dim=-1).to(torch.int32)
             if new_ids == config.eos_token_id:
                 break
