@@ -55,9 +55,6 @@ uv run coreai.llm.export Qwen/Qwen3.5-0.8B --compression none
 # Custom output directory
 uv run coreai.llm.export Qwen/Qwen3.5-0.8B --output-dir ./my-models/
 
-# Truncate to N layers (for debugging)
-uv run coreai.llm.export Qwen/Qwen3.5-0.8B --num-layers 2
-
 # Preview resolved config without exporting
 uv run coreai.llm.export Qwen/Qwen3.5-0.8B --dry-run
 ```
