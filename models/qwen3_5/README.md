@@ -1,4 +1,4 @@
-# Qwen3.5
+# Qwen3.5, 3.6, and 3.8
 
 Alibaba's Qwen3.5 models for on-device inference via Core AI.
 
@@ -89,9 +89,3 @@ swift run -c release llm-benchmark --model path/to/exported_model_folder
 ```
 
 Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p`, `-g`, and `-n`.
-
-## Tests
-
-```bash
-uv run pytest python/tests/test_model_units/test_models/test_macos_layers/test_qwen3_5.py -v
-```
