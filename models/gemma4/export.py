@@ -163,18 +163,19 @@ def _patch_language_metadata(
     hf_model_id: str,
     text_config: Any,
     extras: Optional[dict[str, Any]] = None,
-    assets: Optional[dict[str, Any]] = None,
+    auxiliary_assets: Optional[dict[str, Any]] = None,
 ) -> None:
     """Add Gemma4-specific keys to a written bundle.
 
     ``bundle_llm_asset`` writes the generic 0.2-schema metadata; the keys added
     here are Gemma4-only, so they are merged in afterwards rather than
     special-cased inside the shared bundler. ``extras`` lands in the ``language``
-    block; ``assets`` lands in the top-level role map, which is where sidecar
-    artifacts belong so the runner resolves them through one generic path.
+    block; ``auxiliary_assets`` lands in the top-level
+    ``auxiliary_assets`` role map. ``assets`` is reserved for Core AI models, so
+    sidecar artifacts such as the PLE table belong here instead.
     """
     patch: dict[str, Any] = dict(extras or {})
-    asset_patch: dict[str, Any] = dict(assets or {})
+    asset_patch: dict[str, Any] = dict(auxiliary_assets or {})
 
     eos_token_ids = _resolve_eos_token_ids(hf_model_id, text_config)
     if eos_token_ids:
@@ -187,7 +188,7 @@ def _patch_language_metadata(
     with metadata_path.open() as fh:
         metadata = json.load(fh)
     metadata["language"].update(patch)
-    metadata.setdefault("assets", {}).update(asset_patch)
+    metadata.setdefault("auxiliary_assets", {}).update(asset_patch)
     with metadata_path.open("w") as fh:
         json.dump(metadata, fh, indent=2)
     logger.info(f"Recorded {sorted(patch) + sorted(asset_patch)} in {metadata_path}")
@@ -569,12 +570,12 @@ async def _export_ios(args: argparse.Namespace) -> str:
             name=output_name,
         )
         # The iOS runner needs the sliding window, the dual-RoPE table parameters
-        # and the soft cap from `language.overrides`; the PLE sidecar is declared in the generic
-        # `assets` role map, which is the single path the runner resolves through.
+        # and the soft cap from `language.overrides`; the PLE sidecar is declared under
+        # `auxiliary_assets`; `assets` is reserved for Core AI models.
         extras = _ios_metadata_extras(hf_config)
-        assets = {"per_layer_embeddings": Path(ple_path).name}
+        auxiliary_assets = {"per_layer_embeddings": Path(ple_path).name}
         _patch_language_metadata(
-            bundle_path, hf_model_id, hf_config, extras, assets=assets
+            bundle_path, hf_model_id, hf_config, extras, auxiliary_assets=auxiliary_assets
         )
 
     logger.info(f"Export complete: {bundle_path}")

@@ -377,7 +377,7 @@ public struct EngineOptions: Sendable {
     public let prefillChunkThreshold: Int?
 
     /// Tensor data the bundle ships alongside the model, for weights too large to bake
-    /// into the graph, keyed by the role name under `assets` in `metadata.json` (see
+    /// into the graph, keyed by the role name under `auxiliary_assets` in `metadata.json` (see
     /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
     public let tensorData: [String: URL]
 
@@ -397,7 +397,7 @@ public struct EngineOptions: Sendable {
     ///     Defaults to `nil`.
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
-    ///   - tensorData: Tensor data URLs keyed by `assets` role. Defaults to empty.
+    ///   - tensorData: Tensor data URLs keyed by `auxiliary_assets` role. Defaults to empty.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,

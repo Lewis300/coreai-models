@@ -29,7 +29,13 @@ public struct ModelBundle: Sendable {
     public let userData: [String: String]?
 
     /// Role-to-filename mapping from the `"assets"` field in metadata.json.
+    /// Every entry must be a Core AI model; see `validateModelAssets()`.
     public let assets: [String: String]
+
+    /// Role-to-filename mapping from the `"auxiliary_assets"` field in metadata.json:
+    /// supporting files that are not Core AI models (e.g. raw tensor data such as the
+    /// per-layer embeddings table). Absent in most bundles.
+    public let auxiliaryAssets: [String: String]
 
     /// Full metadata.json bytes, preserved so kind-specific decoders can read
     /// their own blocks without re-reading the file.
@@ -54,6 +60,12 @@ public struct ModelBundle: Sendable {
         return bundlePath.appending(path: path)
     }
 
+    /// Resolve an auxiliary asset's URL within the bundle by role key.
+    public func auxiliaryAssetURL(for key: String) -> URL? {
+        guard let path = auxiliaryAssets[key] else { return nil }
+        return bundlePath.appending(path: path)
+    }
+
     /// Required-component variant — throws `BundleError.missingField` if absent from
     /// `assets`. Does not check whether the resolved file exists on disk or is a valid
     /// model; callers that need that guarantee should call `validateModelAssets()` first
@@ -69,7 +81,8 @@ public struct ModelBundle: Sendable {
     /// `AIModelAsset.isValid(at:)` — this is the framework's own canonical check, so
     /// supported extensions/formats never need duplicating here. Throws
     /// `BundleError.missingAsset` if a component's declared path doesn't exist, or
-    /// `BundleError.invalidModelAsset` if it exists but isn't a valid model.
+    /// `BundleError.invalidModelAsset` if it exists but isn't a valid model. Auxiliary assets
+    /// are only checked for existence, since they aren't Core AI models.
     public func validateModelAssets() throws {
         for (key, filename) in assets {
             let url = bundlePath.appending(path: filename)
@@ -78,6 +91,12 @@ public struct ModelBundle: Sendable {
             }
             guard AIModelAsset.isValid(at: url) else {
                 throw BundleError.invalidModelAsset(key: key, url: url)
+            }
+        }
+        for (key, filename) in auxiliaryAssets {
+            let url = bundlePath.appending(path: filename)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw BundleError.missingAsset(key: key, url: url)
             }
         }
     }
@@ -182,6 +201,7 @@ public struct ModelBundle: Sendable {
         self.name = common.name
         self.userData = common.userData
         self.assets = common.assets ?? [:]
+        self.auxiliaryAssets = common.auxiliaryAssets ?? [:]
     }
 }
 
@@ -201,9 +221,11 @@ extension ModelBundle {
         let name: String
         let userData: [String: String]?
         let assets: [String: String]?
+        let auxiliaryAssets: [String: String]?
 
         enum CodingKeys: String, CodingKey {
             case kind, name, assets
+            case auxiliaryAssets = "auxiliary_assets"
             case userData = "user_data"
         }
     }
