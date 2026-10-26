@@ -473,6 +473,25 @@ struct RawTokenEvaluationTests {
         }
     }
 
+    /// Deprecated so the call to the deprecated overload below does not warn.
+    @available(*, deprecated)
+    @Test("The deprecated evaluateRawTokens(_:) still scores tokens[1...] against [tokens[0]]")
+    func deprecatedOverloadKeepsItsSplit() async throws {
+        let engine = RecordingEngine(tokens: [10, 20, 30], vocabSize: 100)
+        let generator = try await makeGenerator(engine: engine)
+
+        let result = try await generator.evaluateRawTokens([11, 12, 13, 14])
+        #expect(engine.fedInputs == [[11]])
+        #expect(engine.fedContinuations == [[12, 13, 14]])
+        #expect(result.contextTokens == [11])
+        #expect(result.continuationTokens == [12, 13, 14])
+        #expect(result.logits.count == 3)
+
+        await #expect(throws: ContinuationEvaluationError.self) {
+            try await generator.evaluateRawTokens([11])
+        }
+    }
+
     @Test("Text --continuation still feeds its context and forces its continuation")
     func textContinuationUnchanged() async throws {
         let engine = RecordingEngine(tokens: [10, 20, 30], vocabSize: 256)

@@ -3,13 +3,14 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAILanguageModels
 import Foundation
 import Testing
 
 @testable import llm_runner
 
-/// Covers how `llm-runner` decides between generating and scoring from `--raw-tokens`, and each
-/// refusal it makes before the model loads.
+/// Covers how `llm-runner` decides between generating and scoring from `--raw-tokens`, each
+/// refusal it makes before the model loads, and scoring under `--json-schema`.
 @Suite("RawTokenScoring")
 struct RawTokenScoringTests {
     /// A token file in the `{"tokens": [...]}` format, removed when the test ends.
@@ -35,43 +36,57 @@ struct RawTokenScoringTests {
         return file
     }
 
-    private func continuation(
+    private func request(
         path: String?,
         context: [Int32]? = [1, 2, 3],
         textContinuation: Bool = false,
-        logits: Bool = true
-    ) throws -> [Int32]? {
+        logits: Bool = true,
+        conflictingFlags: [String] = []
+    ) throws -> RawTokenScoring.Request? {
         let contextFile = try context.map(tokensFile)
         defer { contextFile?.cleanup() }
-        return try RawTokenScoring.continuation(
+        return try RawTokenScoring.request(
             rawContinuationPath: path,
             rawTokensPath: contextFile?.path,
             textContinuationGiven: textContinuation,
-            logitsRequested: logits)
+            logitsRequested: logits,
+            conflictingFlags: conflictingFlags)
+    }
+
+    /// Expects `body` to throw the `ContinuationOptionError` that `matches` picks out.
+    private func expectRefusal(
+        _ body: () throws -> Void, sourceLocation: SourceLocation = #_sourceLocation,
+        matches: (ContinuationOptionError) -> Bool
+    ) {
+        #expect(sourceLocation: sourceLocation) {
+            try body()
+        } throws: { error in
+            guard let error = error as? ContinuationOptionError else { return false }
+            return matches(error)
+        }
     }
 
     // MARK: Deciding the mode
 
     @Test("--raw-continuation decides between generating and scoring")
     func rawContinuationDecidesTheMode() throws {
-        #expect(try continuation(path: nil) == nil)
-        #expect(try continuation(path: nil, logits: false) == nil)
+        #expect(try request(path: nil) == nil)
+        #expect(try request(path: nil, logits: false) == nil)
+        #expect(try request(path: nil, conflictingFlags: ["--image"]) == nil)
 
         let file = try tokensFile([7, 8, 9])
         defer { file.cleanup() }
-        #expect(try continuation(path: file.path) == [7, 8, 9])
+        #expect(try request(path: file.path) == .init(context: [1, 2, 3], continuation: [7, 8, 9]))
     }
 
-    // MARK: Refusals
+    // MARK: Refusals before the model loads
 
     @Test("--raw-continuation without --raw-tokens is refused")
     func refusesWithoutRawTokens() throws {
         let file = try tokensFile([7])
         defer { file.cleanup() }
-        #expect {
-            try continuation(path: file.path, context: nil)
-        } throws: { error in
-            guard case .rawContinuationRequiresRawTokens = error as? ContinuationOptionError else { return false }
+        expectRefusal({ _ = try request(path: file.path, context: nil) }) {
+            guard case .rawContinuationRequiresRawTokens = $0 else { return false }
             return true
         }
     }
@@ -80,12 +95,8 @@ struct RawTokenScoringTests {
     func refusesWithoutLogitsOutput() throws {
         let file = try tokensFile([7])
         defer { file.cleanup() }
-        #expect {
-            try continuation(path: file.path, logits: false)
-        } throws: { error in
-            guard case .rawContinuationRequiresLogitsOutput = error as? ContinuationOptionError else {
-                return false
-            }
+        expectRefusal({ _ = try request(path: file.path, logits: false) }) {
+            guard case .rawContinuationRequiresLogitsOutput = $0 else { return false }
             return true
         }
     }
@@ -94,24 +105,33 @@ struct RawTokenScoringTests {
     func refusesWithTextContinuation() throws {
         let file = try tokensFile([7])
         defer { file.cleanup() }
-        #expect {
-            try continuation(path: file.path, textContinuation: true)
-        } throws: { error in
-            guard case .rawContinuationConflictsWithContinuation = error as? ContinuationOptionError else {
-                return false
-            }
-            return true
+        expectRefusal({ _ = try request(path: file.path, textContinuation: true) }) {
+            guard case .rawContinuationConflicts(let flag) = $0 else { return false }
+            return flag == "--continuation"
         }
+    }
+
+    @Test(
+        "--raw-continuation with a flag that takes its own path is refused",
+        arguments: ["--batch-prototype", "--image", "--video"])
+    func refusesConflictingFlag(flag: String) throws {
+        let file = try tokensFile([7])
+        defer { file.cleanup() }
+        expectRefusal({ _ = try request(path: file.path, conflictingFlags: [flag]) }) {
+            guard case .rawContinuationConflicts(let reported) = $0 else { return false }
+            return reported == flag
+        }
+        #expect(
+            ContinuationOptionError.rawContinuationConflicts(flag: flag).errorDescription
+                == "--raw-continuation cannot be used with \(flag)")
     }
 
     @Test("An empty --raw-continuation file is refused")
     func refusesEmptyContinuation() throws {
         let file = try tokensFile([])
         defer { file.cleanup() }
-        #expect {
-            try continuation(path: file.path)
-        } throws: { error in
-            guard case .emptyRawContinuation = error as? ContinuationOptionError else { return false }
+        expectRefusal({ _ = try request(path: file.path) }) {
+            guard case .emptyRawContinuation = $0 else { return false }
             return true
         }
     }
@@ -120,10 +140,8 @@ struct RawTokenScoringTests {
     func refusesEmptyContext() throws {
         let file = try tokensFile([7])
         defer { file.cleanup() }
-        #expect {
-            try continuation(path: file.path, context: [])
-        } throws: { error in
-            guard case .emptyRawContext = error as? ContinuationOptionError else { return false }
+        expectRefusal({ _ = try request(path: file.path, context: []) }) {
+            guard case .emptyRawContext = $0 else { return false }
             return true
         }
     }
@@ -136,14 +154,115 @@ struct RawTokenScoringTests {
         let missing = TokensFile()
 
         for path in [malformed.path, missing.path] {
-            #expect {
-                try continuation(path: path)
-            } throws: { error in
-                guard case .unreadableRawTokens(let reported, _) = error as? ContinuationOptionError else {
-                    return false
-                }
+            expectRefusal({ _ = try request(path: path) }) {
+                guard case .unreadableRawTokens(let reported, _) = $0 else { return false }
                 return reported == path
             }
+        }
+    }
+
+    // MARK: Fitting the model
+
+    @Test("Ids that fit the vocabulary and the context length are accepted")
+    func acceptsIdsThatFit() throws {
+        // Ids 0 and vocabSize - 1, and exactly maxContextLength ids in total.
+        try RawTokenScoring.checkFits(
+            .init(context: [0, 1, 2], continuation: [99]), vocabSize: 100, maxContextLength: 4)
+    }
+
+    @Test(
+        "An id outside the vocabulary is refused, naming the file that holds it",
+        arguments: [
+            ([100], [1], "--raw-tokens", Int32(100)),
+            ([1], [1, -1], "--raw-continuation", Int32(-1)),
+            ([1], [250], "--raw-continuation", Int32(250)),
+        ] as [([Int32], [Int32], String, Int32)])
+    func refusesIdOutsideVocabulary(case: (context: [Int32], continuation: [Int32], flag: String, id: Int32)) {
+        expectRefusal({
+            try RawTokenScoring.checkFits(
+                .init(context: `case`.context, continuation: `case`.continuation), vocabSize: 100,
+                maxContextLength: 64)
+        }) {
+            guard case .tokenOutsideVocabulary(let flag, let id, 100) = $0 else { return false }
+            return flag == `case`.flag && id == `case`.id
+        }
+    }
+
+    @Test("A context plus continuation longer than the model's context length is refused")
+    func refusesMoreIdsThanTheContextHolds() {
+        expectRefusal({
+            try RawTokenScoring.checkFits(
+                .init(context: [1, 2, 3], continuation: [4, 5]), vocabSize: 100, maxContextLength: 4)
+        }) {
+            guard case .exceedsContextLength(3, 2, 4) = $0 else { return false }
+            return true
+        }
+    }
+
+    // MARK: Scoring under --json-schema
+
+    /// Ids into `grammarVocab`.
+    private enum Id {
+        static let open: Int32 = 0, close: Int32 = 1, quote: Int32 = 2, colon: Int32 = 3
+        static let a: Int32 = 4, one: Int32 = 5, b: Int32 = 6
+    }
+
+    private static let grammarVocab = ["{", "}", "\"", ":", "a", "1", "b"]
+
+    private static let schema = """
+        {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"], "additionalProperties": false}
+        """
+
+    private func session() throws -> ConstrainedGenerationSession {
+        try ConstrainedGenerationSession(jsonSchema: Self.schema, vocabulary: Self.grammarVocab, vocabType: .raw)
+    }
+
+    /// One flat logits row per continuation id, so masking alone decides the log-probabilities.
+    private func flatResult(_ continuation: [Int32]) -> ContinuationEvaluationResult {
+        ContinuationEvaluationResult(
+            contextTokens: [9],
+            continuationTokens: continuation,
+            logits: Array(repeating: Array(repeating: 0, count: Self.grammarVocab.count), count: continuation.count))
+    }
+
+    @Test("A continuation the schema allows is scored over the ids the schema allows")
+    func masksAnAllowedContinuation() throws {
+        var grammar = try session()
+        let continuation = [Id.open, Id.quote, Id.a, Id.quote, Id.colon, Id.one, Id.close]
+        let unmasked = flatResult(continuation)
+        let masked = try RawTokenScoring.maskedByGrammar(unmasked, session: &grammar)
+
+        #expect(masked.contextTokens == unmasked.contextTokens)
+        #expect(masked.continuationTokens == continuation)
+        #expect(masked.logits.count == continuation.count)
+        // `{` is the only id a JSON object can start with, so it is certain once masked.
+        #expect(abs(masked.targetProbabilities()[0] - 1) < 1e-6)
+        // `b` is no property of the schema, so it is masked out where `a` is the next id.
+        #expect(masked.logits[2][Int(Id.b)] < -1000)
+        #expect(masked.logProbability() > unmasked.logProbability())
+    }
+
+    @Test("A continuation id the schema does not allow is refused at its position")
+    func refusesAnIdTheSchemaDoesNotAllow() throws {
+        var grammar = try session()
+        expectRefusal({
+            _ = try RawTokenScoring.maskedByGrammar(
+                flatResult([Id.open, Id.quote, Id.b]), session: &grammar)
+        }) {
+            guard case .continuationViolatesSchema(2, Id.b) = $0 else { return false }
+            return true
+        }
+    }
+
+    @Test("A continuation that runs past the schema's complete JSON is refused")
+    func refusesIdsAfterTheJSONIsComplete() throws {
+        var grammar = try session()
+        let complete = [Id.open, Id.quote, Id.a, Id.quote, Id.colon, Id.one, Id.close]
+        expectRefusal({
+            _ = try RawTokenScoring.maskedByGrammar(flatResult(complete + [Id.open]), session: &grammar)
+        }) {
+            guard case .continuationPastSchemaEnd(7, Id.open) = $0 else { return false }
+            return true
         }
     }
 }

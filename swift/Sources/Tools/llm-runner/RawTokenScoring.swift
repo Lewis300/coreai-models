@@ -15,27 +15,41 @@ import Foundation
 /// from `--raw-tokens` plus a logits flag alone and took `tokens[0]` as the whole context, so no run
 /// could generate from raw tokens and save the logits of what it generated.
 enum RawTokenScoring {
+    /// The ids a `--raw-continuation` run scores.
+    struct Request: Equatable {
+        /// Every id in `--raw-tokens`.
+        let context: [Int32]
+        /// Every id in `--raw-continuation`; each one is scored.
+        let continuation: [Int32]
+    }
+
     /// - Parameters:
     ///   - rawContinuationPath: The `--raw-continuation` file, in the `{"tokens": [...]}` format of
     ///     `--raw-tokens`, or `nil` when the run generates.
     ///   - rawTokensPath: The `--raw-tokens` file that gives the context, or `nil`.
     ///   - textContinuationGiven: Whether the text `--continuation` is also given.
     ///   - logitsRequested: Whether `--print-logits` or `--save-logits` is given.
-    /// - Returns: The ids to score as a forced continuation of the whole `--raw-tokens` context, or
-    ///   `nil` when the run generates from that context.
+    ///   - conflictingFlags: Flags given on this run that take their own path and would ignore
+    ///     `--raw-continuation` (`--batch-prototype`, `--image`, `--video`).
+    /// - Returns: The context and the ids to score, or `nil` when the run generates from
+    ///   `--raw-tokens`.
     /// - Throws: `ContinuationOptionError` when `--raw-continuation` is given with the text
-    ///   `--continuation`, without `--raw-tokens`, without a logits output, or when either file
-    ///   cannot be read or holds no ids. Both files are read here so the run refuses before the
-    ///   model loads.
-    static func continuation(
+    ///   `--continuation` or a conflicting flag, without `--raw-tokens`, without a logits output, or
+    ///   when either file cannot be read or holds no ids. Both files are read here so the run
+    ///   refuses before the model loads.
+    static func request(
         rawContinuationPath: String?,
         rawTokensPath: String?,
         textContinuationGiven: Bool,
-        logitsRequested: Bool
-    ) throws -> [Int32]? {
+        logitsRequested: Bool,
+        conflictingFlags: [String] = []
+    ) throws -> Request? {
         guard let path = rawContinuationPath else { return nil }
         guard !textContinuationGiven else {
-            throw ContinuationOptionError.rawContinuationConflictsWithContinuation
+            throw ContinuationOptionError.rawContinuationConflicts(flag: "--continuation")
+        }
+        if let flag = conflictingFlags.first {
+            throw ContinuationOptionError.rawContinuationConflicts(flag: flag)
         }
         guard let contextPath = rawTokensPath else {
             throw ContinuationOptionError.rawContinuationRequiresRawTokens
@@ -43,15 +57,56 @@ enum RawTokenScoring {
         guard logitsRequested else {
             throw ContinuationOptionError.rawContinuationRequiresLogitsOutput
         }
-
-        guard !(try readTokens(at: contextPath)).isEmpty else {
+        let context = try readTokens(at: contextPath)
+        guard !context.isEmpty else {
             throw ContinuationOptionError.emptyRawContext(path: contextPath)
         }
-        let tokens = try readTokens(at: path)
-        guard !tokens.isEmpty else {
+        let continuation = try readTokens(at: path)
+        guard !continuation.isEmpty else {
             throw ContinuationOptionError.emptyRawContinuation(path: path)
         }
-        return tokens
+        return Request(context: context, continuation: continuation)
+    }
+
+    /// Refuses ids the model cannot take: one outside its vocabulary, or more ids in total than its
+    /// context holds. Needs only the bundle's config, so the run refuses before the model loads.
+    static func checkFits(_ request: Request, vocabSize: Int, maxContextLength: Int) throws {
+        for (flag, ids) in [("--raw-tokens", request.context), ("--raw-continuation", request.continuation)] {
+            if let id = ids.first(where: { $0 < 0 || Int($0) >= vocabSize }) {
+                throw ContinuationOptionError.tokenOutsideVocabulary(flag: flag, id: id, vocabSize: vocabSize)
+            }
+        }
+        let total = request.context.count + request.continuation.count
+        guard total <= maxContextLength else {
+            throw ContinuationOptionError.exceedsContextLength(
+                context: request.context.count, continuation: request.continuation.count,
+                maxContextLength: maxContextLength)
+        }
+    }
+
+    /// Scores under `--json-schema`: masks each position's logits with the schema's grammar before
+    /// they are scored, as constrained generation masks them before it samples. The context is not
+    /// constrained, only the continuation, so log-probabilities are over the ids the schema allows.
+    ///
+    /// - Throws: `ContinuationOptionError` when a continuation id is one the schema does not allow
+    ///   at its position, or comes after the schema's JSON is complete.
+    static func maskedByGrammar(
+        _ result: ContinuationEvaluationResult, session: inout ConstrainedGenerationSession
+    ) throws -> ContinuationEvaluationResult {
+        var masked: [[LogitsScalarType]] = []
+        masked.reserveCapacity(result.logits.count)
+        for (position, (logits, id)) in zip(result.logits, result.continuationTokens).enumerated() {
+            var row = logits
+            guard session.applyMask(to: &row) else {
+                throw ContinuationOptionError.continuationPastSchemaEnd(position: position, id: id)
+            }
+            guard session.acceptToken(id) else {
+                throw ContinuationOptionError.continuationViolatesSchema(position: position, id: id)
+            }
+            masked.append(row)
+        }
+        return ContinuationEvaluationResult(
+            contextTokens: result.contextTokens, continuationTokens: result.continuationTokens, logits: masked)
     }
 
     private static func readTokens(at path: String) throws -> [Int32] {
@@ -75,10 +130,14 @@ enum ContinuationOptionError: Error, LocalizedError {
     case rawTokensNotSupported
     case rawContinuationRequiresRawTokens
     case rawContinuationRequiresLogitsOutput
-    case rawContinuationConflictsWithContinuation
+    case rawContinuationConflicts(flag: String)
     case unreadableRawTokens(path: String, reason: String)
     case emptyRawContext(path: String)
     case emptyRawContinuation(path: String)
+    case tokenOutsideVocabulary(flag: String, id: Int32, vocabSize: Int)
+    case exceedsContextLength(context: Int, continuation: Int, maxContextLength: Int)
+    case continuationViolatesSchema(position: Int, id: Int32)
+    case continuationPastSchemaEnd(position: Int, id: Int32)
 
     var errorDescription: String? {
         switch self {
@@ -96,8 +155,8 @@ enum ContinuationOptionError: Error, LocalizedError {
             return "--raw-continuation requires --raw-tokens"
         case .rawContinuationRequiresLogitsOutput:
             return "--raw-continuation requires --print-logits or --save-logits"
-        case .rawContinuationConflictsWithContinuation:
-            return "--raw-continuation cannot be used with --continuation"
+        case .rawContinuationConflicts(let flag):
+            return "--raw-continuation cannot be used with \(flag)"
         case .unreadableRawTokens(let path, let reason):
             return "Cannot read token file \(path): \(reason) "
                 + "Expected format: {\"tokens\": [1, 2, 3, ...]}"
@@ -105,6 +164,15 @@ enum ContinuationOptionError: Error, LocalizedError {
             return "--raw-tokens file \(path) holds no tokens, so there is no context to score against"
         case .emptyRawContinuation(let path):
             return "--raw-continuation file \(path) holds no tokens"
+        case .tokenOutsideVocabulary(let flag, let id, let vocabSize):
+            return "\(flag) holds token id \(id), outside the model's vocabulary of \(vocabSize)"
+        case .exceedsContextLength(let context, let continuation, let maxContextLength):
+            return "--raw-tokens (\(context) ids) plus --raw-continuation (\(continuation) ids) is "
+                + "\(context + continuation) ids, more than the model's context length of \(maxContextLength)"
+        case .continuationViolatesSchema(let position, let id):
+            return "--raw-continuation id \(id) at position \(position) is not allowed by --json-schema"
+        case .continuationPastSchemaEnd(let position, let id):
+            return "--raw-continuation id \(id) at position \(position) comes after the --json-schema JSON is complete"
         }
     }
 }

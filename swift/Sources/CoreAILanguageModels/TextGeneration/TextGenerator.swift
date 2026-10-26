@@ -142,8 +142,7 @@ public class TextGenerator {
     ///
     /// The raw-token twin of `evaluateContinuation(context:continuation:)`, and it feeds the
     /// model the same way: the whole context, then each continuation position. No text
-    /// tokenization or BPE boundary detection is needed. It used to take `tokens[0]` as the whole
-    /// context.
+    /// tokenization or BPE boundary detection is needed.
     ///
     /// - Parameters:
     ///   - context: The context ids; at least one.
@@ -169,6 +168,24 @@ public class TextGenerator {
             continuationTokens: continuation,
             logits: allLogits
         )
+    }
+
+    /// Score `tokens[1...]` as a forced continuation of the one-token context `[tokens[0]]`.
+    ///
+    /// - Parameter tokens: Pre-tokenized ids; at least two.
+    /// - Returns: ContinuationEvaluationResult with logits for positions 1..N
+    @available(
+        *, deprecated,
+        message:
+            "Use evaluateRawTokens(context:continuation:), which takes a context of any length. Pass context: [tokens[0]], continuation: Array(tokens.dropFirst()) for this overload's split."
+    )
+    public func evaluateRawTokens(
+        _ tokens: [Int32]
+    ) async throws -> ContinuationEvaluationResult {
+        guard tokens.count >= 2 else {
+            throw ContinuationEvaluationError.emptyInput
+        }
+        return try await evaluateRawTokens(context: [tokens[0]], continuation: Array(tokens.dropFirst()))
     }
 
     /// Feed `context`, then force `continuation`, and return the logits that predict each

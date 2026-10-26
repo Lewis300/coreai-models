@@ -381,11 +381,18 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     func runModel(path modelFile: String, resolver: ModelPaths) async throws {
         // --raw-tokens is always the context. The run scores only when --raw-continuation names
         // the ids to score; otherwise it generates, saving the logits of each generated token.
-        let rawContinuationTokens = try RawTokenScoring.continuation(
+        // --batch-prototype, --image and --video each take their own path and would silently skip
+        // the scoring, so --raw-continuation refuses them.
+        let rawScoring = try RawTokenScoring.request(
             rawContinuationPath: rawContinuation,
             rawTokensPath: rawTokens,
             textContinuationGiven: continuation != nil,
-            logitsRequested: saveLogits != nil || printLogits
+            logitsRequested: saveLogits != nil || printLogits,
+            conflictingFlags: [
+                batchPrototypeRows.map { _ in "--batch-prototype" },
+                imagePath.map { _ in "--image" },
+                videoPath.map { _ in "--video" },
+            ].compactMap { $0 }
         )
 
         // Validate continuation mode requirements
@@ -454,6 +461,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         try bundle.modelBundle.validateModelAssets()
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
+        if let rawScoring {
+            try RawTokenScoring.checkFits(
+                rawScoring, vocabSize: bundle.vocabSize, maxContextLength: bundle.maxContextLength)
+        }
 
         // Resolve component model URLs once; reused for the cache check and model loading below.
         // An LLM bundle has only `main`; VLM bundles also have `vision`, plus `embedding` unless the
@@ -678,20 +689,25 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         // Raw token scoring (--raw-continuation): score those ids as a forced continuation of
-        // the whole --raw-tokens context.
-        if let continuationTokens = rawContinuationTokens, case .rawTokens(let container) = promptInput {
+        // the whole --raw-tokens context, under --json-schema when it is given.
+        if let rawScoring {
             guard inferenceEngine.supportsLogits else {
                 throw ContinuationOptionError.engineDoesNotSupportLogits
             }
-            let result = try await generator.evaluateRawTokens(
-                context: container.tokens, continuation: continuationTokens)
+            var result = try await generator.evaluateRawTokens(
+                context: rawScoring.context, continuation: rawScoring.continuation)
+            if let schemaInput = jsonSchema {
+                var grammar = try ConstrainedGenerationSession(
+                    jsonSchema: try loadJSONSchema(schemaInput), tokenizer: tokenizer, vocabSize: bundle.vocabSize)
+                result = try RawTokenScoring.maskedByGrammar(result, session: &grammar)
+            }
 
             await PerformanceMetrics.shared.endOverallTiming()
 
             try LogitsWriter.handleEvaluationOutput(
                 result: result,
-                context: "(raw tokens: \(container.tokens.count) ids)",
-                continuation: "(raw continuation: \(continuationTokens.count) ids)",
+                context: "(raw tokens: \(rawScoring.context.count) ids)",
+                continuation: "(raw continuation: \(rawScoring.continuation.count) ids)",
                 tokenizer: tokenizer,
                 saveLogitsLength: saveLogitsLength,
                 saveJsonPath: saveLogits,
@@ -841,6 +857,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
     // MARK: - Constrained Generation Helper
 
+    /// The `--json-schema` value: a file's contents when it names a file, otherwise the schema itself.
+    private func loadJSONSchema(_ schemaInput: String) throws -> String {
+        guard FileManager.default.fileExists(atPath: schemaInput) else { return schemaInput }
+        return try String(contentsOfFile: schemaInput, encoding: .utf8)
+    }
+
     private func runConstrainedGeneration(
         schemaInput: String,
         input: Input,
@@ -852,12 +874,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         modelVocabSize: Int?,
         additionalEosTokenIds: Set<Int32> = []
     ) async throws {
-        let schema: String
-        if FileManager.default.fileExists(atPath: schemaInput) {
-            schema = try String(contentsOfFile: schemaInput, encoding: .utf8)
-        } else {
-            schema = schemaInput
-        }
+        let schema = try loadJSONSchema(schemaInput)
 
         CLILogger.log("Constrained generation with JSON schema", component: "Main")
 
