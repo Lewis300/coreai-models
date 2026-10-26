@@ -122,7 +122,7 @@ enum RawTokenScoring {
 // MARK: - Errors
 
 /// Why an `llm-runner` run refuses its continuation options.
-enum ContinuationOptionError: Error, LocalizedError {
+enum ContinuationOptionError: Error, LocalizedError, Equatable {
     case requiresDisabledChatTemplate
     case requiresLogitsOutput
     case engineDoesNotSupportLogits
