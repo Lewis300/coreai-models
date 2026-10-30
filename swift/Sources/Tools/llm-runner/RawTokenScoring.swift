@@ -17,26 +17,23 @@ import Foundation
 enum RawTokenScoring {
     /// The ids a `--raw-continuation` run scores.
     struct Request: Equatable {
-        /// Every id in `--raw-tokens`.
+        /// Context tokens.
         let context: [Int32]
-        /// Every id in `--raw-continuation`; each one is scored.
+        /// Continuation tokens, each one scored.
         let continuation: [Int32]
     }
 
+    /// Reads the tokens to score, refusing options that conflict, before the model loads.
+    ///
     /// - Parameters:
-    ///   - rawContinuationPath: The `--raw-continuation` file, in the `{"tokens": [...]}` format of
-    ///     `--raw-tokens`, or `nil` when the run generates.
-    ///   - rawTokensPath: The `--raw-tokens` file that gives the context, or `nil`.
-    ///   - textContinuationGiven: Whether the text `--continuation` is also given.
-    ///   - logitsRequested: Whether `--print-logits` or `--save-logits` is given.
-    ///   - conflictingFlags: Flags given on this run that take their own path and would ignore
-    ///     `--raw-continuation` (`--batch-prototype`, `--image`, `--video`).
-    /// - Returns: The context and the ids to score, or `nil` when the run generates from
-    ///   `--raw-tokens`.
-    /// - Throws: `ContinuationOptionError` when `--raw-continuation` is given with the text
-    ///   `--continuation` or a conflicting flag, without `--raw-tokens`, without a logits output, or
-    ///   when either file cannot be read or holds no ids, and when a generating run's `--raw-tokens`
-    ///   holds no ids. The files are read here so the run refuses before the model loads.
+    ///   - rawContinuationPath: File of continuation tokens to score, or `nil` when the run generates.
+    ///   - rawTokensPath: File of context tokens, or `nil`.
+    ///   - textContinuationGiven: Whether a text continuation is also given.
+    ///   - logitsRequested: Whether the run prints or saves logits.
+    ///   - conflictingFlags: Options on this run that take their own path and would skip the scoring.
+    /// - Returns: The context and continuation tokens, or `nil` when the run generates.
+    /// - Throws: `ContinuationOptionError` when the options conflict, or when a file cannot be read or
+    ///   holds no tokens.
     static func request(
         rawContinuationPath: String?,
         rawTokensPath: String?,
@@ -74,9 +71,9 @@ enum RawTokenScoring {
         return Request(context: context, continuation: continuation)
     }
 
-    /// The note a run prints when `--raw-tokens` and a logits flag are given without
-    /// `--raw-continuation`. That combination used to score `tokens[1...]` against `tokens[0]`; it
-    /// now generates, so a caller relying on the old behaviour is told how to split the input.
+    /// Produces a notice when a run asks for behaviour that is no longer available: raw tokens with
+    /// a logits output used to score a continuation, and now generate. The notice says how to split
+    /// the input to score instead. Nil when it does not apply.
     static func generationNotice(
         rawTokensGiven: Bool, rawContinuationGiven: Bool, textContinuationGiven: Bool, logitsRequested: Bool
     ) -> String? {
@@ -87,8 +84,9 @@ enum RawTokenScoring {
             + "should pass --raw-tokens [t0] --raw-continuation [t1, ..., tn]."
     }
 
-    /// Refuses ids the model cannot take: one outside its vocabulary, or more ids in total than its
-    /// context holds. Needs only the bundle's config, so the run refuses before the model loads.
+    /// Checks the given request against the model, to ensure every token is in its vocabulary and
+    /// the context and continuation together fit its context length. Needs only the bundle's
+    /// config, so it runs before the model loads.
     static func checkFits(_ request: Request, vocabSize: Int, maxContextLength: Int) throws {
         for (flag, ids) in [("--raw-tokens", request.context), ("--raw-continuation", request.continuation)] {
             if let id = ids.first(where: { $0 < 0 || Int($0) >= vocabSize }) {
@@ -103,12 +101,12 @@ enum RawTokenScoring {
         }
     }
 
-    /// Scores under `--json-schema`: masks each position's logits with the schema's grammar before
-    /// they are scored, as constrained generation masks them before it samples. The context is not
-    /// constrained, only the continuation, so log-probabilities are over the ids the schema allows.
+    /// Masks each continuation position's logits with a JSON schema's grammar, so log-probabilities
+    /// are over the tokens the schema allows there. Once the JSON is complete, only the grammar's stop
+    /// tokens are allowed. The context is not constrained.
     ///
-    /// - Throws: `ContinuationOptionError` when a continuation id is one the schema does not allow
-    ///   at its position, or comes after the schema's JSON is complete.
+    /// - Throws: `ContinuationOptionError` when a continuation token is one the schema does not allow
+    ///   at its position, or comes after the grammar has ended.
     static func maskedByGrammar(
         _ result: ContinuationEvaluationResult, session: inout ConstrainedGenerationSession
     ) throws -> ContinuationEvaluationResult {

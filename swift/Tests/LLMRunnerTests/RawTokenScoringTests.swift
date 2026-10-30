@@ -225,17 +225,19 @@ struct RawTokenScoringTests {
     /// Ids into `grammarVocab`.
     private enum Id {
         static let open: Int32 = 0, close: Int32 = 1, quote: Int32 = 2, colon: Int32 = 3
-        static let a: Int32 = 4, one: Int32 = 5, b: Int32 = 6
+        static let a: Int32 = 4, one: Int32 = 5, b: Int32 = 6, end: Int32 = 7
     }
 
-    private static let grammarVocab = ["{", "}", "\"", ":", "a", "1", "b"]
+    private static let grammarVocab = ["{", "}", "\"", ":", "a", "1", "b", "<|im_end|>"]
 
     private static let schema = """
         {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"], "additionalProperties": false}
         """
 
+    /// The grammar with `end` as its stop token, as llm-runner gives it the stops generation uses.
     private func session() throws -> ConstrainedGenerationSession {
-        try ConstrainedGenerationSession(jsonSchema: Self.schema, vocabulary: Self.grammarVocab, vocabType: .raw)
+        try ConstrainedGenerationSession(
+            jsonSchema: Self.schema, vocabulary: Self.grammarVocab, vocabType: .raw, stopTokenIds: [Id.end])
     }
 
     /// One flat logits row per continuation id, so masking alone decides the log-probabilities.
@@ -271,12 +273,29 @@ struct RawTokenScoringTests {
         }
     }
 
-    @Test("A continuation that runs past the schema's complete JSON is refused")
-    func refusesIdsAfterTheJSONIsComplete() throws {
+    private static let complete = [Id.open, Id.quote, Id.a, Id.quote, Id.colon, Id.one, Id.close]
+
+    @Test("Once the JSON is complete, only a stop token is allowed")
+    func onlyAStopTokenFollowsTheJSON() throws {
         var grammar = try session()
-        let complete = [Id.open, Id.quote, Id.a, Id.quote, Id.colon, Id.one, Id.close]
-        expectRefusal(.continuationPastSchemaEnd(position: 7, id: Id.open)) {
-            _ = try RawTokenScoring.maskedByGrammar(flatResult(complete + [Id.open]), session: &grammar)
+        expectRefusal(.continuationViolatesSchema(position: 7, id: Id.open)) {
+            _ = try RawTokenScoring.maskedByGrammar(flatResult(Self.complete + [Id.open]), session: &grammar)
+        }
+    }
+
+    @Test("A continuation that ends in a stop token is scored, as generation would end it")
+    func scoresAStopTokenAfterTheJSON() throws {
+        var grammar = try session()
+        let masked = try RawTokenScoring.maskedByGrammar(flatResult(Self.complete + [Id.end]), session: &grammar)
+        // The stop token is the only id allowed there, so it is certain once masked.
+        #expect(abs(masked.targetProbabilities()[7] - 1) < 1e-6)
+    }
+
+    @Test("A continuation that runs past its stop token is refused")
+    func refusesIdsAfterTheStopToken() throws {
+        var grammar = try session()
+        expectRefusal(.continuationPastSchemaEnd(position: 8, id: Id.open)) {
+            _ = try RawTokenScoring.maskedByGrammar(flatResult(Self.complete + [Id.end, Id.open]), session: &grammar)
         }
     }
 }

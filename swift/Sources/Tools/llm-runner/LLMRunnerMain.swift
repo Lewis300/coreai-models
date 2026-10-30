@@ -383,10 +383,8 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     }
 
     func runModel(path modelFile: String, resolver: ModelPaths) async throws {
-        // --raw-tokens is always the context. The run scores only when --raw-continuation names
-        // the ids to score; otherwise it generates, saving the logits of each generated token.
-        // --batch-prototype, --image and --video each take their own path and would silently skip
-        // the scoring, so --raw-continuation refuses them.
+        // Decide whether this run scores a forced continuation, refusing options that would skip
+        // the scoring. Done before the model loads, so a bad combination fails fast.
         let rawScoring = try RawTokenScoring.request(
             rawContinuationPath: rawContinuation,
             rawTokensPath: rawTokens,
@@ -709,8 +707,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             var result = try await generator.evaluateRawTokens(
                 context: rawScoring.context, continuation: rawScoring.continuation)
             if let schemaInput = jsonSchema {
+                // The grammar generation would use: the same stop tokens, allowed once the JSON is
+                // complete, and the same whitespace limit.
+                let stopSequences = try validateAndEncodeStopTokens(
+                    stopTokens: stopTokens, tokenizer: tokenizer, additionalEosTokenIds: additionalEosTokenIds)
                 var grammar = try ConstrainedGenerationSession(
-                    jsonSchema: try loadJSONSchema(schemaInput), tokenizer: tokenizer, vocabSize: bundle.vocabSize)
+                    jsonSchema: try loadJSONSchema(schemaInput), tokenizer: tokenizer, vocabSize: bundle.vocabSize,
+                    stopTokenIds: stopSequences.singleTokenStopIds, maxWhitespaceCount: maxWhitespaceCount)
                 result = try RawTokenScoring.maskedByGrammar(result, session: &grammar)
             }
 
