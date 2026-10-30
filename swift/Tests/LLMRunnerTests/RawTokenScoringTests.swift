@@ -132,6 +132,42 @@ struct RawTokenScoringTests {
         }
     }
 
+    @Test("An empty --raw-tokens file is refused when the run generates")
+    func refusesEmptyGenerationContext() throws {
+        #expect {
+            _ = try request(path: nil, context: [])
+        } throws: { error in
+            guard case .emptyRawTokens = error as? ContinuationOptionError else { return false }
+            return true
+        }
+        // A file that cannot be read is left to the prompt resolver.
+        #expect(
+            try RawTokenScoring.request(
+                rawContinuationPath: nil, rawTokensPath: "/nonexistent/tokens.json",
+                textContinuationGiven: false, logitsRequested: true) == nil)
+    }
+
+    // MARK: Migration notice
+
+    @Test("--raw-tokens with a logits flag and no --raw-continuation prints the migration notice")
+    func printsGenerationNotice() {
+        let notice = RawTokenScoring.generationNotice(
+            rawTokensGiven: true, rawContinuationGiven: false, textContinuationGiven: false, logitsRequested: true)
+        #expect(notice?.contains("--raw-tokens [t0] --raw-continuation [t1, ..., tn]") == true)
+
+        for (rawTokens, rawContinuation, textContinuation, logits) in [
+            (false, false, false, true),
+            (true, true, false, true),
+            (true, false, true, true),
+            (true, false, false, false),
+        ] {
+            #expect(
+                RawTokenScoring.generationNotice(
+                    rawTokensGiven: rawTokens, rawContinuationGiven: rawContinuation,
+                    textContinuationGiven: textContinuation, logitsRequested: logits) == nil)
+        }
+    }
+
     @Test("A missing or malformed --raw-continuation file is refused")
     func refusesUnreadableContinuation() throws {
         let malformed = TokensFile()

@@ -35,8 +35,8 @@ enum RawTokenScoring {
     ///   `--raw-tokens`.
     /// - Throws: `ContinuationOptionError` when `--raw-continuation` is given with the text
     ///   `--continuation` or a conflicting flag, without `--raw-tokens`, without a logits output, or
-    ///   when either file cannot be read or holds no ids. Both files are read here so the run
-    ///   refuses before the model loads.
+    ///   when either file cannot be read or holds no ids, and when a generating run's `--raw-tokens`
+    ///   holds no ids. The files are read here so the run refuses before the model loads.
     static func request(
         rawContinuationPath: String?,
         rawTokensPath: String?,
@@ -44,7 +44,13 @@ enum RawTokenScoring {
         logitsRequested: Bool,
         conflictingFlags: [String] = []
     ) throws -> Request? {
-        guard let path = rawContinuationPath else { return nil }
+        guard let path = rawContinuationPath else {
+            // A file that cannot be read is left to the prompt resolver, which reports it as before.
+            if let contextPath = rawTokensPath, let context = try? readTokens(at: contextPath), context.isEmpty {
+                throw ContinuationOptionError.emptyRawTokens(path: contextPath)
+            }
+            return nil
+        }
         guard !textContinuationGiven else {
             throw ContinuationOptionError.rawContinuationConflicts(flag: "--continuation")
         }
@@ -66,6 +72,19 @@ enum RawTokenScoring {
             throw ContinuationOptionError.emptyRawContinuation(path: path)
         }
         return Request(context: context, continuation: continuation)
+    }
+
+    /// The note a run prints when `--raw-tokens` and a logits flag are given without
+    /// `--raw-continuation`. That combination used to score `tokens[1...]` against `tokens[0]`; it
+    /// now generates, so a caller relying on the old behaviour is told how to split the input.
+    static func generationNotice(
+        rawTokensGiven: Bool, rawContinuationGiven: Bool, textContinuationGiven: Bool, logitsRequested: Bool
+    ) -> String? {
+        guard rawTokensGiven, !rawContinuationGiven, !textContinuationGiven, logitsRequested else { return nil }
+        return "Note: --raw-tokens is the context, so this run generates and saves the logits of each "
+            + "generated token. To score a forced continuation instead, pass its ids with "
+            + "--raw-continuation. Runs that relied on --raw-tokens [t0, t1, ..., tn] being scored "
+            + "should pass --raw-tokens [t0] --raw-continuation [t1, ..., tn]."
     }
 
     /// Refuses ids the model cannot take: one outside its vocabulary, or more ids in total than its
@@ -133,6 +152,7 @@ enum ContinuationOptionError: Error, LocalizedError, Equatable {
     case rawContinuationConflicts(flag: String)
     case unreadableRawTokens(path: String, reason: String)
     case emptyRawContext(path: String)
+    case emptyRawTokens(path: String)
     case emptyRawContinuation(path: String)
     case tokenOutsideVocabulary(flag: String, id: Int32, vocabSize: Int)
     case exceedsContextLength(context: Int, continuation: Int, maxContextLength: Int)
@@ -162,6 +182,8 @@ enum ContinuationOptionError: Error, LocalizedError, Equatable {
                 + "Expected format: {\"tokens\": [1, 2, 3, ...]}"
         case .emptyRawContext(let path):
             return "--raw-tokens file \(path) holds no tokens, so there is no context to score against"
+        case .emptyRawTokens(let path):
+            return "--raw-tokens file \(path) holds no tokens, so there is nothing to generate from"
         case .emptyRawContinuation(let path):
             return "--raw-continuation file \(path) holds no tokens"
         case .tokenOutsideVocabulary(let flag, let id, let vocabSize):

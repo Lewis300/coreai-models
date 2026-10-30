@@ -85,7 +85,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("prompt-file"), help: "Read prompt text from file (UTF-8 text file)")
     var promptFile: String?
 
-    @Option(name: .customLong("raw-tokens"), help: "JSON file with pre-tokenized tokens: {\"tokens\": [...]}")
+    @Option(
+        name: .customLong("raw-tokens"),
+        help:
+            "JSON file with pre-tokenized tokens to use as the context: {\"tokens\": [...]}. Generates from them; to score a forced continuation instead, add --raw-continuation"
+    )
     var rawTokens: String?
 
     @Option(
@@ -394,6 +398,14 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 videoPath.map { _ in "--video" },
             ].compactMap { $0 }
         )
+        if let notice = RawTokenScoring.generationNotice(
+            rawTokensGiven: rawTokens != nil,
+            rawContinuationGiven: rawContinuation != nil,
+            textContinuationGiven: continuation != nil,
+            logitsRequested: saveLogits != nil || printLogits
+        ) {
+            FileHandle.standardError.write(Data((notice + "\n").utf8))
+        }
 
         // Validate continuation mode requirements
         if let continuation = continuation {
